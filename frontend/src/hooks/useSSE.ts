@@ -38,10 +38,13 @@ export function useSSE() {
     // Initial connection check
     checkConnection();
 
-    // Periodic health check
+    // Periodic health check - every 60 seconds is enough
     const interval = setInterval(() => {
-      checkConnection();
-    }, 30000);
+      // Only check if we're not already in error state
+      if (store.connectionStatus !== 'error') {
+        checkConnection();
+      }
+    }, 60000);
 
     return () => {
       clearInterval(interval);
@@ -49,7 +52,7 @@ export function useSSE() {
         clearTimeout(reconnectTimeoutRef.current);
       }
     };
-  }, [checkConnection]);
+  }, [checkConnection, store.connectionStatus]);
 
   return {
     connectionStatus: store.connectionStatus,
