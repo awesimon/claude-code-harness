@@ -47,10 +47,25 @@ from agent import AgentManager, Agent, Task, AgentStatus, TaskStatus, TaskType, 
 from services import LLMService, LLMProvider, Message, ChatCompletionRequest, ChatCompletionResponse
 from services.config_service import config_service
 from query_engine import QueryEngine, ConversationState
+from routers import models_router
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 创建用于过滤health检查的中间件
+class HealthCheckFilter(logging.Filter):
+    """过滤health检查日志"""
+    def filter(self, record):
+        if hasattr(record, 'message'):
+            # 过滤health端点的访问日志
+            if '/health' in str(record.message):
+                return False
+        return True
+
+# 应用到uvicorn访问日志
+uvicorn_access_logger = logging.getLogger("uvicorn.access")
+uvicorn_access_logger.addFilter(HealthCheckFilter())
 
 # 全局实例
 agent_manager = AgentManager()
@@ -164,6 +179,9 @@ app = FastAPI(
     version="0.3.0",
     lifespan=lifespan,
 )
+
+# 注册路由
+app.include_router(models_router)
 
 # 挂载静态文件
 app.mount("/static", StaticFiles(directory="static"), name="static")

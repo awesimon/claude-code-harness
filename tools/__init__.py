@@ -103,6 +103,24 @@ __all__ = [
     "ScheduleDeleteInput",
     "ScheduleListInput",
     "ScheduleToggleInput",
+    # 新增工具
+    # Brief工具
+    "BriefTool",
+    "BriefInput",
+    # 工作树工具
+    "EnterWorktreeTool",
+    "ExitWorktreeTool",
+    "EnterWorktreeInput",
+    "ExitWorktreeInput",
+    # 工具搜索
+    "ToolSearchTool",
+    "ToolSearchInput",
+    # PowerShell工具
+    "PowerShellTool",
+    "PowerShellInput",
+    # 睡眠工具
+    "SleepTool",
+    "SleepInput",
 ]
 
 
@@ -175,3 +193,19 @@ from .schedule_cron_tool import (
     ScheduleCreateTool, ScheduleDeleteTool, ScheduleListTool, ScheduleToggleTool,
     ScheduleCreateInput, ScheduleDeleteInput, ScheduleListInput, ScheduleToggleInput,
 )
+
+# 新增工具
+# Brief工具
+from .brief_tool import BriefTool, BriefInput
+
+# 工作树工具
+from .worktree_tool import EnterWorktreeTool, ExitWorktreeTool, EnterWorktreeInput, ExitWorktreeInput
+
+# 工具搜索
+from .tool_search_tool import ToolSearchTool, ToolSearchInput
+
+# PowerShell工具
+from .powershell_tool import PowerShellTool, PowerShellInput
+
+# 睡眠工具
+from .sleep_tool import SleepTool, SleepInput

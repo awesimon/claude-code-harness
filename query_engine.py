@@ -235,6 +235,7 @@ class QueryEngine:
         conversation_id: str,
         user_message: str,
         stream: bool = False,
+        temperature: Optional[float] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         主对话入口

@@ -158,14 +158,7 @@ class LLMService:
             raise ValueError(f"Unsupported provider: {request.provider}")
 
     def _get_temperature(self, request_temp: Optional[float]) -> float:
-        """获取 temperature，默认 1.0
-
-        注意：infini-ai 代理只接受 temperature=1.0
-        """
-        # 检查是否使用 infini-ai 代理
-        base_url = os.getenv("OPENAI_BASE_URL", "")
-        if "infini-ai" in base_url:
-            return 1.0
+        """获取 temperature，优先使用请求中的值，否则使用默认值"""
         return request_temp if request_temp is not None else 1.0
 
     async def _openai_chat_completion(

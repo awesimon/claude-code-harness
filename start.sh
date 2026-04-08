@@ -1,15 +1,26 @@
 #!/bin/bash
-export ANTHROPIC_API_KEY=sk-cp-nvf5mdnanxyfacun
-export ANTHROPIC_BASE_URL=https://cloud.infini-ai.com/maas/coding
-export DEFAULT_MODEL=minimax-m2.7
-export DEFAULT_MAX_TOKENS=4096
-export DEFAULT_TEMPERATURE=0.7
-export HOST=0.0.0.0
-export PORT=8000
+
+# 从.env文件加载环境变量
+if [ -f .env ]; then
+    echo "从.env文件加载配置..."
+    # 使用source加载.env文件
+    set -a
+    source .env
+    set +a
+else
+    echo "警告: .env文件不存在"
+fi
+
+# 设置默认值（如果.env中没有定义）
+HOST=${HOST:-0.0.0.0}
+PORT=${PORT:-8000}
+DEFAULT_MODEL=${DEFAULT_MODEL:-gpt-4o}
 
 echo "启动 Claude Code Python API..."
 echo "模型: $DEFAULT_MODEL"
-echo "API: $ANTHROPIC_BASE_URL"
+echo "API: $OPENAI_BASE_URL"
+echo "Host: $HOST:$PORT"
 echo ""
 
-python3 -m uvicorn main:app --host $HOST --port $PORT --reload
+# 启动服务，禁用access log以减少health检查日志输出
+python3 -m uvicorn main:app --host $HOST --port $PORT --reload --no-access-log
