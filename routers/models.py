@@ -53,10 +53,12 @@ class SelectModelResponse(BaseModel):
 
 def model_to_response(model: ModelConfig) -> ModelResponse:
     """将模型配置转换为响应"""
+    # Handle both enum and string provider values
+    provider_value = model.provider.value if hasattr(model.provider, 'value') else str(model.provider)
     return ModelResponse(
         model_id=model.model_id,
         name=model.name,
-        provider=model.provider.value,
+        provider=provider_value,
         max_tokens=model.max_tokens,
         temperature=model.temperature,
         supports_streaming=model.supports_streaming,
