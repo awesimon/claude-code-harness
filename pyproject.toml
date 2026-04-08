@@ -1,0 +1,38 @@
+[project]
+name = "claude-code-python-api"
+version = "0.2.0"
+description = "Claude Code核心功能的Python FastAPI服务端，支持OpenAI/Anthropic"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.5.0",
+    "aiofiles>=23.2.0",
+    "httpx>=0.25.0",
+    "python-multipart>=0.0.6",
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "mypy>=1.7.0",
+    "ruff>=0.1.0",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I"]

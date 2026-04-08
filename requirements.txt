@@ -1,0 +1,24 @@
+# FastAPI框架
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# 数据验证
+pydantic>=2.5.0
+
+# 异步支持
+aiofiles>=23.2.0
+
+# HTTP客户端（用于MCP等外部调用）
+httpx>=0.25.0
+
+# 工具依赖
+python-multipart>=0.0.6
+
+# 环境变量管理
+python-dotenv>=1.0.0
+
+# 开发依赖（可选）
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+black>=23.0.0
+mypy>=1.7.0

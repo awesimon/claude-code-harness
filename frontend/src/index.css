@@ -1,0 +1,258 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Brand colors - avoiding AI purple/blue, using sophisticated palette */
+    --background: 0 0% 8%; /* #141413 - near black but not pure black */
+    --foreground: 40 10% 98%; /* #faf9f5 - warm white */
+
+    --card: 0 0% 11%; /* Slightly lighter than background */
+    --card-foreground: 40 10% 98%;
+
+    --popover: 0 0% 11%;
+    --popover-foreground: 40 10% 98%;
+
+    /* Primary accent - warm orange instead of AI blue */
+    --primary: 15 60% 53%; /* #d97757 */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 0 0% 20%;
+    --secondary-foreground: 40 10% 98%;
+
+    --muted: 0 0% 20%;
+    --muted-foreground: 40 5% 70%; /* #b0aea5 - mid tone */
+
+    --accent: 210 30% 60%; /* #6a9bcc - subtle blue */
+    --accent-foreground: 0 0% 100%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 40 10% 20%;
+    --input: 40 10% 20%;
+    --ring: 15 60% 53%; /* Matches primary */
+    --radius: 0.625rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Geist', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  }
+
+  /* Focus visible styles */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Reduced motion support */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* Glass morphism utility */
+  .glass {
+    @apply backdrop-blur-xl bg-white/[0.03] border border-white/10;
+    box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.05);
+  }
+
+  .glass-strong {
+    @apply backdrop-blur-2xl bg-white/[0.06] border border-white/10;
+    box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.1),
+                0 4px 6px -1px rgba(0, 0, 0, 0.1),
+                0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  }
+
+  /* Shimmer effect for loading states */
+  .shimmer {
+    background: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0) 0%,
+      rgba(255, 255, 255, 0.05) 50%,
+      rgba(255, 255, 255, 0) 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+
+  /* Custom scrollbar - thinner and more refined */
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 2px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.2);
+  }
+
+  /* Typography utilities */
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .tracking-tighter {
+    letter-spacing: -0.04em;
+  }
+
+  /* Message content styles - refined */
+  .message-content {
+    @apply text-sm max-w-none;
+  }
+
+  .message-content p {
+    @apply my-2 leading-relaxed first:mt-0 last:mb-0;
+  }
+
+  .message-content pre {
+    @apply my-3 rounded-lg bg-black/30 p-4 overflow-x-auto border border-white/5;
+  }
+
+  .message-content code {
+    @apply font-mono text-sm;
+  }
+
+  .message-content :not(pre) > code {
+    @apply rounded bg-white/10 px-1.5 py-0.5 text-foreground;
+  }
+
+  .message-content ul, .message-content ol {
+    @apply my-2 pl-5;
+  }
+
+  .message-content li {
+    @apply my-1;
+  }
+
+  .message-content a {
+    @apply text-primary hover:underline underline-offset-2;
+  }
+
+  .message-content blockquote {
+    @apply my-2 border-l-2 border-primary/50 pl-4 italic text-muted-foreground;
+  }
+
+  .message-content h1, .message-content h2, .message-content h3,
+  .message-content h4, .message-content h5, .message-content h6 {
+    @apply my-3 font-semibold text-foreground;
+  }
+
+  .message-content h1 { @apply text-xl; }
+  .message-content h2 { @apply text-lg; }
+  .message-content h3 { @apply text-base; }
+  .message-content h4, .message-content h5, .message-content h6 { @apply text-sm; }
+
+  .message-content hr {
+    @apply my-4 border-border;
+  }
+
+  .message-content table {
+    @apply my-3 w-full text-sm;
+  }
+
+  .message-content th, .message-content td {
+    @apply border border-white/10 px-3 py-2;
+  }
+
+  .message-content th {
+    @apply bg-white/5 font-semibold;
+  }
+
+  /* Gradient text utility */
+  .text-gradient {
+    @apply bg-gradient-to-r from-primary via-primary to-accent bg-clip-text text-transparent;
+  }
+
+  /* Micro-interactions */
+  .tap-highlight {
+    transition: transform 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .tap-highlight:active {
+    transform: scale(0.98);
+  }
+
+  /* Hide scrollbar utility */
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+/* Geist font import */
+@font-face {
+  font-family: 'Geist';
+  src: url('https://cdn.jsdelivr.net/npm/geist@1.2.0/dist/fonts/geist-sans/Geist-Regular.woff2') format('woff2');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('https://cdn.jsdelivr.net/npm/geist@1.2.0/dist/fonts/geist-sans/Geist-Medium.woff2') format('woff2');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('https://cdn.jsdelivr.net/npm/geist@1.2.0/dist/fonts/geist-sans/Geist-SemiBold.woff2') format('woff2');
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Geist';
+  src: url('https://cdn.jsdelivr.net/npm/geist@1.2.0/dist/fonts/geist-sans/Geist-Bold.woff2') format('woff2');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
