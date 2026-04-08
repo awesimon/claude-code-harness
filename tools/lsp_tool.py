@@ -89,7 +89,7 @@ class LSPTool(Tool):
             return ToolError(f"Path is not a file: {input_data.file_path}", tool_name=self.name)
         return None
 
-    async def run(self, input_data: LSPInput) -> ToolResult:
+    async def execute(self, input_data: LSPInput) -> ToolResult:
         """Execute LSP operation (mock implementation)."""
         import os
         abs_path = os.path.abspath(input_data.file_path)

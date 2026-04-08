@@ -228,3 +228,9 @@ from .lsp_tool import LSPTool, LSPInput
 
 # MCP资源工具
 from .mcp_resource_tool import ListMcpResourcesTool, ReadMcpResourceTool, ListMcpResourcesInput, ReadMcpResourceInput
+
+# MCP认证工具
+from .mcp_auth_tool import McpAuthTool, McpAuthInput
+
+# 验证计划工具
+from .verify_plan_tool import VerifyPlanExecutionTool, VerifyPlanInput

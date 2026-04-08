@@ -40,7 +40,7 @@ class McpAuthTool(Tool[McpAuthInput, Dict[str, Any]]):
             return ToolError("Server name is required", tool_name=self.name)
         return None
 
-    async def run(self, input_data: McpAuthInput) -> ToolResult:
+    async def execute(self, input_data: McpAuthInput) -> ToolResult:
         # Mock implementation - would start OAuth flow in real implementation
         return ToolResult(
             success=True,

@@ -47,7 +47,7 @@ class ListMcpResourcesTool(Tool[ListMcpResourcesInput, List[Dict[str, Any]]]):
                 return ToolError(f"MCP server not found: {input_data.server}", tool_name=self.name)
         return None
 
-    async def run(self, input_data: ListMcpResourcesInput) -> ToolResult:
+    async def execute(self, input_data: ListMcpResourcesInput) -> ToolResult:
         # Mock implementation
         resources = [
             {
@@ -103,7 +103,7 @@ class ReadMcpResourceTool(Tool[ReadMcpResourceInput, Dict[str, Any]]):
             return ToolError("Resource URI is required", tool_name=self.name)
         return None
 
-    async def run(self, input_data: ReadMcpResourceInput) -> ToolResult:
+    async def execute(self, input_data: ReadMcpResourceInput) -> ToolResult:
         # Mock implementation
         content = f"Mock content for resource {input_data.uri} from server {input_data.server}"
         return ToolResult(

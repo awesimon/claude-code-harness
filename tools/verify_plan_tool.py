@@ -64,7 +64,7 @@ class VerifyPlanExecutionTool(Tool[VerifyPlanInput, Dict[str, Any]]):
             return ToolError("plan_id is required", tool_name=self.name)
         return None
 
-    async def run(self, input_data: VerifyPlanInput) -> ToolResult:
+    async def execute(self, input_data: VerifyPlanInput) -> ToolResult:
         # Mock implementation
         verified = True
         completed_steps = len(input_data.expected_steps) if input_data.expected_steps else 3
