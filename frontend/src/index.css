@@ -146,7 +146,37 @@
   }
 
   .message-content pre {
-    @apply my-3 rounded-lg bg-black/30 p-4 overflow-x-auto border border-white/5;
+    @apply my-3 rounded-lg bg-black/30 overflow-x-auto border border-white/5;
+  }
+
+  /* Code block wrapper */
+  .code-block-wrapper {
+    @apply my-3 rounded-lg overflow-hidden border border-white/10;
+  }
+
+  .code-block-header {
+    @apply flex items-center justify-between px-3 py-2 bg-white/5 border-b border-white/10;
+  }
+
+  .code-language {
+    @apply text-xs text-muted-foreground font-mono;
+  }
+
+  .code-copy-btn {
+    @apply flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground
+           hover:text-foreground hover:bg-white/10 rounded transition-colors;
+  }
+
+  .code-copy-btn.copied {
+    @apply text-emerald-400;
+  }
+
+  .code-block-wrapper pre {
+    @apply my-0 rounded-none border-none bg-black/40;
+  }
+
+  .code-block-wrapper code {
+    @apply text-xs;
   }
 
   .message-content code {
