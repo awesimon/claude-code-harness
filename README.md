@@ -190,5 +190,6 @@ python_api/
 
 ## License
 
-仅供学习研究使用，源码版权归Anthropic所有。
-For educational and research purposes only. Source code copyright belongs to Anthropic.
+MIT License - 详见 [LICENSE](LICENSE) 文件。
+
+本项目是基于 Claude Code 概念独立实现的 Python 版本，代码由社区贡献。
