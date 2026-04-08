@@ -121,6 +121,14 @@ __all__ = [
     # 睡眠工具
     "SleepTool",
     "SleepInput",
+    # LSP工具
+    "LSPTool",
+    "LSPInput",
+    # MCP资源工具
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    "ListMcpResourcesInput",
+    "ReadMcpResourceInput",
 ]
 
 
@@ -209,3 +217,9 @@ from .powershell_tool import PowerShellTool, PowerShellInput
 
 # 睡眠工具
 from .sleep_tool import SleepTool, SleepInput
+
+# LSP工具
+from .lsp_tool import LSPTool, LSPInput
+
+# MCP资源工具
+from .mcp_resource_tool import ListMcpResourcesTool, ReadMcpResourceTool, ListMcpResourcesInput, ReadMcpResourceInput
