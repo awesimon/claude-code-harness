@@ -13,7 +13,7 @@ import { useChat } from '@/hooks/useChat';
 import { useSSE } from '@/hooks/useSSE';
 import { useChatStore } from '@/stores/chatStore';
 import { MagneticButton } from '@/components/ui/MagneticButton';
-import type { ModelType } from '@/types';
+import { fetchModels, selectModel, type ModelInfo } from '@/services/modelService';
 import { cn } from '@/lib/utils';
 
 export default function App() {
@@ -32,8 +32,32 @@ export default function App() {
   const { connectionStatus } = useSSE();
   const { selectedModel, setSelectedModel, setError } = useChatStore();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = React.useState(false);
+  const [models, setModels] = React.useState<ModelInfo[]>([]);
+  const [isLoadingModels, setIsLoadingModels] = React.useState(true);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
   const shouldReduceMotion = useReducedMotion();
+
+  // 加载模型列表
+  React.useEffect(() => {
+    const loadModels = async () => {
+      try {
+        setIsLoadingModels(true);
+        const data = await fetchModels();
+        setModels(data.models);
+        // 如果没有选中的模型，使用默认模型
+        if (!selectedModel && data.default_model) {
+          setSelectedModel(data.default_model);
+        }
+      } catch (err) {
+        console.error('Failed to load models:', err);
+        setError('Failed to load models');
+      } finally {
+        setIsLoadingModels(false);
+      }
+    };
+
+    loadModels();
+  }, [selectedModel, setSelectedModel, setError]);
 
   const handleQuickAction = React.useCallback(
     (command: string) => {
@@ -43,8 +67,13 @@ export default function App() {
   );
 
   const handleModelChange = React.useCallback(
-    (value: string) => {
-      setSelectedModel(value as ModelType);
+    async (value: string) => {
+      setSelectedModel(value);
+      try {
+        await selectModel(value);
+      } catch (err) {
+        console.error('Failed to select model:', err);
+      }
     },
     [setSelectedModel]
   );
@@ -85,14 +114,19 @@ export default function App() {
 
           <div className="flex items-center gap-3">
             {/* Model Select */}
-            <Select value={selectedModel} onValueChange={handleModelChange}>
-              <SelectTrigger className="w-[160px] glass-strong h-9">
-                <SelectValue placeholder="Select model" />
+            <Select value={selectedModel} onValueChange={handleModelChange} disabled={isLoadingModels}>
+              <SelectTrigger className="w-[180px] glass-strong h-9">
+                <SelectValue placeholder={isLoadingModels ? "Loading..." : "Select model"} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="gpt-4o">GPT-4o</SelectItem>
-                <SelectItem value="claude-3-sonnet">Claude 3 Sonnet</SelectItem>
-                <SelectItem value="claude-3-opus">Claude 3 Opus</SelectItem>
+                {models.map((model) => (
+                  <SelectItem key={model.model_id} value={model.model_id}>
+                    <div className="flex flex-col">
+                      <span>{model.name}</span>
+                      <span className="text-xs text-muted-foreground">{model.provider}</span>
+                    </div>
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
 

@@ -85,6 +85,14 @@ __all__ = [
     "MCPManager",
     "MCPServer",
     "MCPTool",
+    # MCP资源工具
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    "ListMcpResourcesInput",
+    "ReadMcpResourceInput",
+    # MCP认证工具
+    "McpAuthTool",
+    "McpAuthInput",
     # 配置工具
     "ConfigGetTool",
     "ConfigSetTool",
@@ -103,7 +111,6 @@ __all__ = [
     "ScheduleDeleteInput",
     "ScheduleListInput",
     "ScheduleToggleInput",
-    # 新增工具
     # Brief工具
     "BriefTool",
     "BriefInput",
@@ -124,11 +131,9 @@ __all__ = [
     # LSP工具
     "LSPTool",
     "LSPInput",
-    # MCP资源工具
-    "ListMcpResourcesTool",
-    "ReadMcpResourceTool",
-    "ListMcpResourcesInput",
-    "ReadMcpResourceInput",
+    # 验证计划工具
+    "VerifyPlanExecutionTool",
+    "VerifyPlanInput",
 ]
 
 

@@ -23,7 +23,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
       isProcessing: false,
       status: 'idle',
       connectionStatus: 'disconnected',
-      selectedModel: 'claude-3-sonnet',
+      selectedModel: 'gpt-4o',
       error: null,
 
       // Actions

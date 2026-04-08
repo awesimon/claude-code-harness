@@ -32,7 +32,8 @@ export interface Conversation {
 
 export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting' | 'error';
 
-export type ModelType = 'gpt-4o' | 'claude-3-sonnet';
+// Model type is now dynamic - any string is valid
+export type ModelType = string;
 
 export interface ChatState {
   conversations: Conversation[];
