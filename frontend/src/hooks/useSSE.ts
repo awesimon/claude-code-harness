@@ -17,7 +17,7 @@ export function useSSE() {
       store.setConnectionStatus('error');
     }
     return isHealthy;
-  }, [store]);
+  }, [store.setConnectionStatus]);
 
   const reconnect = useCallback(() => {
     if (reconnectAttempts >= maxReconnectAttempts) {
@@ -40,10 +40,7 @@ export function useSSE() {
 
     // Periodic health check - every 60 seconds is enough
     const interval = setInterval(() => {
-      // Only check if we're not already in error state
-      if (store.connectionStatus !== 'error') {
-        checkConnection();
-      }
+      checkConnection();
     }, 60000);
 
     return () => {
@@ -52,7 +49,9 @@ export function useSSE() {
         clearTimeout(reconnectTimeoutRef.current);
       }
     };
-  }, [checkConnection, store.connectionStatus]);
+    // Only run on mount and when checkConnection changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return {
     connectionStatus: store.connectionStatus,
