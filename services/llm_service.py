@@ -158,7 +158,14 @@ class LLMService:
             raise ValueError(f"Unsupported provider: {request.provider}")
 
     def _get_temperature(self, request_temp: Optional[float]) -> float:
-        """获取 temperature，默认 1.0"""
+        """获取 temperature，默认 1.0
+
+        注意：infini-ai 代理只接受 temperature=1.0
+        """
+        # 检查是否使用 infini-ai 代理
+        base_url = os.getenv("OPENAI_BASE_URL", "")
+        if "infini-ai" in base_url:
+            return 1.0
         return request_temp if request_temp is not None else 1.0
 
     async def _openai_chat_completion(
@@ -166,6 +173,11 @@ class LLMService:
         request: ChatCompletionRequest,
     ) -> ChatCompletionResponse:
         """OpenAI聊天完成"""
+        # 检查是否使用 infini-ai 代理，如果是则直接使用 httpx
+        base_url = os.getenv("OPENAI_BASE_URL", "")
+        if "infini-ai" in base_url:
+            return await self._infini_ai_chat_completion(request)
+
         client = self._get_openai_client()
 
         model = request.model or self._default_model
@@ -207,11 +219,76 @@ class LLMService:
             raw_response=response.model_dump(),
         )
 
+    async def _infini_ai_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        """直接使用 httpx 调用 infini-ai API"""
+        import httpx
+
+        base_url = os.getenv("OPENAI_BASE_URL", "https://cloud.infini-ai.com/maas/coding/v1")
+        api_key = os.getenv("OPENAI_API_KEY")
+
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable not set")
+
+        model = request.model or self._default_model
+        messages = [m.to_openai() for m in request.messages]
+
+        # 构建请求体
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": request.temperature if request.temperature is not None else 0.7,
+        }
+
+        if request.max_tokens:
+            payload["max_tokens"] = request.max_tokens
+
+        if request.tools:
+            payload["tools"] = request.tools
+        if request.tool_choice:
+            payload["tool_choice"] = request.tool_choice
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=60.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        choice = data["choices"][0]
+        message = choice["message"]
+
+        return ChatCompletionResponse(
+            id=data.get("id", ""),
+            model=data.get("model", model),
+            content=message.get("content", ""),
+            role=message.get("role", "assistant"),
+            tool_calls=message.get("tool_calls"),
+            usage=data.get("usage"),
+            finish_reason=choice.get("finish_reason"),
+            raw_response=data,
+        )
+
     async def _openai_chat_completion_stream(
         self,
         request: ChatCompletionRequest,
     ) -> AsyncIterator[ChatCompletionResponse]:
         """OpenAI流式聊天完成"""
+        # 检查是否使用 infini-ai 代理，如果是则直接使用 httpx
+        base_url = os.getenv("OPENAI_BASE_URL", "")
+        if "infini-ai" in base_url:
+            async for chunk in self._infini_ai_chat_completion_stream(request):
+                yield chunk
+            return
+
         client = self._get_openai_client()
 
         model = request.model or self._default_model
@@ -247,6 +324,72 @@ class LLMService:
                 finish_reason=finish_reason,
                 raw_response=chunk.model_dump(),
             )
+
+    async def _infini_ai_chat_completion_stream(
+        self,
+        request: ChatCompletionRequest,
+    ) -> AsyncIterator[ChatCompletionResponse]:
+        """直接使用 httpx 调用 infini-ai API 流式接口"""
+        import httpx
+
+        base_url = os.getenv("OPENAI_BASE_URL", "https://cloud.infini-ai.com/maas/coding/v1")
+        api_key = os.getenv("OPENAI_API_KEY")
+
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable not set")
+
+        model = request.model or self._default_model
+        messages = [m.to_openai() for m in request.messages]
+
+        # 构建请求体
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": request.temperature if request.temperature is not None else 0.7,
+            "stream": True,
+        }
+
+        if request.max_tokens:
+            payload["max_tokens"] = request.max_tokens
+
+        if request.tools:
+            payload["tools"] = request.tools
+
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=60.0,
+            ) as response:
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            data = json.loads(data_str)
+                            choice = data.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+
+                            yield ChatCompletionResponse(
+                                id=data.get("id", ""),
+                                model=data.get("model", model),
+                                content=delta.get("content", ""),
+                                role=delta.get("role", "assistant"),
+                                tool_calls=delta.get("tool_calls"),
+                                finish_reason=choice.get("finish_reason"),
+                                raw_response=data,
+                            )
+                        except json.JSONDecodeError:
+                            continue
 
     async def _anthropic_chat_completion(
         self,
