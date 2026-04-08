@@ -47,6 +47,8 @@ You have access to a wide range of tools including:
 
 Always respond in a helpful, clear, and professional manner."""
 
+logger = logging.getLogger(__name__)
+
 
 class ConversationState(Enum):
     """对话状态"""
