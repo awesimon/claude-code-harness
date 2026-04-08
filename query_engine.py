@@ -15,7 +15,37 @@ from services import LLMService, LLMProvider, Message, ChatCompletionRequest
 from tools import ToolRegistry
 from tools.base import ToolResult
 
-logger = logging.getLogger(__name__)
+# 系统提示词 - 定义AI助手的行为和能力
+SYSTEM_PROMPT = """You are Claude Code, a powerful AI coding assistant created by Anthropic.
+
+Your goal is to help users with software engineering tasks by:
+1. Understanding their requests thoroughly
+2. Using available tools to explore, analyze, and modify code
+3. Providing clear explanations and reasoning
+4. Following best practices for software development
+
+When using tools:
+- Always think step by step about what you need to do
+- Use file tools to read and understand code before making changes
+- Use bash tools to run commands when necessary
+- Use search tools to find relevant code
+- Explain your actions and reasoning to the user
+
+Be proactive but careful:
+- Ask for clarification if the request is ambiguous
+- Validate your understanding before making destructive changes
+- Provide code examples when helpful
+- Consider edge cases and potential issues
+
+You have access to a wide range of tools including:
+- File operations (read, write, edit)
+- Code search (glob, grep)
+- Command execution (bash)
+- Web search and fetch
+- Agent management for complex tasks
+- And more...
+
+Always respond in a helpful, clear, and professional manner."""
 
 
 class ConversationState(Enum):
@@ -75,6 +105,9 @@ class ConversationContext:
     def to_llm_messages(self) -> List[Message]:
         """转换为LLM消息格式"""
         llm_messages = []
+
+        # 添加系统提示词作为第一条消息
+        llm_messages.append(Message(role="system", content=SYSTEM_PROMPT))
 
         for turn in self.messages:
             if turn.role == "assistant" and turn.tool_calls:
@@ -415,13 +448,147 @@ class QueryEngine:
         self,
         conversation_id: str,
         user_message: str,
+        temperature: Optional[float] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
-        流式对话（简化版，实际实现需要更复杂的SSE处理）
+        流式对话 - 实现真正的流式输出
         """
-        # 目前先使用非流式，但按token模拟流式效果
-        async for event in self.chat(conversation_id, user_message, stream=False):
-            yield event
+        context = self._conversations.get(conversation_id)
+        if not context:
+            yield {"type": "error", "error": f"Conversation {conversation_id} not found"}
+            return
+
+        # 添加用户消息
+        context.messages.append(ConversationTurn(
+            role="user",
+            content=user_message
+        ))
+
+        yield {"type": "user_message", "content": user_message}
+
+        # 开始对话循环
+        iteration = 0
+        while iteration < self.max_iterations:
+            iteration += 1
+            logger.info(f"Iteration {iteration} for conversation {conversation_id}")
+
+            self._update_state(context, ConversationState.THINKING)
+            yield {"type": "state_change", "state": "thinking"}
+
+            # 调用 LLM（流式）
+            llm_messages = context.to_llm_messages()
+            tools = self._build_tools_schema()
+
+            try:
+                # 使用流式API
+                full_content = ""
+                tool_calls_buffer = []
+
+                async for chunk in self.llm_service.chat_completion_stream(
+                    ChatCompletionRequest(
+                        messages=llm_messages,
+                        model=self.model,
+                        tools=tools if tools else None,
+                        tool_choice="auto" if tools else None,
+                        provider=self.provider,
+                        temperature=temperature,
+                    )
+                ):
+                    # 检查是否是工具调用
+                    if chunk.tool_calls:
+                        tool_calls_buffer.extend(chunk.tool_calls)
+
+                    # 发送内容片段
+                    if chunk.content:
+                        full_content += chunk.content
+                        yield {
+                            "type": "assistant_message",
+                            "content": chunk.content,
+                            "is_streaming": True
+                        }
+
+                    # 检查是否完成
+                    if chunk.finish_reason:
+                        break
+
+                # 处理工具调用
+                if tool_calls_buffer:
+                    tool_calls = [ToolCall.from_openai(tc) for tc in tool_calls_buffer]
+
+                    assistant_turn = ConversationTurn(
+                        role="assistant",
+                        content=full_content or "",
+                        tool_calls=tool_calls
+                    )
+                    context.messages.append(assistant_turn)
+
+                    # 发送工具调用事件
+                    yield {
+                        "type": "tool_call",
+                        "tool_calls": [
+                            {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                            for tc in tool_calls
+                        ]
+                    }
+
+                    # 执行工具
+                    self._update_state(context, ConversationState.TOOL_CALLING)
+                    yield {"type": "state_change", "state": "tool_calling"}
+
+                    observations = await self._execute_tools(tool_calls)
+
+                    # 添加工具观察消息
+                    tool_turn = ConversationTurn(
+                        role="tool",
+                        tool_observations=observations
+                    )
+                    context.messages.append(tool_turn)
+
+                    # 发送工具结果
+                    for obs in observations:
+                        yield {
+                            "type": "tool_result",
+                            "tool_call_id": obs.tool_call_id,
+                            "name": obs.name,
+                            "success": obs.result.success,
+                            "result": obs.result.data if obs.result.success else str(obs.result.error),
+                            "execution_time": obs.execution_time
+                        }
+
+                    self._update_state(context, ConversationState.OBSERVING)
+                    yield {"type": "state_change", "state": "observing"}
+
+                else:
+                    # 没有工具调用，对话完成
+                    assistant_turn = ConversationTurn(
+                        role="assistant",
+                        content=full_content
+                    )
+                    context.messages.append(assistant_turn)
+                    self._update_state(context, ConversationState.COMPLETED)
+
+                    yield {
+                        "type": "assistant_message",
+                        "content": full_content,
+                        "finish_reason": "stop",
+                        "is_streaming": False
+                    }
+                    return
+
+            except Exception as e:
+                logger.error(f"LLM call failed: {e}")
+                self._update_state(context, ConversationState.ERROR)
+                yield {"type": "error", "error": f"LLM call failed: {str(e)}"}
+                return
+
+        # 达到最大迭代次数
+        logger.warning(f"Max iterations ({self.max_iterations}) reached")
+        self._update_state(context, ConversationState.COMPLETED)
+        yield {
+            "type": "assistant_message",
+            "content": "（已达到最大迭代次数，对话结束）",
+            "finish_reason": "max_iterations"
+        }
 
     def get_conversation_history(self, conversation_id: str) -> Optional[List[Dict]]:
         """获取对话历史"""

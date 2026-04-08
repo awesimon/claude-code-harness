@@ -58,7 +58,7 @@ export const useChatStore = create<ChatState & ChatActions>()(
       updateMessage: (id, content) => {
         set((state) => {
           const newMessages = state.messages.map((m) =>
-            m.id === id ? { ...m, content: m.content + content } : m
+            m.id === id ? { ...m, content: content } : m
           );
           if (state.currentConversationId) {
             const updatedConversations = state.conversations.map((c) =>
