@@ -50,6 +50,8 @@ export interface ChatActions {
   setCurrentConversation: (id: string | null) => void;
   addMessage: (message: Omit<Message, 'id' | 'timestamp'>) => string;
   updateMessage: (id: string, content: string) => void;
+  updateMessageToolCalls: (id: string, toolCalls: ToolCall[]) => void;
+  updateMessageToolResults: (id: string, toolResults: ToolResult[]) => void;
   setProcessing: (isProcessing: boolean) => void;
   setStatus: (status: ChatState['status']) => void;
   setConnectionStatus: (status: ConnectionStatus) => void;
@@ -67,8 +69,12 @@ export interface SSEEvent {
   data?: unknown;
   content?: string;
   tool_calls?: ToolCall[];
-  state?: string;
+  tool_call_id?: string;
+  name?: string;
+  success?: boolean;
+  result?: unknown;
   error?: string;
+  state?: string;
 }
 
 export interface UserMessageEvent extends SSEEvent {
@@ -89,9 +95,11 @@ export interface ToolCallEvent extends SSEEvent {
 
 export interface ToolResultEvent extends SSEEvent {
   type: 'tool_result';
+  tool_call_id?: string;
   name: string;
   success: boolean;
   result: unknown;
+  error?: string;
 }
 
 export interface StateChangeEvent extends SSEEvent {

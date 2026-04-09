@@ -4,10 +4,10 @@ LLM服务模块
 """
 
 import os
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, AsyncIterator, Union
-import json
 
 import httpx
 from openai import AsyncOpenAI
@@ -211,42 +211,79 @@ class LLMService:
         self,
         request: ChatCompletionRequest,
     ) -> AsyncIterator[ChatCompletionResponse]:
-        """OpenAI流式聊天完成"""
-        client = self._get_openai_client()
+        """OpenAI流式聊天完成 - 直接使用httpx处理SSE"""
+        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        api_key = os.getenv("OPENAI_API_KEY")
+
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY environment variable not set")
 
         model = request.model or self._default_model
         messages = [m.to_openai() for m in request.messages]
 
-        kwargs = {
+        # 构建请求体
+        payload = {
             "model": model,
             "messages": messages,
-            "temperature": self._get_temperature(request.temperature),
+            "temperature": request.temperature if request.temperature is not None else 0.7,
             "stream": True,
+            "max_tokens": request.max_tokens or self._default_max_tokens,
         }
 
-        if request.max_tokens:
-            kwargs["max_tokens"] = request.max_tokens
-        else:
-            kwargs["max_tokens"] = self._default_max_tokens
-
         if request.tools:
-            kwargs["tools"] = request.tools
+            payload["tools"] = request.tools
+        if request.tool_choice:
+            payload["tool_choice"] = request.tool_choice
 
-        stream = await client.chat.completions.create(**kwargs)
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=httpx.Timeout(60.0, connect=10.0),
+            ) as response:
+                response.raise_for_status()
 
-        async for chunk in stream:
-            delta = chunk.choices[0].delta
-            finish_reason = chunk.choices[0].finish_reason
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
 
-            yield ChatCompletionResponse(
-                id=chunk.id,
-                model=chunk.model,
-                content=delta.content or "",
-                role=delta.role or "assistant",
-                tool_calls=[tc.model_dump() for tc in delta.tool_calls] if delta.tool_calls else None,
-                finish_reason=finish_reason,
-                raw_response=chunk.model_dump(),
-            )
+                        try:
+                            data = json.loads(data_str)
+                            choices = data.get("choices", [])
+                            if not choices:
+                                continue
+                            
+                            choice = choices[0]
+                            delta = choice.get("delta", {})
+                            
+                            # 提取工具调用
+                            tool_calls = None
+                            if delta.get("tool_calls"):
+                                tool_calls = delta["tool_calls"]
+
+                            yield ChatCompletionResponse(
+                                id=data.get("id", ""),
+                                model=data.get("model", model),
+                                content=delta.get("content", ""),
+                                role=delta.get("role", "assistant"),
+                                tool_calls=tool_calls,
+                                finish_reason=choice.get("finish_reason"),
+                                raw_response=data,
+                            )
+                        except json.JSONDecodeError:
+                            # 忽略无法解析的行
+                            continue
 
     async def _anthropic_chat_completion(
         self,

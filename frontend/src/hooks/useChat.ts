@@ -41,7 +41,6 @@ export function useChat() {
       abortControllerRef.current = new AbortController();
 
       let assistantMessageId: string | null = null;
-      let currentToolCalls: ToolCall[] = [];
 
       try {
         await streamMessage(
@@ -54,31 +53,46 @@ export function useChat() {
               switch (event.type) {
                 case 'assistant_message':
                   if (!assistantMessageId) {
+                    // First assistant message - create new message
                     assistantMessageId = store.addMessage({
                       role: 'assistant',
                       content: event.content || '',
                     });
                     store.setStatus('streaming');
                   } else {
-                    store.updateMessage(assistantMessageId, event.content || '');
+                    // Append content to existing message
+                    if (event.content) {
+                      store.updateMessage(assistantMessageId, event.content);
+                    }
                   }
                   break;
 
                 case 'tool_call':
                   store.setStatus('tool_calling');
-                  if (event.tool_calls) {
-                    currentToolCalls = [...currentToolCalls, ...event.tool_calls];
+                  if (event.tool_calls && assistantMessageId) {
+                    store.updateMessageToolCalls(assistantMessageId, event.tool_calls);
                   }
                   break;
 
                 case 'tool_result':
-                  // Tool results are handled separately
+                  if (assistantMessageId) {
+                    const toolResult: ToolResult = {
+                      id: event.tool_call_id || '',
+                      name: event.name || '',
+                      success: event.success || false,
+                      result: event.result,
+                      error: event.error,
+                    };
+                    store.updateMessageToolResults(assistantMessageId, [toolResult]);
+                  }
                   break;
 
                 case 'state_change':
                   if (event.state === 'thinking') {
                     store.setStatus('thinking');
                   } else if (event.state === 'tool_calling') {
+                    store.setStatus('tool_calling');
+                  } else if (event.state === 'observing') {
                     store.setStatus('tool_calling');
                   } else {
                     store.setStatus('streaming');

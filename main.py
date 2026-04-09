@@ -621,7 +621,7 @@ async def chat_stream(request: ChatRequest):
         raise HTTPException(status_code=404, detail=f"对话 {conversation_id} 不存在")
 
     async def generate():
-        async for event in query_engine.chat(conversation_id, request.message):
+        async for event in query_engine.chat_stream(conversation_id, request.message):
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 

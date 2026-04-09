@@ -612,7 +612,8 @@ class QueryEngine:
             try:
                 # 使用流式API
                 full_content = ""
-                tool_calls_buffer = []
+                # 使用字典来累积工具调用，key是index
+                tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
 
                 async for chunk in self.llm_service.chat_completion_stream(
                     ChatCompletionRequest(
@@ -626,7 +627,23 @@ class QueryEngine:
                 ):
                     # 检查是否是工具调用
                     if chunk.tool_calls:
-                        tool_calls_buffer.extend(chunk.tool_calls)
+                        # 累积工具调用片段（处理流式delta格式）
+                        for tc in chunk.tool_calls:
+                            idx = tc.get("index", 0)
+                            if idx not in tool_calls_accumulator:
+                                tool_calls_accumulator[idx] = {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""}
+                                }
+                            # 累积各个字段
+                            if tc.get("id"):
+                                tool_calls_accumulator[idx]["id"] = tc["id"]
+                            func = tc.get("function", {})
+                            if func.get("name"):
+                                tool_calls_accumulator[idx]["function"]["name"] = func["name"]
+                            if func.get("arguments"):
+                                tool_calls_accumulator[idx]["function"]["arguments"] += func["arguments"]
 
                     # 发送内容片段
                     if chunk.content:
@@ -642,7 +659,9 @@ class QueryEngine:
                         break
 
                 # 处理工具调用
-                if tool_calls_buffer:
+                if tool_calls_accumulator:
+                    # 将累积的工具调用转换为列表
+                    tool_calls_buffer = [tool_calls_accumulator[i] for i in sorted(tool_calls_accumulator.keys())]
                     tool_calls = [ToolCall.from_openai(tc) for tc in tool_calls_buffer]
 
                     assistant_turn = ConversationTurn(

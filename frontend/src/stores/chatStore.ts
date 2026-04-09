@@ -58,7 +58,41 @@ export const useChatStore = create<ChatState & ChatActions>()(
       updateMessage: (id, content) => {
         set((state) => {
           const newMessages = state.messages.map((m) =>
-            m.id === id ? { ...m, content: content } : m
+            m.id === id ? { ...m, content: m.content + content } : m
+          );
+          if (state.currentConversationId) {
+            const updatedConversations = state.conversations.map((c) =>
+              c.id === state.currentConversationId
+                ? { ...c, messages: newMessages, updatedAt: Date.now() }
+                : c
+            );
+            return { messages: newMessages, conversations: updatedConversations };
+          }
+          return { messages: newMessages };
+        });
+      },
+
+      updateMessageToolCalls: (id, toolCalls) => {
+        set((state) => {
+          const newMessages = state.messages.map((m) =>
+            m.id === id ? { ...m, toolCalls: [...(m.toolCalls || []), ...toolCalls] } : m
+          );
+          if (state.currentConversationId) {
+            const updatedConversations = state.conversations.map((c) =>
+              c.id === state.currentConversationId
+                ? { ...c, messages: newMessages, updatedAt: Date.now() }
+                : c
+            );
+            return { messages: newMessages, conversations: updatedConversations };
+          }
+          return { messages: newMessages };
+        });
+      },
+
+      updateMessageToolResults: (id, toolResults) => {
+        set((state) => {
+          const newMessages = state.messages.map((m) =>
+            m.id === id ? { ...m, toolResults: [...(m.toolResults || []), ...toolResults] } : m
           );
           if (state.currentConversationId) {
             const updatedConversations = state.conversations.map((c) =>
