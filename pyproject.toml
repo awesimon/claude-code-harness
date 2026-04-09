@@ -13,6 +13,7 @@ dependencies = [
     "python-multipart>=0.0.6",
     "openai>=1.0.0",
     "python-dotenv>=1.0.0",
+    "beautifulsoup4>=4.14.3",
 ]
 
 [project.optional-dependencies]
