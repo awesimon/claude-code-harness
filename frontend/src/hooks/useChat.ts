@@ -118,6 +118,16 @@ export function useChat() {
                   }
                   break;
 
+                case 'thinking':
+                  // 处理思考过程
+                  if (streamingStateRef.current.currentAssistantId && event.content) {
+                    store.updateMessageThinking(
+                      streamingStateRef.current.currentAssistantId,
+                      event.content
+                    );
+                  }
+                  break;
+
                 case 'state_change':
                   if (event.state === 'thinking') {
                     store.setStatus('thinking');

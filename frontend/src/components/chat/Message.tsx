@@ -9,6 +9,7 @@ import type { Message as MessageType } from '@/types';
 import { cn } from '@/lib/utils';
 import { ToolCall } from '@/components/tools/ToolCall';
 import { ToolResult } from '@/components/tools/ToolResult';
+import { ThinkingBlock } from './ThinkingBlock';
 
 // Configure marked for security and features
 marked.setOptions({
@@ -199,6 +200,7 @@ export const Message = React.memo(function Message({
 
   // Track expanded states for tool calls and results
   const [expandedTools, setExpandedTools] = React.useState<Set<string>>(new Set());
+  const [isThinkingExpanded, setIsThinkingExpanded] = React.useState(false);
 
   const toggleTool = React.useCallback((id: string) => {
     setExpandedTools((prev) => {
@@ -212,13 +214,19 @@ export const Message = React.memo(function Message({
     });
   }, []);
 
-  // Handle copy button clicks for code blocks
+  const toggleThinking = React.useCallback(() => {
+    setIsThinkingExpanded((prev) => !prev);
+  }, []);
+
+  // Handle copy button clicks for code blocks - 使用稳定的事件委托
   React.useEffect(() => {
     if (!contentRef.current) return;
 
-    const handleCodeCopy = async (e: Event) => {
-      const target = e.target as HTMLElement;
-      const button = target.closest('.code-copy-btn') as HTMLButtonElement;
+    // 使用事件委托，只绑定一次到容器
+    const contentElement = contentRef.current;
+
+    const handleCodeCopy = async (e: MouseEvent) => {
+      const button = (e.target as HTMLElement).closest('.code-copy-btn') as HTMLButtonElement;
       if (!button) return;
 
       const code = decodeURIComponent(button.dataset.code || '');
@@ -241,17 +249,12 @@ export const Message = React.memo(function Message({
       }
     };
 
-    const codeBlocks = contentRef.current.querySelectorAll('.code-copy-btn');
-    codeBlocks.forEach((btn) => {
-      btn.addEventListener('click', handleCodeCopy);
-    });
+    contentElement.addEventListener('click', handleCodeCopy);
 
     return () => {
-      codeBlocks.forEach((btn) => {
-        btn.removeEventListener('click', handleCodeCopy);
-      });
+      contentElement.removeEventListener('click', handleCodeCopy);
     };
-  }, [message.content, copy]);
+  }, [copy]); // 只依赖 copy 函数，不依赖 message.content
 
   // Handle message copy
   const handleCopyMessage = React.useCallback(async () => {
@@ -267,21 +270,22 @@ export const Message = React.memo(function Message({
   const hasContent = Boolean(message.content?.trim());
   const hasToolCalls = message.toolCalls && message.toolCalls.length > 0;
   const hasToolResults = message.toolResults && message.toolResults.length > 0;
+  const hasThinking = Boolean(message.thinking?.trim());
 
-  // Animation variants
+  // Animation variants - 简化动画以提高性能
   const containerVariants = {
-    initial: shouldReduceMotion ? { opacity: 1 } : { opacity: 0, y: 20 },
-    animate: { opacity: 1, y: 0 },
+    initial: { opacity: 1 },
+    animate: { opacity: 1 },
   };
 
   const avatarVariants = {
-    initial: shouldReduceMotion ? { opacity: 1 } : { scale: 0.8, opacity: 0 },
-    animate: { scale: 1, opacity: 1 },
+    initial: { opacity: 1 },
+    animate: { opacity: 1 },
   };
 
   const contentVariants = {
-    initial: shouldReduceMotion ? { opacity: 1 } : { opacity: 0, x: isUser ? 20 : -20 },
-    animate: { opacity: 1, x: 0 },
+    initial: { opacity: 1 },
+    animate: { opacity: 1 },
   };
 
   return (
@@ -315,6 +319,16 @@ export const Message = React.memo(function Message({
 
       {/* Content Column */}
       <div className={cn('flex-1 min-w-0', isUser ? 'text-right' : 'text-left')}>
+        {/* Thinking Block - Display before content */}
+        {hasThinking && (
+          <ThinkingBlock
+            thinking={message.thinking!}
+            thinkingTime={message.thinkingTime}
+            isExpanded={isThinkingExpanded}
+            onToggle={toggleThinking}
+          />
+        )}
+
         {/* Message Content */}
         {hasContent && (
           <motion.div

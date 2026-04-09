@@ -463,34 +463,20 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
                 </button>
               </motion.div>
             ) : (
-              <AnimatePresence mode="popLayout" initial={false}>
+              <>
                 {visibleMessages.map((message, index) => (
-                  <motion.div
+                  <div
                     key={message.id}
-                    // 移除 layout prop 避免频繁的布局计算
-                    initial={
-                      shouldReduceMotion
-                        ? { opacity: 1 }
-                        : { opacity: 0, y: 20 }
-                    }
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, scale: 0.95 }}
-                    transition={{
-                      duration: 0.2,
-                      delay: shouldReduceMotion
-                        ? 0
-                        : Math.min(index * 0.02, 0.1),
-                      ease: [0.16, 1, 0.3, 1],
-                    }}
+                    className="message-item"
                   >
                     <Message
                       message={message}
                       isLast={index === visibleMessages.length - 1}
                       onCopy={onCopyMessage}
                     />
-                  </motion.div>
+                  </div>
                 ))}
-              </AnimatePresence>
+              </>
             )}
 
             {/* Loading/Typing indicator */}

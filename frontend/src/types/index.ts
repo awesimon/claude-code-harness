@@ -6,6 +6,8 @@ export interface Message {
   timestamp: number;
   toolCalls?: ToolCall[];
   toolResults?: ToolResult[];
+  thinking?: string; // 思考过程
+  thinkingTime?: number; // 思考耗时(ms)
 }
 
 export interface ToolCall {
@@ -52,6 +54,7 @@ export interface ChatActions {
   updateMessage: (id: string, content: string) => void;
   updateMessageToolCalls: (id: string, toolCalls: ToolCall[]) => void;
   updateMessageToolResults: (id: string, toolResults: ToolResult[]) => void;
+  updateMessageThinking: (id: string, thinking: string) => void;
   setProcessing: (isProcessing: boolean) => void;
   setStatus: (status: ChatState['status']) => void;
   setConnectionStatus: (status: ConnectionStatus) => void;
@@ -65,7 +68,7 @@ export interface ChatActions {
 
 // SSE Event types
 export interface SSEEvent {
-  type: 'user_message' | 'assistant_message' | 'tool_call' | 'tool_result' | 'state_change' | 'error' | 'done';
+  type: 'user_message' | 'assistant_message' | 'thinking' | 'tool_call' | 'tool_result' | 'state_change' | 'error' | 'done';
   data?: unknown;
   content?: string;
   tool_calls?: ToolCall[];

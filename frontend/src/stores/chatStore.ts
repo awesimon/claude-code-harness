@@ -88,9 +88,16 @@ export const useChatStore = create<ChatState & ChatActions>()(
 
       updateMessageToolCalls: (id, toolCalls) => {
         set((state) => {
-          const newMessages = state.messages.map((m) =>
-            m.id === id ? { ...m, toolCalls: [...(m.toolCalls || []), ...toolCalls] } : m
-          );
+          const newMessages = state.messages.map((m) => {
+            if (m.id === id) {
+              // 限制 toolCalls 数量
+              const existing = m.toolCalls || [];
+              const combined = [...existing, ...toolCalls];
+              const limited = combined.slice(-20); // 最多保留20个
+              return { ...m, toolCalls: limited };
+            }
+            return m;
+          });
           if (state.currentConversationId) {
             const updatedConversations = state.conversations.map((c) =>
               c.id === state.currentConversationId
@@ -105,9 +112,42 @@ export const useChatStore = create<ChatState & ChatActions>()(
 
       updateMessageToolResults: (id, toolResults) => {
         set((state) => {
-          const newMessages = state.messages.map((m) =>
-            m.id === id ? { ...m, toolResults: [...(m.toolResults || []), ...toolResults] } : m
-          );
+          const newMessages = state.messages.map((m) => {
+            if (m.id === id) {
+              // 限制 toolResults 数量
+              const existing = m.toolResults || [];
+              const combined = [...existing, ...toolResults];
+              const limited = combined.slice(-20); // 最多保留20个
+              return { ...m, toolResults: limited };
+            }
+            return m;
+          });
+          if (state.currentConversationId) {
+            const updatedConversations = state.conversations.map((c) =>
+              c.id === state.currentConversationId
+                ? { ...c, messages: newMessages, updatedAt: Date.now() }
+                : c
+            );
+            return { messages: newMessages, conversations: updatedConversations };
+          }
+          return { messages: newMessages };
+        });
+      },
+
+      updateMessageThinking: (id, thinking) => {
+        set((state) => {
+          const newMessages = state.messages.map((m) => {
+            if (m.id === id) {
+              // 限制 thinking 长度
+              const newThinking = (m.thinking || '') + thinking;
+              const maxThinkingLength = 50000;
+              const truncatedThinking = newThinking.length > maxThinkingLength
+                ? newThinking.slice(0, maxThinkingLength) + '\n\n[思考内容已截断...]'
+                : newThinking;
+              return { ...m, thinking: truncatedThinking };
+            }
+            return m;
+          });
           if (state.currentConversationId) {
             const updatedConversations = state.conversations.map((c) =>
               c.id === state.currentConversationId
@@ -179,7 +219,8 @@ export const useChatStore = create<ChatState & ChatActions>()(
     {
       name: 'chat-storage',
       partialize: (state) => ({
-        conversations: state.conversations,
+        // 只保存最近的10个对话，限制localStorage大小
+        conversations: state.conversations.slice(0, 10),
         selectedModel: state.selectedModel,
       }),
     }

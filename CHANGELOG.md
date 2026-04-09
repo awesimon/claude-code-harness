@@ -62,6 +62,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fixed memory leak from unlimited message accumulation
 - Fixed React re-rendering issues with streaming content
 
+## [0.4.0] - 2025-04-10
+
+### Fixed
+- **Browser Freezing Issues** - Fixed long-running session performance degradation
+  - Limited thinking content to 50KB to prevent unbounded memory growth
+  - Limited toolCalls and toolResults to 20 items per message
+  - Limited persisted conversations to 10 in localStorage
+  - Optimized event delegation for code block copy buttons
+  - Removed AnimatePresence popLayout causing layout thrashing
+
+### Changed
+- Improved memory management in chat store
+- Optimized message component rendering
+
 ## [0.3.0] - 2024-04-04
 
 ### Added
