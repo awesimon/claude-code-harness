@@ -14,6 +14,7 @@ import logging
 from services import LLMService, LLMProvider, Message, ChatCompletionRequest
 from tools import ToolRegistry
 from tools.base import ToolResult
+from plan import get_plan_mode_manager, PlanModeState, NotInPlanModeError
 
 # 系统提示词 - 定义AI助手的行为和能力
 SYSTEM_PROMPT = """You are Claude Code, a powerful AI coding assistant created by Anthropic.
@@ -43,7 +44,28 @@ You have access to a wide range of tools including:
 - Command execution (bash)
 - Web search and fetch
 - Agent management for complex tasks
+- Plan mode for complex implementation tasks
 - And more...
+
+## Plan Mode
+
+For complex tasks that require exploration and design before implementation, you can use Plan Mode:
+
+1. Use `EnterPlanMode` when you need to:
+   - Explore the codebase thoroughly before making changes
+   - Design an architectural approach
+   - Consider multiple implementation options
+   - Get user approval before implementing
+
+2. In Plan Mode:
+   - You are in READ-ONLY mode - DO NOT write or edit files
+   - Explore the codebase to understand patterns
+   - Design a concrete implementation plan
+   - Consider trade-offs and alternatives
+
+3. Use `ExitPlanMode` when ready to:
+   - Present your plan for user approval
+   - Start implementing the approved plan
 
 Always respond in a helpful, clear, and professional manner."""
 
@@ -181,6 +203,7 @@ class QueryEngine:
         self.model = model or os.getenv("DEFAULT_MODEL")
         self._conversations: Dict[str, ConversationContext] = {}
         self._state_callbacks: List[Callable[[str, ConversationState, ConversationState], None]] = []
+        self._plan_mode_manager = get_plan_mode_manager()
 
     def _get_default_provider(self) -> LLMProvider:
         """根据环境变量确定默认 provider"""
@@ -246,9 +269,34 @@ class QueryEngine:
         """删除对话"""
         if conversation_id in self._conversations:
             del self._conversations[conversation_id]
+            # 清理计划模式相关数据
+            self._plan_mode_manager.clear_session(conversation_id)
             logger.info(f"Deleted conversation: {conversation_id}")
 
-    def _build_tools_schema(self) -> List[Dict[str, Any]]:
+    def is_in_plan_mode(self, conversation_id: str) -> bool:
+        """检查对话是否在计划模式中"""
+        return self._plan_mode_manager.is_in_plan_mode(conversation_id)
+
+    def get_plan_mode_state(self, conversation_id: str) -> PlanModeState:
+        """获取计划模式状态"""
+        return self._plan_mode_manager.get_state(conversation_id)
+
+    def _filter_tools_for_plan_mode(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        在计划模式下过滤工具
+        只允许只读工具：Read, Glob, Grep, Bash(只读命令)
+        """
+        allowed_tools = {"Read", "Glob", "Grep", "Bash", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion"}
+
+        filtered = []
+        for tool in tools:
+            tool_name = tool.get("function", {}).get("name", "")
+            if tool_name in allowed_tools:
+                filtered.append(tool)
+
+        return filtered
+
+    def _build_tools_schema(self, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """构建工具 schema 列表"""
         tools = []
         for name in ToolRegistry.list_tools():
@@ -263,6 +311,11 @@ class QueryEngine:
                         "parameters": schema.get("parameters", {"type": "object", "properties": {}})
                     }
                 })
+
+        # 如果在计划模式下，过滤工具
+        if conversation_id and self.is_in_plan_mode(conversation_id):
+            tools = self._filter_tools_for_plan_mode(tools)
+
         return tools
 
     async def chat(
@@ -307,7 +360,7 @@ class QueryEngine:
 
             # 调用 LLM
             llm_messages = context.to_llm_messages()
-            tools = self._build_tools_schema()
+            tools = self._build_tools_schema(conversation_id)
 
             try:
                 response = await self.llm_service.chat_completion(
@@ -371,7 +424,12 @@ class QueryEngine:
             self._update_state(context, ConversationState.TOOL_CALLING)
             yield {"type": "state_change", "state": "tool_calling"}
 
-            observations = await self._execute_tools(tool_calls)
+            observations = await self._execute_tools(tool_calls, conversation_id)
+
+            # 检查是否是 ExitPlanMode 工具调用
+            exit_plan_mode_called = any(
+                tc.name == "ExitPlanMode" for tc in tool_calls
+            )
 
             # 添加工具观察消息
             tool_turn = ConversationTurn(
@@ -391,6 +449,19 @@ class QueryEngine:
                     "execution_time": obs.execution_time
                 }
 
+            # 如果调用了 ExitPlanMode，处理审批流程
+            if exit_plan_mode_called:
+                plan_state = self.get_plan_mode_state(conversation_id)
+                if plan_state == PlanModeState.PENDING_APPROVAL:
+                    # 发送等待审批事件
+                    yield {
+                        "type": "plan_mode",
+                        "event": "pending_approval",
+                        "message": "Plan submitted for approval. Waiting for user..."
+                    }
+                    # 暂停对话循环，等待用户审批
+                    return
+
             self._update_state(context, ConversationState.OBSERVING)
             yield {"type": "state_change", "state": "observing"}
 
@@ -405,7 +476,8 @@ class QueryEngine:
 
     async def _execute_tools(
         self,
-        tool_calls: List[ToolCall]
+        tool_calls: List[ToolCall],
+        conversation_id: Optional[str] = None
     ) -> List[ToolObservation]:
         """
         并行执行工具调用
@@ -424,8 +496,49 @@ class QueryEngine:
                     execution_time=0
                 )
 
+            # 检查计划模式权限
+            if conversation_id and self.is_in_plan_mode(conversation_id):
+                # 在计划模式下，只允许只读工具
+                allowed_tools = {"Read", "Glob", "Grep", "Bash", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion"}
+                if tool_call.name not in allowed_tools:
+                    return ToolObservation(
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
+                        result=ToolResult.error(
+                            Exception(
+                                f"Tool '{tool_call.name}' is not allowed in plan mode. "
+                                "Only read-only tools are permitted during planning."
+                            )
+                        ),
+                        execution_time=0
+                    )
+
+                # 对于 Bash 工具，需要额外检查命令
+                if tool_call.name == "Bash":
+                    args = tool_call.arguments
+                    command = args.get("command", "")
+                    # 检查是否是只读命令
+                    write_commands = ["touch", "mkdir", "rm", "cp", "mv", ">", ">>", "|", "git add", "git commit"]
+                    if any(cmd in command for cmd in write_commands):
+                        return ToolObservation(
+                            tool_call_id=tool_call.id,
+                            name=tool_call.name,
+                            result=ToolResult.error(
+                                Exception(
+                                    "Write operations are not allowed in plan mode. "
+                                    f"Command '{command}' contains write operations."
+                                )
+                            ),
+                            execution_time=0
+                        )
+
             try:
-                result = await tool.run(tool_call.arguments)
+                # 构建工具上下文
+                tool_context = {
+                    "session_id": conversation_id,
+                    "current_mode": "plan" if (conversation_id and self.is_in_plan_mode(conversation_id)) else "default",
+                }
+                result = await tool.run(tool_call.arguments, tool_context)
             except Exception as e:
                 result = ToolResult.error(
                     Exception(f"Tool execution error: {str(e)}")
@@ -479,7 +592,7 @@ class QueryEngine:
 
             # 调用 LLM（流式）
             llm_messages = context.to_llm_messages()
-            tools = self._build_tools_schema()
+            tools = self._build_tools_schema(conversation_id)
 
             try:
                 # 使用流式API
@@ -537,7 +650,12 @@ class QueryEngine:
                     self._update_state(context, ConversationState.TOOL_CALLING)
                     yield {"type": "state_change", "state": "tool_calling"}
 
-                    observations = await self._execute_tools(tool_calls)
+                    observations = await self._execute_tools(tool_calls, conversation_id)
+
+                    # 检查是否是 ExitPlanMode 工具调用
+                    exit_plan_mode_called = any(
+                        tc.name == "ExitPlanMode" for tc in tool_calls
+                    )
 
                     # 添加工具观察消息
                     tool_turn = ConversationTurn(
@@ -556,6 +674,19 @@ class QueryEngine:
                             "result": obs.result.data if obs.result.success else str(obs.result.error),
                             "execution_time": obs.execution_time
                         }
+
+                    # 如果调用了 ExitPlanMode，处理审批流程
+                    if exit_plan_mode_called:
+                        plan_state = self.get_plan_mode_state(conversation_id)
+                        if plan_state == PlanModeState.PENDING_APPROVAL:
+                            # 发送等待审批事件
+                            yield {
+                                "type": "plan_mode",
+                                "event": "pending_approval",
+                                "message": "Plan submitted for approval. Waiting for user..."
+                            }
+                            # 暂停对话循环，等待用户审批
+                            return
 
                     self._update_state(context, ConversationState.OBSERVING)
                     yield {"type": "state_change", "state": "observing"}
@@ -610,6 +741,20 @@ class QueryEngine:
             }
             for turn in context.messages
         ]
+
+    def get_plan_mode_info(self, conversation_id: str) -> Optional[Dict]:
+        """获取计划模式信息"""
+        return self._plan_mode_manager.get_session_info(conversation_id)
+
+    async def approve_plan(self, conversation_id: str, edited_content: Optional[str] = None) -> Dict[str, Any]:
+        """批准计划"""
+        result = await self._plan_mode_manager.approve_plan(conversation_id, edited_content)
+        return result
+
+    async def reject_plan(self, conversation_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        """拒绝计划"""
+        result = await self._plan_mode_manager.reject_plan(conversation_id, reason)
+        return result
 
     def clear_conversation(self, conversation_id: str):
         """清空对话历史"""

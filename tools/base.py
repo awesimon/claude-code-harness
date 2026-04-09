@@ -170,12 +170,13 @@ class Tool(ABC, Generic[InputType, OutputType]):
         """
         return None
 
-    async def run(self, input_data: InputType) -> ToolResult:
+    async def run(self, input_data: InputType, context: Optional[Dict[str, Any]] = None) -> ToolResult:
         """
         运行工具（包含验证和执行）
 
         Args:
             input_data: 工具输入数据 (dataclass 或 dict)
+            context: 可选的执行上下文，包含 session_id, current_mode 等
 
         Returns:
             ToolResult: 执行结果
