@@ -93,18 +93,28 @@ class AgentExecutor:
 
     def _build_system_prompt(self) -> str:
         """构建系统提示词"""
-        if is_built_in_agent(self.agent_definition):
-            if self.agent_definition.get_system_prompt:
-                return self.agent_definition.get_system_prompt()
-
-        # 默认系统提示词
-        return f"""You are an agent for Claude Code, Anthropic's official CLI for Claude.
+        base_prompt = f"""You are an agent for Claude Code, Anthropic's official CLI for Claude.
 Agent Type: {self.agent_definition.agent_type}
 
 {self.agent_definition.when_to_use}
 
-Complete the task fully—don't gold-plate, but don't leave it half-done.
-When you complete the task, respond with a concise report covering what was done and any key findings."""
+CRITICAL RULES:
+1. Use tools silently - DO NOT output text between tool calls
+2. Complete the task fully—don't gold-plate, but don't leave it half-done
+3. When you complete the task, respond with ONLY a concise report covering what was done and key findings
+4. Your response MUST begin with "Scope:" followed by your findings
+5. Be factual and concise, under 500 words unless specified otherwise
+
+Output format:
+  Scope: <one sentence summary of what you did>
+  Result: <key findings and actions taken>
+  Key files: <relevant file paths if applicable>"""
+
+        # 如果是内置Agent且有自定义prompt，使用自定义的
+        if self.agent_definition.get_system_prompt:
+            return self.agent_definition.get_system_prompt()
+
+        return base_prompt
 
     async def _run_conversation_loop(
         self,
