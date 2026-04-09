@@ -26,8 +26,8 @@ export interface ToolResult {
 
 export interface Conversation {
   id: string;
-  title: string;
-  messages: Message[];
+  title: string | null;
+  messages?: Message[];
   createdAt: number;
   updatedAt: number;
 }
@@ -64,6 +64,22 @@ export interface ChatActions {
   addConversation: (conversation: Conversation) => void;
   removeConversation: (id: string) => void;
   loadConversation: (id: string) => void;
+}
+
+// Task types
+export interface Task {
+  id: string;
+  subject: string;
+  description: string;
+  active_form?: string;
+  owner?: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  blocks?: string[];
+  blocked_by?: string[];
+  meta?: Record<string, any>;
+  created_at?: string;
+  updated_at?: string;
+  conversation_id?: string;
 }
 
 // SSE Event types

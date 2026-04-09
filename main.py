@@ -48,6 +48,10 @@ from services import LLMService, LLMProvider, Message, ChatCompletionRequest, Ch
 from services.config_service import config_service
 from query_engine import QueryEngine, ConversationState
 from routers import models_router, plan_router, agents_router
+from routers.data_router import (
+    conversations_router, tasks_router, plans_router, ws_router
+)
+from models import init_db
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -159,9 +163,9 @@ async def lifespan(app: FastAPI):
     logger.info("启动Agent管理器...")
     await agent_manager.start()
 
-    # 注册任务处理器
-    # TODO: 添加默认任务处理器
-    pass
+    # 初始化数据库
+    logger.info("初始化数据库...")
+    init_db()
 
     yield
 
@@ -180,10 +184,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 注册路由
+# Initialize database
+init_db()
+
+# Register routers
 app.include_router(models_router)
 app.include_router(plan_router)
 app.include_router(agents_router)
+
+# Register new data routers
+app.include_router(conversations_router, prefix="/api/v1")
+app.include_router(tasks_router, prefix="/api/v1")
+app.include_router(plans_router, prefix="/api/v1")
+app.include_router(ws_router, prefix="/api/v1")
 
 # 挂载静态文件
 app.mount("/static", StaticFiles(directory="static"), name="static")
