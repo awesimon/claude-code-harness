@@ -47,7 +47,7 @@ from agent import AgentManager, Agent, Task, AgentStatus, TaskStatus, TaskType, 
 from services import LLMService, LLMProvider, Message, ChatCompletionRequest, ChatCompletionResponse
 from services.config_service import config_service
 from query_engine import QueryEngine, ConversationState
-from routers import models_router, plan_router
+from routers import models_router, plan_router, agents_router
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -183,6 +183,7 @@ app = FastAPI(
 # 注册路由
 app.include_router(models_router)
 app.include_router(plan_router)
+app.include_router(agents_router)
 
 # 挂载静态文件
 app.mount("/static", StaticFiles(directory="static"), name="static")

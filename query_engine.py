@@ -15,6 +15,7 @@ from services import LLMService, LLMProvider, Message, ChatCompletionRequest
 from tools import ToolRegistry
 from tools.base import ToolResult
 from plan import get_plan_mode_manager, PlanModeState, NotInPlanModeError
+from agents import get_agent_manager, AgentExecutionConfig
 
 # 系统提示词 - 定义AI助手的行为和能力
 SYSTEM_PROMPT = """You are Claude Code, a powerful AI coding assistant created by Anthropic.
@@ -66,6 +67,19 @@ For complex tasks that require exploration and design before implementation, you
 3. Use `ExitPlanMode` when ready to:
    - Present your plan for user approval
    - Start implementing the approved plan
+
+## Agent System
+
+For complex tasks, you can spawn specialized agents:
+
+1. Use `Agent` tool with appropriate `subagent_type`:
+   - `Explore` - Fast read-only agent for searching codebases
+   - `Plan` - Software architect for designing implementation plans
+   - `general-purpose` - General research and multi-step tasks
+   - `Code` - Code implementation tasks
+   - `Test` - Writing and running tests
+
+2. Agents run independently and return structured reports
 
 Always respond in a helpful, clear, and professional manner."""
 
@@ -204,6 +218,7 @@ class QueryEngine:
         self._conversations: Dict[str, ConversationContext] = {}
         self._state_callbacks: List[Callable[[str, ConversationState, ConversationState], None]] = []
         self._plan_mode_manager = get_plan_mode_manager()
+        self._agent_manager = get_agent_manager()
 
     def _get_default_provider(self) -> LLMProvider:
         """根据环境变量确定默认 provider"""
@@ -755,6 +770,42 @@ class QueryEngine:
         """拒绝计划"""
         result = await self._plan_mode_manager.reject_plan(conversation_id, reason)
         return result
+
+    async def spawn_agent(
+        self,
+        conversation_id: str,
+        agent_type: str,
+        prompt: str,
+        is_async: bool = False
+    ) -> str:
+        """
+        在对话中创建 Agent
+
+        Args:
+            conversation_id: 对话ID
+            agent_type: Agent 类型
+            prompt: 任务描述
+            is_async: 是否异步执行
+
+        Returns:
+            Agent ID
+        """
+        agent_id = await self._agent_manager.spawn_agent(
+            agent_type=agent_type,
+            prompt=prompt,
+            parent_session_id=conversation_id,
+            config=AgentExecutionConfig(is_async=is_async),
+            is_async=is_async,
+        )
+        return agent_id
+
+    def get_agent_status(self, agent_id: str) -> Optional[Dict]:
+        """获取 Agent 状态"""
+        return self._agent_manager.get_agent_status(agent_id)
+
+    def abort_agent(self, agent_id: str):
+        """中止 Agent"""
+        self._agent_manager.abort_agent(agent_id)
 
     def clear_conversation(self, conversation_id: str):
         """清空对话历史"""
