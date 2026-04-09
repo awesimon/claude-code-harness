@@ -1,47 +1,88 @@
 # Claude Code Python API
 
-[English](#english) | [中文](#中文)
+A Python FastAPI implementation of Claude Code core features, providing AI-powered coding assistance with advanced tool capabilities, multi-provider LLM support, and production-ready error handling.
 
----
+## Overview
 
-<a name="english"></a>
-## English
+This project implements a Python-based alternative to Claude Code, featuring a FastAPI backend with a React frontend. It supports multiple LLM providers and includes advanced features like context compaction, error recovery, and agent-based task execution.
 
-A Python FastAPI implementation of Claude Code core features, supporting multiple LLM providers (OpenAI, Anthropic, DeepSeek, GLM, MiniMax, Kimi).
+## Key Features
 
-### Features
+### Core Capabilities
 
-- **Tools API**: File operations (read/write/edit), code search (Glob/Grep), Bash command execution
-- **Agent Management**: Create/manage agents, task assignment, parallel execution
-- **Task Scheduling**: Priority queue, async execution, status tracking
-- **Team Management**: Create/delete teams, multi-agent collaboration
-- **Plan Mode**: Support for plan mode enter/exit
-- **MCP Support**: MCP server management, tool execution, resource access
-- **Cron Jobs**: Task scheduling with Cron expressions
-- **LLM Integration**: Support for multiple providers (OpenAI, Anthropic, DeepSeek, GLM, MiniMax, Kimi)
-- **Streaming**: SSE streaming response support
-- **Model Management**: 12 built-in models with dynamic configuration
+- **Advanced Tool System**: 37+ built-in tools including file operations (read/write/edit), code search (Glob/Grep), Bash command execution, web search, and more
+- **Agent Management**: Create and manage AI agents with specific capabilities, task assignment, and parallel execution
+- **Multi-Provider LLM Support**: OpenAI, Anthropic, DeepSeek, GLM, MiniMax, and Moonshot AI (Kimi)
+- **Streaming Responses**: Server-Sent Events (SSE) for real-time streaming chat completions
+- **Plan Mode**: Structured implementation planning with approval workflow
 
-### Built-in Models
+### Production-Ready Features
 
-- **OpenAI**: gpt-4o, gpt-4o-mini
-- **Anthropic**: claude-3-5-sonnet, claude-3-opus
-- **DeepSeek**: deepseek-v3.2, deepseek-v3.2-thinking
-- **GLM**: glm-4.7, glm-5
-- **MiniMax**: minimax-m2.1, minimax-m2.5, minimax-m2.7
-- **Kimi**: kimi-k2.5
+#### Context Compaction Service
+Automatically compresses conversation context when approaching token limits:
+- **Token Counter**: Accurate token estimation for mixed Chinese/English content and multimodal inputs
+- **Compaction Strategies**: Full compaction, partial compaction, and intelligent summarization
+- **Auto-Compaction**: Automatic threshold detection with circuit breaker protection
+- **Reactive Compaction**: Handles API errors (413 Payload Too Large) gracefully
+- **Boundary Markers**: Tracks compaction points in conversation history
 
-### Quick Start
+#### Error Recovery System
+Comprehensive error handling for robust production use:
+- **Error Classification**: Distinguishes recoverable vs non-recoverable errors
+- **Max Output Tokens Recovery**: Progressive token limit increases (1.5x/2x/4x/8x)
+- **Prompt Too Long Handling**: Truncation and compression strategies
+- **Exponential Backoff**: Configurable retry mechanism with jitter
+- **Circuit Breaker**: Prevents cascade failures during API outages
+
+#### Performance Optimizations
+- Message content limiting (50KB per message, 100KB max accumulation)
+- DOM node limiting (max 100 messages stored, 50 visible)
+- Optimized React rendering with proper memoization
+- Markdown parsing error handling
+
+## Supported Models
+
+### OpenAI
+- gpt-4o, gpt-4o-mini
+
+### Anthropic
+- claude-3-5-sonnet-20241022
+- claude-3-opus-20240229
+
+### DeepSeek
+- deepseek-v3.2
+- deepseek-v3.2-thinking
+
+### GLM
+- glm-4.7
+- glm-5
+
+### MiniMax
+- minimax-m2.1
+- minimax-m2.5
+- minimax-m2.7
+
+### Moonshot AI (Kimi)
+- kimi-k2.5
+
+## Quick Start
+
+### Prerequisites
+- Python 3.10+
+- Node.js 18+ (for frontend)
+- API keys for desired LLM providers
+
+### Installation
 
 ```bash
 cd python_api
 
-# Install uv
+# Install uv (fast Python package installer)
 pip install uv
 
 # Create virtual environment
 uv venv
-source .venv/bin/activate
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install dependencies
 uv pip install -e ".[dev]"
@@ -49,7 +90,34 @@ uv pip install -e ".[dev]"
 # Configure environment
 cp .env.example .env
 # Edit .env with your API keys
+```
 
+### Configuration
+
+Create a `.env` file with your API keys:
+
+```env
+# Required: At least one LLM provider API key
+OPENAI_API_KEY=your_openai_key
+ANTHROPIC_API_KEY=your_anthropic_key
+DEEPSEEK_API_KEY=your_deepseek_key
+GLM_API_KEY=your_glm_key
+MINIMAX_API_KEY=your_minimax_key
+MOONSHOT_API_KEY=your_moonshot_key
+
+# Optional: Default model selection
+DEFAULT_MODEL=gpt-4o
+DEFAULT_MAX_TOKENS=4096
+DEFAULT_TEMPERATURE=0.7
+
+# Server configuration
+HOST=0.0.0.0
+PORT=8000
+```
+
+### Running the Application
+
+```bash
 # Start backend
 python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
@@ -59,137 +127,188 @@ npm install
 npm run dev
 ```
 
-### API Endpoints
+The application will be available at:
+- Frontend: http://localhost:5173
+- Backend API: http://localhost:8000
+- API Documentation: http://localhost:8000/docs
 
-- **Tools**: `/tools/read-file`, `/tools/write-file`, `/tools/edit-file`, `/tools/glob`, `/tools/grep`, `/tools/bash`
-- **Agents**: `/agents` (POST, GET, DELETE)
-- **Tasks**: `/tasks` (POST, GET)
-- **Teams**: `/teams` (POST, DELETE)
-- **Models**: `/api/models` (GET, POST)
-- **Chat**: `/chat/create`, `/chat`, `/chat/stream`
-- **LLM**: `/llm/chat`, `/llm/chat/stream`, `/llm/models`
-- **System**: `/stats`, `/health`
+## API Endpoints
 
-### Project Structure
+### Tools
+- `POST /tools/read-file` - Read file contents
+- `POST /tools/write-file` - Write file contents
+- `POST /tools/edit-file` - Edit file with string replacement
+- `POST /tools/glob` - File pattern matching
+- `POST /tools/grep` - Content search with regex
+- `POST /tools/bash` - Execute shell commands
+
+### Chat
+- `POST /chat/create` - Create new conversation
+- `POST /chat` - Send message (non-streaming)
+- `POST /chat/stream` - Send message (SSE streaming)
+- `GET /chat/{id}/history` - Get conversation history
+- `DELETE /chat/{id}` - Clear conversation
+
+### Agents
+- `POST /agents` - Create agent
+- `GET /agents` - List agents
+- `GET /agents/{id}` - Get agent details
+- `DELETE /agents/{id}` - Remove agent
+
+### LLM
+- `POST /llm/chat` - Chat completion
+- `POST /llm/chat/stream` - Streaming chat completion
+- `GET /llm/models` - List available models
+- `GET /llm/config` - Get LLM configuration
+
+### System
+- `GET /stats` - System statistics
+- `GET /health` - Health check
+
+## Project Structure
 
 ```
 python_api/
-├── main.py              # FastAPI main app
-├── query_engine.py      # Core conversation engine
-├── config/              # Configuration module
-├── routers/             # API routers
-├── tools/               # 37+ tools
-├── agent/               # Agent module
-├── services/            # Services (LLM, config)
-└── frontend/            # React frontend
+├── main.py                 # FastAPI application entry point
+├── query_engine.py         # Core conversation engine with error recovery
+├── CHANGELOG.md           # Version history and changes
+├── config/                # Configuration management
+│   └── settings.py
+├── routers/               # API route handlers
+│   ├── models_router.py
+│   ├── plan_router.py
+│   └── agents_router.py
+├── tools/                 # Tool implementations (37+ tools)
+│   ├── base.py
+│   ├── file_tools.py
+│   ├── search_tools.py
+│   └── ...
+├── agent/                 # Agent management system
+│   ├── __init__.py
+│   └── agent_manager.py
+├── services/              # Core services
+│   ├── llm_service.py     # LLM provider abstraction
+│   ├── config_service.py  # Configuration service
+│   ├── compact/           # Context compaction service
+│   │   ├── __init__.py
+│   │   ├── token_counter.py
+│   │   ├── compaction.py
+│   │   ├── auto_compact.py
+│   │   └── reactive_compact.py
+│   └── error_recovery/    # Error recovery system
+│       ├── __init__.py
+│       ├── error_types.py
+│       ├── recovery_manager.py
+│       ├── retry_handler.py
+│       └── token_recovery.py
+├── tests/                 # Test suite
+│   ├── test_context_compaction.py
+│   └── test_error_recovery.py
+└── frontend/              # React TypeScript frontend
+    ├── src/
+    │   ├── components/    # React components
+    │   ├── hooks/         # Custom hooks
+    │   ├── stores/        # State management (Zustand)
+    │   └── lib/           # Utilities
+    └── package.json
 ```
 
-### Environment Variables
+## Architecture
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `OPENAI_API_KEY` | OpenAI API key | - |
-| `ANTHROPIC_API_KEY` | Anthropic API key | - |
-| `DEFAULT_MODEL` | Default model | gpt-4o |
-| `HOST` | Server host | 0.0.0.0 |
-| `PORT` | Server port | 8000 |
+### Context Compaction Flow
 
----
+```
+Conversation → Token Count → Threshold Check
+                                    ↓
+                    ┌───────────────┴───────────────┐
+                    ↓                               ↓
+            Below Threshold                  Above Threshold
+                    ↓                               ↓
+            Continue Normally              Trigger Compaction
+                                                    ↓
+                                    Select Strategy (Full/Partial/Summary)
+                                                    ↓
+                                    Compress History + Add Boundary
+                                                    ↓
+                                           Continue Conversation
+```
 
-<a name="中文"></a>
-## 中文
+### Error Recovery Flow
 
-将Claude Code核心功能改造成Python FastAPI服务端接口，支持多提供商LLM调用。
+```
+API Call → Error Occurs → Error Classification
+                                    ↓
+                    ┌───────────────┴───────────────┐
+                    ↓                               ↓
+            Recoverable Error                Non-Recoverable
+                    ↓                               ↓
+            Apply Recovery Strategy            Fail Fast
+                    ↓
+    ┌───────────────┼───────────────┐
+    ↓               ↓               ↓
+Token Limit    Rate Limit     Server Error
+    ↓               ↓               ↓
+Increase       Backoff        Retry with
+Tokens         + Retry        Fallback
+```
 
-### 功能特性
+## Testing
 
-- **工具API**: 文件操作（读/写/编辑）、代码搜索（Glob/Grep）、Bash命令执行
-- **Agent管理**: 创建/管理Agent、任务分配、并行执行
-- **任务调度**: 优先级队列、异步执行、状态跟踪
-- **团队管理**: 创建/删除团队，多Agent协作
-- **计划模式**: 支持计划模式进入/退出
-- **MCP支持**: MCP服务器管理、工具执行、资源访问
-- **定时任务**: Cron表达式支持的任务调度
-- **LLM集成**: 支持多提供商（OpenAI、Anthropic、DeepSeek、GLM、MiniMax、Kimi）
-- **流式响应**: 支持SSE流式输出
-- **模型管理**: 内置12个模型，支持动态配置
-
-### 内置模型
-
-- **OpenAI**: gpt-4o, gpt-4o-mini
-- **Anthropic**: claude-3-5-sonnet, claude-3-opus
-- **DeepSeek**: deepseek-v3.2, deepseek-v3.2-thinking
-- **GLM**: glm-4.7, glm-5
-- **MiniMax**: minimax-m2.1, minimax-m2.5, minimax-m2.7
-- **Kimi**: kimi-k2.5
-
-### 快速开始
+Run the test suite:
 
 ```bash
-cd python_api
+# Run all tests
+pytest
 
-# 安装 uv
-pip install uv
+# Run with coverage
+pytest --cov=services --cov-report=html
 
-# 创建虚拟环境
-uv venv
-source .venv/bin/activate
-
-# 安装依赖
-uv pip install -e ".[dev]"
-
-# 配置环境变量
-cp .env.example .env
-# 编辑 .env 填入API密钥
-
-# 启动后端
-python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
-
-# 启动前端（另一个终端）
-cd frontend
-npm install
-npm run dev
+# Run specific test file
+pytest tests/test_context_compaction.py -v
+pytest tests/test_error_recovery.py -v
 ```
 
-### API端点
+Current test coverage:
+- Context Compaction: 42 tests ✅
+- Error Recovery: 36 tests ✅
+- Total: 78 tests passing
 
-- **工具**: `/tools/read-file`, `/tools/write-file`, `/tools/edit-file`, `/tools/glob`, `/tools/grep`, `/tools/bash`
-- **Agent**: `/agents` (POST, GET, DELETE)
-- **任务**: `/tasks` (POST, GET)
-- **团队**: `/teams` (POST, DELETE)
-- **模型**: `/api/models` (GET, POST)
-- **对话**: `/chat/create`, `/chat`, `/chat/stream`
-- **LLM**: `/llm/chat`, `/llm/chat/stream`, `/llm/models`
-- **系统**: `/stats`, `/health`
+## Environment Variables
 
-### 项目结构
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `OPENAI_API_KEY` | OpenAI API key | No* | - |
+| `ANTHROPIC_API_KEY` | Anthropic API key | No* | - |
+| `DEEPSEEK_API_KEY` | DeepSeek API key | No* | - |
+| `GLM_API_KEY` | GLM API key | No* | - |
+| `MINIMAX_API_KEY` | MiniMax API key | No* | - |
+| `MOONSHOT_API_KEY` | Moonshot AI API key | No* | - |
+| `DEFAULT_MODEL` | Default LLM model | No | gpt-4o |
+| `DEFAULT_MAX_TOKENS` | Default max tokens | No | 4096 |
+| `DEFAULT_TEMPERATURE` | Default temperature | No | 0.7 |
+| `HOST` | Server bind address | No | 0.0.0.0 |
+| `PORT` | Server port | No | 8000 |
 
-```
-python_api/
-├── main.py              # FastAPI主应用
-├── query_engine.py      # 核心对话引擎
-├── config/              # 配置模块
-├── routers/             # API路由
-├── tools/               # 37+个工具
-├── agent/               # Agent模块
-├── services/            # 服务模块
-└── frontend/            # React前端
-```
+*At least one LLM provider API key is required.
 
-### 环境变量
+## Contributing
 
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `OPENAI_API_KEY` | OpenAI API密钥 | - |
-| `ANTHROPIC_API_KEY` | Anthropic API密钥 | - |
-| `DEFAULT_MODEL` | 默认模型 | gpt-4o |
-| `HOST` | 服务主机 | 0.0.0.0 |
-| `PORT` | 服务端口 | 8000 |
+Contributions are welcome! Please feel free to submit a Pull Request.
 
----
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
 ## License
 
-MIT License - 详见 [LICENSE](LICENSE) 文件。
+MIT License - see [LICENSE](LICENSE) file for details.
 
-本项目是基于 Claude Code 概念独立实现的 Python 版本，代码由社区贡献。
+## Acknowledgments
+
+This project is an independent Python implementation inspired by Claude Code concepts. The codebase is developed and maintained by the community.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history and detailed changes.

@@ -12,6 +12,16 @@ from enum import Enum
 import logging
 
 from services import LLMService, LLMProvider, Message, ChatCompletionRequest
+from services.error_recovery import (
+    RecoveryManager,
+    RecoveryConfig,
+    RecoveryResult,
+    classify_for_user,
+    classify_error,
+    TokenLimitError,
+    PromptTooLongError,
+    RetryConfig,
+)
 from tools import ToolRegistry
 from tools.base import ToolResult
 from plan import get_plan_mode_manager, PlanModeState, NotInPlanModeError
@@ -209,6 +219,7 @@ class QueryEngine:
         max_iterations: int = 10,
         provider: Optional[LLMProvider] = None,
         model: Optional[str] = None,
+        enable_error_recovery: bool = True,
     ):
         self.llm_service = llm_service or LLMService()
         self.max_iterations = max_iterations
@@ -219,6 +230,21 @@ class QueryEngine:
         self._state_callbacks: List[Callable[[str, ConversationState, ConversationState], None]] = []
         self._plan_mode_manager = get_plan_mode_manager()
         self._agent_manager = get_agent_manager()
+
+        # 初始化错误恢复管理器
+        self._recovery_manager: Optional[RecoveryManager] = None
+        if enable_error_recovery:
+            recovery_config = RecoveryConfig(
+                retry_config=RetryConfig(
+                    max_retries=3,
+                    base_delay=1.0,
+                    max_delay=30.0,
+                ),
+                enable_token_recovery=True,
+                max_token_recovery_attempts=5,
+                max_total_attempts=8,
+            )
+            self._recovery_manager = RecoveryManager(recovery_config)
 
     def _get_default_provider(self) -> LLMProvider:
         """根据环境变量确定默认 provider"""
@@ -378,19 +404,56 @@ class QueryEngine:
             tools = self._build_tools_schema(conversation_id)
 
             try:
-                response = await self.llm_service.chat_completion(
-                    ChatCompletionRequest(
-                        messages=llm_messages,
-                        model=self.model,
-                        tools=tools if tools else None,
-                        tool_choice="auto" if tools else None,
-                        provider=self.provider,
+                # 使用恢复管理器执行LLM调用
+                if self._recovery_manager:
+                    result = await self._recovery_manager.execute_with_recovery(
+                        self._call_llm_with_recovery,
+                        llm_messages,
+                        tools,
                     )
-                )
+                    if result.success:
+                        response = result.response
+                    else:
+                        raise result.final_error or Exception(result.message)
+                else:
+                    response = await self.llm_service.chat_completion(
+                        ChatCompletionRequest(
+                            messages=llm_messages,
+                            model=self.model,
+                            tools=tools if tools else None,
+                            tool_choice="auto" if tools else None,
+                            provider=self.provider,
+                        )
+                    )
             except Exception as e:
-                logger.error(f"LLM call failed: {e}")
+                # 使用错误分类提供友好的错误信息
+                error_info = classify_for_user(e)
+                logger.error(f"LLM call failed: {e} (category: {error_info['type']})")
                 self._update_state(context, ConversationState.ERROR)
-                yield {"type": "error", "error": f"LLM call failed: {str(e)}"}
+
+                # 如果是不可恢复的错误，提供更具体的建议
+                if not error_info['retryable']:
+                    if isinstance(e, PromptTooLongError):
+                        yield {
+                            "type": "error",
+                            "error": "对话历史太长，请开始新对话或清空当前对话",
+                            "error_category": "prompt_too_long",
+                            "action": "clear_conversation"
+                        }
+                    else:
+                        yield {
+                            "type": "error",
+                            "error": error_info['message'],
+                            "error_category": error_info['type'],
+                            "action": error_info['action']
+                        }
+                else:
+                    yield {
+                        "type": "error",
+                        "error": f"LLM调用失败: {str(e)}",
+                        "error_category": error_info['type'],
+                        "action": error_info['action']
+                    }
                 return
 
             # 检查是否有工具调用
@@ -610,21 +673,33 @@ class QueryEngine:
             tools = self._build_tools_schema(conversation_id)
 
             try:
-                # 使用流式API
+                # 使用流式API，带错误恢复
                 full_content = ""
                 # 使用字典来累积工具调用，key是index
                 tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
 
-                async for chunk in self.llm_service.chat_completion_stream(
-                    ChatCompletionRequest(
-                        messages=llm_messages,
-                        model=self.model,
-                        tools=tools if tools else None,
-                        tool_choice="auto" if tools else None,
-                        provider=self.provider,
-                        temperature=temperature,
+                # 创建请求
+                stream_request = ChatCompletionRequest(
+                    messages=llm_messages,
+                    model=self.model,
+                    tools=tools if tools else None,
+                    tool_choice="auto" if tools else None,
+                    provider=self.provider,
+                    temperature=temperature,
+                )
+
+                # 使用恢复机制执行流式调用
+                stream_iter = None
+                if self._recovery_manager:
+                    # 使用带恢复的流式执行
+                    stream_iter = self._recovery_manager.execute_stream_with_recovery(
+                        self._call_llm_stream_with_recovery,
+                        stream_request,
                     )
-                ):
+                else:
+                    stream_iter = self.llm_service.chat_completion_stream(stream_request)
+
+                async for chunk in stream_iter:
                     # 检查是否是工具调用
                     if chunk.tool_calls:
                         # 累积工具调用片段（处理流式delta格式）
@@ -756,6 +831,31 @@ class QueryEngine:
             "content": "（已达到最大迭代次数，对话结束）",
             "finish_reason": "max_iterations"
         }
+
+    async def _call_llm_with_recovery(
+        self,
+        llm_messages: List[Message],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Any:
+        """LLM调用包装器 - 用于错误恢复机制"""
+        request = ChatCompletionRequest(
+            messages=llm_messages,
+            model=self.model,
+            tools=tools if tools else None,
+            tool_choice="auto" if tools else None,
+            provider=self.provider,
+        )
+        return await self.llm_service.chat_completion(request)
+
+    async def _call_llm_stream_with_recovery(
+        self,
+        request: ChatCompletionRequest
+    ) -> AsyncIterator[Any]:
+        """
+        流式LLM调用包装器 - 用于错误恢复机制
+        """
+        async for chunk in self.llm_service.chat_completion_stream(request):
+            yield chunk
 
     def get_conversation_history(self, conversation_id: str) -> Optional[List[Dict]]:
         """获取对话历史"""

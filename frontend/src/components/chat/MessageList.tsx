@@ -338,6 +338,16 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
     const filteredMessages = useFilteredMessages(messages, filter);
     const isSearching = filter.query.trim() !== '' || filter.role !== 'all';
 
+    // 限制渲染的消息数量，避免DOM节点过多
+    const maxVisibleMessages = 50;
+    const visibleMessages = React.useMemo(() => {
+      if (filteredMessages.length <= maxVisibleMessages) {
+        return filteredMessages;
+      }
+      // 只保留最近的消息
+      return filteredMessages.slice(-maxVisibleMessages);
+    }, [filteredMessages]);
+
     // Handle scroll events to show/hide scroll to bottom button
     const handleScroll = React.useCallback(() => {
       if (!scrollRef.current) return;
@@ -431,6 +441,11 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
           aria-label="Chat messages"
         >
           <div className="mx-auto max-w-3xl space-y-6">
+            {filteredMessages.length > maxVisibleMessages && (
+              <div className="text-center py-2 text-xs text-muted-foreground bg-white/5 rounded-lg">
+                显示最近 {maxVisibleMessages} 条消息（共 {filteredMessages.length} 条）
+              </div>
+            )}
             {isSearching && filteredMessages.length === 0 ? (
               <motion.div
                 initial={{ opacity: 0 }}
@@ -449,10 +464,10 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
               </motion.div>
             ) : (
               <AnimatePresence mode="popLayout" initial={false}>
-                {filteredMessages.map((message, index) => (
+                {visibleMessages.map((message, index) => (
                   <motion.div
                     key={message.id}
-                    layout
+                    // 移除 layout prop 避免频繁的布局计算
                     initial={
                       shouldReduceMotion
                         ? { opacity: 1 }
@@ -461,16 +476,16 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, scale: 0.95 }}
                     transition={{
-                      duration: 0.3,
+                      duration: 0.2,
                       delay: shouldReduceMotion
                         ? 0
-                        : Math.min(index * 0.05, 0.3),
+                        : Math.min(index * 0.02, 0.1),
                       ease: [0.16, 1, 0.3, 1],
                     }}
                   >
                     <Message
                       message={message}
-                      isLast={index === filteredMessages.length - 1}
+                      isLast={index === visibleMessages.length - 1}
                       onCopy={onCopyMessage}
                     />
                   </motion.div>

@@ -88,31 +88,43 @@ const MessageContent = React.memo(function MessageContent({
   isUser: boolean;
   contentRef: React.RefObject<HTMLDivElement>;
 }) {
+  // 使用 useMemo 缓存解析结果，避免重复解析
   const formattedContent = React.useMemo(() => {
-    const rawHtml = marked.parse(content);
-    return DOMPurify.sanitize(rawHtml as string, {
-      ALLOWED_TAGS: [
-        'p', 'br', 'strong', 'em', 'u', 's', 'del', 'ins',
-        'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-        'ul', 'ol', 'li',
-        'blockquote', 'hr',
-        'code', 'pre',
-        'a', 'img',
-        'table', 'thead', 'tbody', 'tr', 'th', 'td',
-        'div', 'span',
-      ],
-      ALLOWED_ATTR: [
-        'href', 'title', 'alt', 'src',
-        'class', 'data-code', 'aria-label',
-      ],
-    });
+    // 限制内容长度，防止过长内容导致性能问题
+    const maxLength = 50000;
+    const truncatedContent = content.length > maxLength
+      ? content.slice(0, maxLength) + '\n\n[内容已截断...]'
+      : content;
+
+    try {
+      const rawHtml = marked.parse(truncatedContent);
+      return DOMPurify.sanitize(rawHtml as string, {
+        ALLOWED_TAGS: [
+          'p', 'br', 'strong', 'em', 'u', 's', 'del', 'ins',
+          'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+          'ul', 'ol', 'li',
+          'blockquote', 'hr',
+          'code', 'pre',
+          'a', 'img',
+          'table', 'thead', 'tbody', 'tr', 'th', 'td',
+          'div', 'span',
+        ],
+        ALLOWED_ATTR: [
+          'href', 'title', 'alt', 'src',
+          'class', 'data-code', 'aria-label',
+        ],
+      });
+    } catch (e) {
+      // 解析失败时返回纯文本
+      return `<p>${truncatedContent.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>`;
+    }
   }, [content]);
 
   return (
     <div
       ref={contentRef}
       className={cn(
-        'message-content prose prose-invert max-w-none',
+        'message-content prose prose-invert max-w-none break-words',
         'prose-headings:mb-3 prose-headings:mt-4 prose-headings:font-semibold',
         'prose-p:my-2 prose-p:leading-relaxed',
         'prose-ul:my-2 prose-ol:my-2 prose-li:my-1',
@@ -129,6 +141,9 @@ const MessageContent = React.memo(function MessageContent({
       dangerouslySetInnerHTML={{ __html: formattedContent }}
     />
   );
+}, (prevProps, nextProps) => {
+  // 自定义比较函数，只在内容变化超过一定阈值时才重新渲染
+  return prevProps.content === nextProps.content;
 });
 
 MessageContent.displayName = 'MessageContent';
@@ -300,20 +315,6 @@ export const Message = React.memo(function Message({
 
       {/* Content Column */}
       <div className={cn('flex-1 min-w-0', isUser ? 'text-right' : 'text-left')}>
-        {/* Tool Calls */}
-        {hasToolCalls && (
-          <div className="mb-3 space-y-2">
-            {message.toolCalls!.map((toolCall) => (
-              <ToolCall
-                key={toolCall.id}
-                toolCall={toolCall}
-                isExpanded={expandedTools.has(toolCall.id)}
-                onToggle={() => toggleTool(toolCall.id)}
-              />
-            ))}
-          </div>
-        )}
-
         {/* Message Content */}
         {hasContent && (
           <motion.div
@@ -346,6 +347,20 @@ export const Message = React.memo(function Message({
               </div>
             )}
           </motion.div>
+        )}
+
+        {/* Tool Calls - Display after content */}
+        {hasToolCalls && (
+          <div className={cn('space-y-2', hasContent && 'mt-3')}>
+            {message.toolCalls!.map((toolCall) => (
+              <ToolCall
+                key={toolCall.id}
+                toolCall={toolCall}
+                isExpanded={expandedTools.has(toolCall.id)}
+                onToggle={() => toggleTool(toolCall.id)}
+              />
+            ))}
+          </div>
         )}
 
         {/* Tool Results */}

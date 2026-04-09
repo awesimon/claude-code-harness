@@ -3,6 +3,7 @@ LLM服务模块
 支持OpenAI和Anthropic API调用
 """
 
+import logging
 import os
 import json
 from dataclasses import dataclass, field
@@ -11,6 +12,8 @@ from typing import Any, Dict, List, Optional, AsyncIterator, Union
 
 import httpx
 from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
 
 
 class LLMProvider(Enum):
@@ -182,12 +185,19 @@ class LLMService:
         else:
             kwargs["max_tokens"] = self._default_max_tokens
 
-        if request.tools:
+        # Only add tools if explicitly provided and not empty
+        # Some providers (like infini-ai) don't support tools
+        if request.tools and len(request.tools) > 0:
             kwargs["tools"] = request.tools
-        if request.tool_choice:
-            kwargs["tool_choice"] = request.tool_choice
+            if request.tool_choice:
+                kwargs["tool_choice"] = request.tool_choice
 
-        response = await client.chat.completions.create(**kwargs)
+        try:
+            response = await client.chat.completions.create(**kwargs)
+        except Exception as e:
+            logger.error(f"OpenAI API call failed: {e}")
+            logger.error(f"Request kwargs: {kwargs}")
+            raise
 
         choice = response.choices[0]
         message = choice.message

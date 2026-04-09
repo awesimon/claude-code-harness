@@ -8,6 +8,12 @@ export function useChat() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const [retryCount, setRetryCount] = useState(0);
 
+  // Track the current streaming state
+  const streamingStateRef = useRef<{
+    currentAssistantId: string | null;
+    hasReceivedToolCalls: boolean;
+  }>({ currentAssistantId: null, hasReceivedToolCalls: false });
+
   const sendMessage = useCallback(
     async (content: string) => {
       if (store.isProcessing || !content.trim()) return;
@@ -37,10 +43,11 @@ export function useChat() {
       store.setStatus('thinking');
       store.setError(null);
 
+      // Reset streaming state
+      streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
+
       // Create abort controller for cancellation
       abortControllerRef.current = new AbortController();
-
-      let assistantMessageId: string | null = null;
 
       try {
         await streamMessage(
@@ -51,31 +58,52 @@ export function useChat() {
           {
             onEvent: (event) => {
               switch (event.type) {
-                case 'assistant_message':
-                  if (!assistantMessageId) {
-                    // First assistant message - create new message
-                    assistantMessageId = store.addMessage({
+                case 'assistant_message': {
+                  const state = streamingStateRef.current;
+
+                  // If we've already received tool calls, this is a NEW assistant message
+                  // after tool execution - create a new message
+                  if (state.hasReceivedToolCalls) {
+                    const newMessageId = store.addMessage({
                       role: 'assistant',
                       content: event.content || '',
                     });
-                    store.setStatus('streaming');
+                    state.currentAssistantId = newMessageId;
+                    state.hasReceivedToolCalls = false;
+                  } else if (!state.currentAssistantId) {
+                    // First assistant message - create new
+                    const newMessageId = store.addMessage({
+                      role: 'assistant',
+                      content: event.content || '',
+                    });
+                    state.currentAssistantId = newMessageId;
                   } else {
-                    // Append content to existing message
+                    // Continue appending to current message
                     if (event.content) {
-                      store.updateMessage(assistantMessageId, event.content);
+                      store.updateMessage(state.currentAssistantId, event.content);
                     }
                   }
+
+                  if (event.is_streaming) {
+                    store.setStatus('streaming');
+                  }
                   break;
+                }
 
                 case 'tool_call':
                   store.setStatus('tool_calling');
-                  if (event.tool_calls && assistantMessageId) {
-                    store.updateMessageToolCalls(assistantMessageId, event.tool_calls);
+                  streamingStateRef.current.hasReceivedToolCalls = true;
+
+                  if (event.tool_calls && streamingStateRef.current.currentAssistantId) {
+                    store.updateMessageToolCalls(
+                      streamingStateRef.current.currentAssistantId,
+                      event.tool_calls
+                    );
                   }
                   break;
 
                 case 'tool_result':
-                  if (assistantMessageId) {
+                  if (streamingStateRef.current.currentAssistantId) {
                     const toolResult: ToolResult = {
                       id: event.tool_call_id || '',
                       name: event.name || '',
@@ -83,7 +111,10 @@ export function useChat() {
                       result: event.result,
                       error: event.error,
                     };
-                    store.updateMessageToolResults(assistantMessageId, [toolResult]);
+                    store.updateMessageToolResults(
+                      streamingStateRef.current.currentAssistantId,
+                      [toolResult]
+                    );
                   }
                   break;
 
@@ -119,6 +150,7 @@ export function useChat() {
               store.setProcessing(false);
               store.setStatus('idle');
               setRetryCount(0);
+              streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
             },
           },
           abortControllerRef.current.signal
@@ -139,6 +171,7 @@ export function useChat() {
     }
     store.setProcessing(false);
     store.setStatus('idle');
+    streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
   }, [store]);
 
   const clearChat = useCallback(async () => {
@@ -151,6 +184,7 @@ export function useChat() {
     }
     store.clearMessages();
     store.setCurrentConversation(null);
+    streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
   }, [store]);
 
   const newChat = useCallback(async () => {
@@ -163,6 +197,7 @@ export function useChat() {
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
+      streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
       return conversationId;
     } catch (error) {
       store.setError('Failed to create conversation');

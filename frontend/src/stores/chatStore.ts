@@ -40,7 +40,12 @@ export const useChatStore = create<ChatState & ChatActions>()(
       addMessage: (message) => {
         const newMessage = createMessage(message.role, message.content, message.toolCalls, message.toolResults);
         set((state) => {
-          const newMessages = [...state.messages, newMessage];
+          let newMessages = [...state.messages, newMessage];
+          // 限制消息列表长度，保留最近100条消息
+          const maxMessages = 100;
+          if (newMessages.length > maxMessages) {
+            newMessages = newMessages.slice(-maxMessages);
+          }
           // Update conversation messages if in a conversation
           if (state.currentConversationId) {
             const updatedConversations = state.conversations.map((c) =>
@@ -57,9 +62,18 @@ export const useChatStore = create<ChatState & ChatActions>()(
 
       updateMessage: (id, content) => {
         set((state) => {
-          const newMessages = state.messages.map((m) =>
-            m.id === id ? { ...m, content: m.content + content } : m
-          );
+          const newMessages = state.messages.map((m) => {
+            if (m.id === id) {
+              // 限制消息最大长度，防止性能问题
+              const newContent = m.content + content;
+              const maxLength = 100000;
+              const truncatedContent = newContent.length > maxLength
+                ? newContent.slice(0, maxLength) + '\n\n[消息内容已截断...]'
+                : newContent;
+              return { ...m, content: truncatedContent };
+            }
+            return m;
+          });
           if (state.currentConversationId) {
             const updatedConversations = state.conversations.map((c) =>
               c.id === state.currentConversationId
