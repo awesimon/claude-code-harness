@@ -124,7 +124,7 @@ const MessageContent = React.memo(function MessageContent({
     <div
       ref={contentRef}
       className={cn(
-        'message-content prose prose-invert max-w-none break-words',
+        'message-content prose dark:prose-invert max-w-none break-words',
         'prose-headings:mb-3 prose-headings:mt-4 prose-headings:font-semibold',
         'prose-p:my-2 prose-p:leading-relaxed',
         'prose-ul:my-2 prose-ol:my-2 prose-li:my-1',
@@ -133,10 +133,10 @@ const MessageContent = React.memo(function MessageContent({
         'prose-pre:my-0 prose-pre:p-0',
         'prose-a:text-primary hover:prose-a:underline',
         'prose-table:border-collapse prose-table:w-full',
-        'prose-th:border prose-th:border-white/10 prose-th:p-2 prose-th:bg-white/5',
-        'prose-td:border prose-td:border-white/10 prose-td:p-2',
+        'prose-th:border prose-th:border-border prose-th:p-2 prose-th:bg-muted',
+        'prose-td:border prose-td:border-border prose-td:p-2',
         'prose-img:rounded-lg prose-img:max-w-full',
-        'prose-hr:border-white/10',
+        'prose-hr:border-border',
       )}
       dangerouslySetInnerHTML={{ __html: formattedContent }}
     />
@@ -340,7 +340,7 @@ export const Message = React.memo(function Message({
               'relative group/content',
               isUser
                 ? 'bg-primary text-primary-foreground'
-                : 'glass border border-white/10'
+                : 'glass border border-border'
             )}
           >
             <MessageContent
