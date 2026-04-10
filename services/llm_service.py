@@ -74,6 +74,7 @@ class ChatCompletionResponse:
     usage: Optional[Dict[str, int]] = None
     finish_reason: Optional[str] = None
     raw_response: Optional[Dict] = None
+    reasoning_content: Optional[str] = None  # For models like kimi-k2.5 that return thinking content
 
 
 class LLMService:
@@ -273,14 +274,17 @@ class LLMService:
                             choices = data.get("choices", [])
                             if not choices:
                                 continue
-                            
+
                             choice = choices[0]
                             delta = choice.get("delta", {})
-                            
+
                             # 提取工具调用
                             tool_calls = None
                             if delta.get("tool_calls"):
                                 tool_calls = delta["tool_calls"]
+
+                            # 提取推理内容 (kimi-k2.5等模型)
+                            reasoning_content = delta.get("reasoning_content")
 
                             yield ChatCompletionResponse(
                                 id=data.get("id", ""),
@@ -290,6 +294,7 @@ class LLMService:
                                 tool_calls=tool_calls,
                                 finish_reason=choice.get("finish_reason"),
                                 raw_response=data,
+                                reasoning_content=reasoning_content,
                             )
                         except json.JSONDecodeError:
                             # 忽略无法解析的行

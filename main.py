@@ -649,10 +649,48 @@ async def chat_stream(request: ChatRequest):
                 context = query_engine.get_conversation(conversation_id)
                 if context:
                     for msg in messages:
-                        from query_engine import ConversationTurn
+                        from query_engine import ConversationTurn, ToolCall, ToolObservation
+                        from tools.base import ToolResult
+
+                        # 解析 tool_calls
+                        tool_calls = None
+                        if msg.tool_calls:
+                            tool_calls = [
+                                ToolCall(
+                                    id=tc.get("id", ""),
+                                    name=tc.get("name", ""),
+                                    arguments=tc.get("arguments", {})
+                                )
+                                for tc in msg.tool_calls
+                            ]
+
+                        # 解析 tool_results
+                        tool_observations = None
+                        if msg.tool_results:
+                            tool_observations = []
+                            for tr in msg.tool_results:
+                                result_data = tr.get("result", {})
+                                # 创建 ToolResult
+                                result = ToolResult(
+                                    success=tr.get("success", False),
+                                    data=result_data,
+                                    message="",
+                                    error=None
+                                )
+                                tool_observations.append(
+                                    ToolObservation(
+                                        tool_call_id=tr.get("tool_call_id", ""),
+                                        name=tr.get("name", ""),
+                                        result=result,
+                                        execution_time=tr.get("execution_time", 0)
+                                    )
+                                )
+
                         context.messages.append(ConversationTurn(
                             role=msg.role,
-                            content=msg.content
+                            content=msg.content,
+                            tool_calls=tool_calls,
+                            tool_observations=tool_observations
                         ))
             else:
                 raise HTTPException(status_code=404, detail=f"对话 {conversation_id} 不存在")
@@ -660,8 +698,118 @@ async def chat_stream(request: ChatRequest):
             db.close()
 
     async def generate():
+        # Track state for saving messages
+        assistant_content = ""
+        assistant_thinking = ""
+        current_tool_calls = []
+        current_tool_results = []
+        has_user_message_saved = False
+        assistant_message_saved = False  # Track if assistant message has been saved
+
         async for event in query_engine.chat_stream(conversation_id, request.message):
+            # Save user message on first event
+            if not has_user_message_saved:
+                db = SessionLocal()
+                try:
+                    service = ConversationService(db)
+                    # Check if conversation exists in DB, if not create it
+                    conv = service.get_conversation(conversation_id)
+                    if not conv:
+                        from schemas import ConversationCreate
+                        service.create_conversation(ConversationCreate())
+                    # Save user message
+                    from schemas import MessageCreate
+                    service.add_message(conversation_id, MessageCreate(
+                        role="user",
+                        content=request.message
+                    ))
+                except Exception as e:
+                    logger.error(f"Failed to save user message: {e}")
+                finally:
+                    db.close()
+                has_user_message_saved = True
+
+            event_type = event.get("type")
+
+            # Track thinking content
+            if event_type == "thinking":
+                thinking_content = event.get("content", "")
+                if thinking_content:
+                    assistant_thinking += thinking_content
+
+            # Track assistant content
+            elif event_type == "assistant_message":
+                content = event.get("content", "")
+                if content:
+                    assistant_content += content
+
+                # Check if this is the final message (has finish_reason)
+                finish_reason = event.get("finish_reason")
+                if finish_reason and not assistant_message_saved:
+                    # Save final assistant message to database
+                    db = SessionLocal()
+                    try:
+                        service = ConversationService(db)
+                        from schemas import MessageCreate
+                        service.add_message(conversation_id, MessageCreate(
+                            role="assistant",
+                            content=assistant_content,
+                            thinking=assistant_thinking if assistant_thinking else None,
+                            tool_calls=current_tool_calls if current_tool_calls else None,
+                            tool_results=current_tool_results if current_tool_results else None
+                        ))
+                        assistant_message_saved = True
+                        logger.info(f"Saved assistant message with content length: {len(assistant_content)}")
+                    except Exception as e:
+                        logger.error(f"Failed to save assistant message: {e}")
+                    finally:
+                        db.close()
+
+            # Track tool calls
+            elif event_type == "tool_call":
+                tool_calls = event.get("tool_calls", [])
+                if tool_calls:
+                    current_tool_calls = [
+                        {
+                            "id": tc.get("id", ""),
+                            "name": tc.get("name", ""),
+                            "arguments": tc.get("arguments", {})
+                        }
+                        for tc in tool_calls
+                    ]
+
+            # Track tool results
+            elif event_type == "tool_result":
+                tool_result = {
+                    "tool_call_id": event.get("tool_call_id", ""),
+                    "name": event.get("name", ""),
+                    "success": event.get("success", False),
+                    "result": event.get("result"),
+                    "execution_time": event.get("execution_time", 0)
+                }
+                current_tool_results.append(tool_result)
+
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+        # Ensure assistant message is saved at the end if not already saved
+        if not assistant_message_saved and assistant_content:
+            db = SessionLocal()
+            try:
+                service = ConversationService(db)
+                from schemas import MessageCreate
+                service.add_message(conversation_id, MessageCreate(
+                    role="assistant",
+                    content=assistant_content,
+                    thinking=assistant_thinking if assistant_thinking else None,
+                    tool_calls=current_tool_calls if current_tool_calls else None,
+                    tool_results=current_tool_results if current_tool_results else None
+                ))
+                logger.info(f"Saved assistant message at end with content length: {len(assistant_content)}")
+            except Exception as e:
+                logger.error(f"Failed to save assistant message at end: {e}")
+            finally:
+                db.close()
+
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(

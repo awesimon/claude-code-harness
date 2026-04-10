@@ -290,6 +290,7 @@ export default {
   },
   plugins: [
     require("tailwindcss-animate"),
+    require("@tailwindcss/typography"),
 
     /* Custom plugin for additional utilities */
     function({ addUtilities, theme }) {

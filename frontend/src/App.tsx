@@ -13,6 +13,7 @@ import { useChat } from '@/hooks/useChat';
 import { useSSE } from '@/hooks/useSSE';
 import { useChatStore } from '@/stores/chatStore';
 import { MagneticButton } from '@/components/ui/MagneticButton';
+import { ThemeToggleSimple } from '@/components/ThemeToggle';
 import { fetchModels, selectModel, type ModelInfo } from '@/services/modelService';
 import { cn } from '@/lib/utils';
 
@@ -113,6 +114,9 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-3">
+            {/* Theme Toggle */}
+            <ThemeToggleSimple />
+
             {/* Model Select */}
             <Select value={selectedModel} onValueChange={handleModelChange} disabled={isLoadingModels}>
               <SelectTrigger className="w-[180px] glass-strong h-9">

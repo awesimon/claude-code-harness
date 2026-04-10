@@ -37,10 +37,12 @@ Your goal is to help users with software engineering tasks by:
 4. Following best practices for software development
 
 When using tools:
+- **CRITICAL**: When user asks about a URL or web content, you MUST use the `web_fetch` tool to get the actual content. Do NOT hallucinate or make up information about websites.
 - Always think step by step about what you need to do
 - Use file tools to read and understand code before making changes
 - Use bash tools to run commands when necessary
 - Use search tools to find relevant code
+- Use `web_fetch` tool when you need to analyze a GitHub repository, documentation, or any web page
 - Explain your actions and reasoning to the user
 
 Be proactive but careful:
@@ -53,7 +55,7 @@ You have access to a wide range of tools including:
 - File operations (read, write, edit)
 - Code search (glob, grep)
 - Command execution (bash)
-- Web search and fetch
+- **Web fetch (`web_fetch`) - Use this when analyzing GitHub repos, docs, or any URL**
 - Agent management for complex tasks
 - Plan mode for complex implementation tasks
 - And more...
@@ -139,6 +141,7 @@ class ConversationTurn:
     content: str = ""
     tool_calls: Optional[List[ToolCall]] = None
     tool_observations: Optional[List[ToolObservation]] = None
+    thinking: Optional[str] = None  # 推理/思考内容
     timestamp: float = field(default_factory=lambda: asyncio.get_event_loop().time())
 
 
@@ -518,12 +521,24 @@ class QueryEngine:
 
             # 发送工具结果
             for obs in observations:
+                # 将工具结果转换为可序列化的格式
+                result_data = obs.result.data
+                if hasattr(result_data, '__dataclass_fields__'):
+                    # 如果是 dataclass，转换为字典
+                    result_data = {
+                        k: getattr(result_data, k)
+                        for k in result_data.__dataclass_fields__.keys()
+                    }
+                elif not isinstance(result_data, (str, int, float, bool, list, dict, type(None))):
+                    # 其他非基本类型，转为字符串
+                    result_data = str(result_data)
+
                 yield {
                     "type": "tool_result",
                     "tool_call_id": obs.tool_call_id,
                     "name": obs.name,
                     "success": obs.result.success,
-                    "result": obs.result.data if obs.result.success else str(obs.result.error),
+                    "result": result_data if obs.result.success else str(obs.result.error),
                     "execution_time": obs.execution_time
                 }
 
@@ -691,13 +706,19 @@ class QueryEngine:
                 # 使用恢复机制执行流式调用
                 stream_iter = None
                 if self._recovery_manager:
-                    # 使用带恢复的流式执行
-                    stream_iter = self._recovery_manager.execute_stream_with_recovery(
-                        self._call_llm_stream_with_recovery,
-                        stream_request,
-                    )
+                    # 使用带恢复的流式执行 - 创建一个异步生成器包装器
+                    async def stream_with_recovery():
+                        async for chunk in self._recovery_manager.execute_stream_with_recovery(
+                            self._call_llm_stream_with_recovery,
+                            stream_request,
+                        ):
+                            yield chunk
+                    stream_iter = stream_with_recovery()
                 else:
                     stream_iter = self.llm_service.chat_completion_stream(stream_request)
+
+                # 累积思考内容
+                full_thinking = ""
 
                 async for chunk in stream_iter:
                     # 检查是否是工具调用
@@ -719,6 +740,14 @@ class QueryEngine:
                                 tool_calls_accumulator[idx]["function"]["name"] = func["name"]
                             if func.get("arguments"):
                                 tool_calls_accumulator[idx]["function"]["arguments"] += func["arguments"]
+
+                    # 发送推理内容（thinking）
+                    if chunk.reasoning_content:
+                        full_thinking += chunk.reasoning_content
+                        yield {
+                            "type": "thinking",
+                            "content": chunk.reasoning_content,
+                        }
 
                     # 发送内容片段
                     if chunk.content:
@@ -742,7 +771,8 @@ class QueryEngine:
                     assistant_turn = ConversationTurn(
                         role="assistant",
                         content=full_content or "",
-                        tool_calls=tool_calls
+                        tool_calls=tool_calls,
+                        thinking=full_thinking if full_thinking else None
                     )
                     context.messages.append(assistant_turn)
 
@@ -775,12 +805,24 @@ class QueryEngine:
 
                     # 发送工具结果
                     for obs in observations:
+                        # 将工具结果转换为可序列化的格式
+                        result_data = obs.result.data
+                        if hasattr(result_data, '__dataclass_fields__'):
+                            # 如果是 dataclass，转换为字典
+                            result_data = {
+                                k: getattr(result_data, k)
+                                for k in result_data.__dataclass_fields__.keys()
+                            }
+                        elif not isinstance(result_data, (str, int, float, bool, list, dict, type(None))):
+                            # 其他非基本类型，转为字符串
+                            result_data = str(result_data)
+
                         yield {
                             "type": "tool_result",
                             "tool_call_id": obs.tool_call_id,
                             "name": obs.name,
                             "success": obs.result.success,
-                            "result": obs.result.data if obs.result.success else str(obs.result.error),
+                            "result": result_data if obs.result.success else str(obs.result.error),
                             "execution_time": obs.execution_time
                         }
 
@@ -804,7 +846,8 @@ class QueryEngine:
                     # 没有工具调用，对话完成
                     assistant_turn = ConversationTurn(
                         role="assistant",
-                        content=full_content
+                        content=full_content,
+                        thinking=full_thinking if full_thinking else None
                     )
                     context.messages.append(assistant_turn)
                     self._update_state(context, ConversationState.COMPLETED)
@@ -867,10 +910,21 @@ class QueryEngine:
             {
                 "role": turn.role,
                 "content": turn.content,
+                "thinking": turn.thinking,
                 "tool_calls": [
                     {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
                     for tc in (turn.tool_calls or [])
                 ] if turn.tool_calls else None,
+                "tool_observations": [
+                    {
+                        "tool_call_id": obs.tool_call_id,
+                        "name": obs.name,
+                        "success": obs.result.success,
+                        "result": obs.result.data if obs.result.success else str(obs.result.error),
+                        "execution_time": obs.execution_time
+                    }
+                    for obs in (turn.tool_observations or [])
+                ] if turn.tool_observations else None,
                 "timestamp": turn.timestamp
             }
             for turn in context.messages

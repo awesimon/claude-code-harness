@@ -94,6 +94,7 @@ export interface SSEEvent {
   result?: unknown;
   error?: string;
   state?: string;
+  is_streaming?: boolean;
 }
 
 export interface UserMessageEvent extends SSEEvent {

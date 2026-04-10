@@ -7,8 +7,7 @@ import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.min.css';
 import type { Message as MessageType } from '@/types';
 import { cn } from '@/lib/utils';
-import { ToolCall } from '@/components/tools/ToolCall';
-import { ToolResult } from '@/components/tools/ToolResult';
+import { ToolExecution } from '@/components/tools/ToolExecution';
 import { ThinkingBlock } from './ThinkingBlock';
 
 // Configure marked for security and features
@@ -198,7 +197,7 @@ export const Message = React.memo(function Message({
   const shouldReduceMotion = useReducedMotion();
   const { copied, copy } = useCopyToClipboard();
 
-  // Track expanded states for tool calls and results
+  // Track expanded states for tool executions
   const [expandedTools, setExpandedTools] = React.useState<Set<string>>(new Set());
   const [isThinkingExpanded, setIsThinkingExpanded] = React.useState(false);
 
@@ -363,31 +362,24 @@ export const Message = React.memo(function Message({
           </motion.div>
         )}
 
-        {/* Tool Calls - Display after content */}
+        {/* Tool Executions - Combined ToolCall and ToolResult */}
         {hasToolCalls && (
-          <div className={cn('space-y-2', hasContent && 'mt-3')}>
-            {message.toolCalls!.map((toolCall) => (
-              <ToolCall
-                key={toolCall.id}
-                toolCall={toolCall}
-                isExpanded={expandedTools.has(toolCall.id)}
-                onToggle={() => toggleTool(toolCall.id)}
-              />
-            ))}
-          </div>
-        )}
-
-        {/* Tool Results */}
-        {hasToolResults && (
-          <div className={cn('mt-3 space-y-2', isUser ? 'text-right' : 'text-left')}>
-            {message.toolResults!.map((toolResult, index) => (
-              <ToolResult
-                key={`${toolResult.id}-${index}`}
-                toolResult={toolResult}
-                isExpanded={expandedTools.has(`result-${toolResult.id}`)}
-                onToggle={() => toggleTool(`result-${toolResult.id}`)}
-              />
-            ))}
+          <div className={cn('mt-3 space-y-2')}>
+            {message.toolCalls!.map((toolCall) => {
+              // Find matching tool result
+              const toolResult = message.toolResults?.find(
+                (result) => result.id === toolCall.id
+              );
+              return (
+                <ToolExecution
+                  key={toolCall.id}
+                  toolCall={toolCall}
+                  toolResult={toolResult}
+                  isExpanded={expandedTools.has(toolCall.id)}
+                  onToggle={() => toggleTool(toolCall.id)}
+                />
+              );
+            })}
           </div>
         )}
 

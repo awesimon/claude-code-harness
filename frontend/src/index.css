@@ -23,48 +23,48 @@
     --accent-error: 0 84% 60%; /* Red */
     --accent-info: 200 80% 55%; /* Sky blue */
 
-    /* ==================== Background Colors ==================== */
-    --background: 0 0% 8%; /* #141413 - near black */
-    --background-elevated: 0 0% 11%; /* Slightly lighter */
-    --background-floating: 0 0% 14%; /* For floating elements */
-    --background-sunken: 0 0% 5%; /* For sunken/pressed states */
+    /* ==================== Light Theme (Default) ==================== */
+    --background: 0 0% 98%; /* #fafafa - off white */
+    --background-elevated: 0 0% 100%; /* Pure white */
+    --background-floating: 0 0% 100%;
+    --background-sunken: 0 0% 96%;
 
     /* Surface colors */
-    --surface: 0 0% 11%;
-    --surface-hover: 0 0% 14%;
-    --surface-active: 0 0% 17%;
+    --surface: 0 0% 100%;
+    --surface-hover: 0 0% 97%;
+    --surface-active: 0 0% 94%;
 
-    /* ==================== Text Colors ==================== */
-    --foreground: 40 10% 98%; /* #faf9f5 - warm white */
-    --text-primary: 40 10% 98%;
-    --text-secondary: 40 10% 85%;
-    --text-tertiary: 40 8% 70%;
-    --text-muted: 40 5% 55%;
-    --text-disabled: 40 5% 35%;
-    --text-inverse: 0 0% 10%;
+    /* Text colors */
+    --foreground: 0 0% 10%; /* Near black */
+    --text-primary: 0 0% 10%;
+    --text-secondary: 0 0% 25%;
+    --text-tertiary: 0 0% 40%;
+    --text-muted: 0 0% 50%;
+    --text-disabled: 0 0% 65%;
+    --text-inverse: 0 0% 98%;
 
-    /* ==================== Border Colors ==================== */
-    --border: 40 10% 20%;
-    --border-subtle: 40 10% 15%;
-    --border-strong: 40 10% 25%;
+    /* Border colors */
+    --border: 0 0% 85%;
+    --border-subtle: 0 0% 90%;
+    --border-strong: 0 0% 75%;
     --border-focus: 15 60% 53%;
     --border-error: 0 84% 60%;
 
-    /* ==================== Semantic Colors (Shadcn) ==================== */
-    --card: 0 0% 11%;
-    --card-foreground: 40 10% 98%;
+    /* Semantic Colors (Shadcn) */
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 10%;
 
-    --popover: 0 0% 11%;
-    --popover-foreground: 40 10% 98%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 10%;
 
     --primary: 15 60% 53%;
     --primary-foreground: 0 0% 100%;
 
-    --secondary: 0 0% 20%;
-    --secondary-foreground: 40 10% 98%;
+    --secondary: 0 0% 96%;
+    --secondary-foreground: 0 0% 10%;
 
-    --muted: 0 0% 20%;
-    --muted-foreground: 40 5% 70%;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 45%;
 
     --accent: 210 30% 60%;
     --accent-foreground: 0 0% 100%;
@@ -72,28 +72,28 @@
     --destructive: 0 84% 60%;
     --destructive-foreground: 0 0% 100%;
 
-    --input: 40 10% 20%;
+    --input: 0 0% 85%;
     --ring: 15 60% 53%;
     --radius: 0.625rem;
 
-    /* ==================== Glass Effect Variables ==================== */
-    --glass-bg: rgba(255, 255, 255, 0.03);
-    --glass-bg-strong: rgba(255, 255, 255, 0.06);
-    --glass-bg-subtle: rgba(255, 255, 255, 0.02);
-    --glass-border: rgba(255, 255, 255, 0.1);
-    --glass-border-strong: rgba(255, 255, 255, 0.15);
-    --glass-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1),
-                    0 2px 4px -1px rgba(0, 0, 0, 0.06);
-    --glass-shadow-strong: 0 10px 15px -3px rgba(0, 0, 0, 0.15),
-                           0 4px 6px -2px rgba(0, 0, 0, 0.1);
+    /* Glass Effect Variables */
+    --glass-bg: rgba(255, 255, 255, 0.8);
+    --glass-bg-strong: rgba(255, 255, 255, 0.95);
+    --glass-bg-subtle: rgba(255, 255, 255, 0.5);
+    --glass-border: rgba(0, 0, 0, 0.1);
+    --glass-border-strong: rgba(0, 0, 0, 0.15);
+    --glass-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05),
+                    0 2px 4px -1px rgba(0, 0, 0, 0.03);
+    --glass-shadow-strong: 0 10px 15px -3px rgba(0, 0, 0, 0.08),
+                           0 4px 6px -2px rgba(0, 0, 0, 0.05);
 
-    /* ==================== Animation Durations ==================== */
+    /* Animation Durations */
     --duration-fast: 0.15s;
     --duration-normal: 0.3s;
     --duration-slow: 0.5s;
     --duration-slower: 0.8s;
 
-    /* ==================== Z-Index Scale ==================== */
+    /* Z-Index Scale */
     --z-base: 0;
     --z-dropdown: 100;
     --z-sticky: 200;
@@ -103,6 +103,62 @@
     --z-popover: 600;
     --z-tooltip: 700;
     --z-toast: 800;
+  }
+
+  /* ==================== Dark Theme ==================== */
+  .dark {
+    /* Brand colors remain the same */
+
+    /* Background Colors */
+    --background: 0 0% 8%; /* #141413 - near black */
+    --background-elevated: 0 0% 11%;
+    --background-floating: 0 0% 14%;
+    --background-sunken: 0 0% 5%;
+
+    /* Surface colors */
+    --surface: 0 0% 11%;
+    --surface-hover: 0 0% 14%;
+    --surface-active: 0 0% 17%;
+
+    /* Text Colors */
+    --foreground: 40 10% 98%; /* Warm white */
+    --text-primary: 40 10% 98%;
+    --text-secondary: 40 10% 85%;
+    --text-tertiary: 40 8% 70%;
+    --text-muted: 40 5% 55%;
+    --text-disabled: 40 5% 35%;
+    --text-inverse: 0 0% 10%;
+
+    /* Border Colors */
+    --border: 40 10% 20%;
+    --border-subtle: 40 10% 15%;
+    --border-strong: 40 10% 25%;
+
+    /* Semantic Colors (Shadcn) */
+    --card: 0 0% 11%;
+    --card-foreground: 40 10% 98%;
+
+    --popover: 0 0% 11%;
+    --popover-foreground: 40 10% 98%;
+
+    --secondary: 0 0% 20%;
+    --secondary-foreground: 40 10% 98%;
+
+    --muted: 0 0% 20%;
+    --muted-foreground: 40 5% 70%;
+
+    --input: 40 10% 20%;
+
+    /* Glass Effect Variables */
+    --glass-bg: rgba(255, 255, 255, 0.03);
+    --glass-bg-strong: rgba(255, 255, 255, 0.06);
+    --glass-bg-subtle: rgba(255, 255, 255, 0.02);
+    --glass-border: rgba(255, 255, 255, 0.1);
+    --glass-border-strong: rgba(255, 255, 255, 0.15);
+    --glass-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1),
+                    0 2px 4px -1px rgba(0, 0, 0, 0.06);
+    --glass-shadow-strong: 0 10px 15px -3px rgba(0, 0, 0, 0.15),
+                           0 4px 6px -2px rgba(0, 0, 0, 0.1);
   }
 }
 

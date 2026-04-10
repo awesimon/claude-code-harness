@@ -62,7 +62,7 @@ class WebFetchTool(Tool[WebFetchInput, WebFetchOutput]):
     """
 
     name = "web_fetch"
-    description = "获取网页内容并转换为 Markdown。支持超时、重试和错误处理。"
+    description = "Fetches content from a URL and converts it to Markdown. Use this tool when the user asks about a GitHub repository, documentation, or any web page. REQUIRED: When analyzing any URL, you MUST use this tool first."
     version = "1.0"
 
     # 配置参数

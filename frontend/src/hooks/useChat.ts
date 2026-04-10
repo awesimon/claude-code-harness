@@ -12,7 +12,8 @@ export function useChat() {
   const streamingStateRef = useRef<{
     currentAssistantId: string | null;
     hasReceivedToolCalls: boolean;
-  }>({ currentAssistantId: null, hasReceivedToolCalls: false });
+    thinkingContent: string; // 累积当前轮次的thinking
+  }>({ currentAssistantId: null, hasReceivedToolCalls: false, thinkingContent: '' });
 
   const sendMessage = useCallback(
     async (content: string) => {
@@ -45,7 +46,7 @@ export function useChat() {
       store.setError(null);
 
       // Reset streaming state
-      streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
+      streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false, thinkingContent: '' };
 
       // Create abort controller for cancellation
       abortControllerRef.current = new AbortController();
@@ -116,14 +117,35 @@ export function useChat() {
                       streamingStateRef.current.currentAssistantId,
                       [toolResult]
                     );
+                    // 工具结果后，重置thinking状态，准备第二轮thinking
+                    streamingStateRef.current.thinkingContent = '';
                   }
                   break;
 
                 case 'thinking':
                   // 处理思考过程
-                  if (streamingStateRef.current.currentAssistantId && event.content) {
+                  if (event.content) {
+                    const state = streamingStateRef.current;
+                    // 检查是否是第二轮thinking（工具调用后）
+                    if (state.hasReceivedToolCalls && state.thinkingContent === '' && state.currentAssistantId) {
+                      // 第二轮thinking开始，创建新消息
+                      const newMessageId = store.addMessage({
+                        role: 'assistant',
+                        content: '',
+                      });
+                      state.currentAssistantId = newMessageId;
+                    }
+                    if (!state.currentAssistantId) {
+                      // 第一轮thinking，创建新消息
+                      const newMessageId = store.addMessage({
+                        role: 'assistant',
+                        content: '',
+                      });
+                      state.currentAssistantId = newMessageId;
+                    }
+                    state.thinkingContent += event.content;
                     store.updateMessageThinking(
-                      streamingStateRef.current.currentAssistantId,
+                      state.currentAssistantId,
                       event.content
                     );
                   }
@@ -161,7 +183,7 @@ export function useChat() {
               store.setProcessing(false);
               store.setStatus('idle');
               setRetryCount(0);
-              streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
+              streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false, thinkingContent: '' };
             },
           },
           abortControllerRef.current.signal
@@ -182,7 +204,7 @@ export function useChat() {
     }
     store.setProcessing(false);
     store.setStatus('idle');
-    streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
+    streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false, thinkingContent: '' };
   }, [store]);
 
   const clearChat = useCallback(async () => {
@@ -195,7 +217,7 @@ export function useChat() {
     }
     store.clearMessages();
     store.setCurrentConversation(null);
-    streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
+    streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false, thinkingContent: '' };
   }, [store]);
 
   const newChat = useCallback(async () => {
@@ -208,7 +230,7 @@ export function useChat() {
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
-      streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
+      streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false, thinkingContent: '' };
       return conversation.id;
     } catch (error) {
       store.setError('Failed to create conversation');
