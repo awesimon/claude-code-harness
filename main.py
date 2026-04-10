@@ -632,8 +632,32 @@ async def chat_stream(request: ChatRequest):
     if not conversation_id:
         conversation_id = query_engine.create_conversation()
 
+    # Check if conversation exists in query_engine, if not, try to load from database
     if not query_engine.get_conversation(conversation_id):
-        raise HTTPException(status_code=404, detail=f"对话 {conversation_id} 不存在")
+        # Try to load from database
+        from models import SessionLocal
+        from services.conversation_service import ConversationService
+        db = SessionLocal()
+        try:
+            service = ConversationService(db)
+            conversation = service.get_conversation(conversation_id)
+            if conversation:
+                # Create conversation in query_engine
+                query_engine.create_conversation(conversation_id)
+                # Load messages
+                messages = service.get_messages(conversation_id)
+                context = query_engine.get_conversation(conversation_id)
+                if context:
+                    for msg in messages:
+                        from query_engine import ConversationTurn
+                        context.messages.append(ConversationTurn(
+                            role=msg.role,
+                            content=msg.content
+                        ))
+            else:
+                raise HTTPException(status_code=404, detail=f"对话 {conversation_id} 不存在")
+        finally:
+            db.close()
 
     async def generate():
         async for event in query_engine.chat_stream(conversation_id, request.message):
