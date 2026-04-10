@@ -30,11 +30,24 @@ class TaskStatus(str, PyEnum):
     COMPLETED = "completed"
 
 
+class ConversationState(str, PyEnum):
+    """对话状态枚举"""
+    NORMAL = "normal"
+    PLANNING = "planning"
+
+
+class TeamMemberStatus(str, PyEnum):
+    IDLE = "idle"
+    BUSY = "busy"
+    OFFLINE = "offline"
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     title = Column(String, nullable=True)
+    state = Column(String, default=ConversationState.NORMAL)  # 'normal', 'planning'
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -64,6 +77,7 @@ class Task(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True)
+    team_id = Column(String, ForeignKey("teams.id", ondelete="CASCADE"), nullable=True)
     subject = Column(String, nullable=False)
     description = Column(Text, nullable=False)
     active_form = Column(String, nullable=True)  # Present continuous form for spinner
@@ -77,6 +91,7 @@ class Task(Base):
 
     # Relationships
     conversation = relationship("Conversation", back_populates="tasks")
+    team = relationship("Team")
 
 
 class Plan(Base):
@@ -85,6 +100,7 @@ class Plan(Base):
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     conversation_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), unique=True)
     content = Column(Text, nullable=False)
+    version = Column(Integer, default=1)  # Plan version for recovery
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -103,6 +119,39 @@ class Agent(Base):
     max_concurrent_tasks = Column(Integer, default=1)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Team(Base):
+    __tablename__ = "teams"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False, unique=True)
+    lead_agent_id = Column(String, ForeignKey("agents.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    members = relationship("TeamMember", back_populates="team", cascade="all, delete-orphan")
+
+
+class TeamMember(Base):
+    __tablename__ = "team_members"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    team_id = Column(String, ForeignKey("teams.id", ondelete="CASCADE"), nullable=False)
+    agent_id = Column(String, ForeignKey("agents.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)
+    agent_type = Column(String, default="worker")
+    status = Column(Enum(TeamMemberStatus), default=TeamMemberStatus.IDLE)
+    joined_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    team = relationship("Team", back_populates="members")
+
+    # Ensure unique agent per team
+    __table_args__ = (
+        {'sqlite_autoincrement': True},
+    )
 
 
 def init_db():

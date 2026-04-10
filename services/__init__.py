@@ -5,6 +5,7 @@
 
 from .llm_service import LLMService, LLMProvider, Message, ChatCompletionRequest, ChatCompletionResponse
 from .config_service import ConfigService
+from .team_service import TeamService
 
 __all__ = [
     "LLMService",
@@ -13,4 +14,5 @@ __all__ = [
     "ChatCompletionRequest",
     "ChatCompletionResponse",
     "ConfigService",
+    "TeamService",
 ]

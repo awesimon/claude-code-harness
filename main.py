@@ -25,8 +25,8 @@ from tools import (
     AgentTool, AgentListTool, AgentDestroyTool,
     AgentToolInput, AgentListInput, AgentDestroyInput,
     # Task tools
-    TaskGetTool, TaskStopTool, TaskOutputTool,
-    TaskGetInput, TaskStopInput, TaskOutputInput,
+    TaskGetTool, TaskCreateTool, TaskUpdateTool, TaskListTool,
+    TaskGetInput, TaskCreateInput, TaskUpdateInput, TaskListInput,
     # Web tools
     WebSearchTool, WebFetchTool, WebSearchInput, WebFetchInput,
     # Team tools
@@ -51,6 +51,7 @@ from routers import models_router, plan_router, agents_router
 from routers.data_router import (
     conversations_router, tasks_router, plans_router, ws_router
 )
+from routers.team_router import teams_router
 from models import init_db
 
 # 配置日志
@@ -196,6 +197,7 @@ app.include_router(agents_router)
 app.include_router(conversations_router, prefix="/api/v1")
 app.include_router(tasks_router, prefix="/api/v1")
 app.include_router(plans_router, prefix="/api/v1")
+app.include_router(teams_router, prefix="/api/v1")
 app.include_router(ws_router, prefix="/api/v1")
 
 # 挂载静态文件

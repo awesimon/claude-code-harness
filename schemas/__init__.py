@@ -178,6 +178,15 @@ class AgentStatusResponse(BaseModel):
     current_tasks: List[str]
 
 
+# ==================== API Response Schema ====================
+
+class APIResponse(BaseModel):
+    success: bool
+    data: Optional[Any] = None
+    message: str = ""
+    error: Optional[str] = None
+
+
 # ==================== WebSocket Schemas ====================
 
 class WSMessage(BaseModel):

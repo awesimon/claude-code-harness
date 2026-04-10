@@ -1,7 +1,7 @@
 """
 Plan Mode 工具模块
-提供进入和退出计划模式的功能 - 新版本
-与 plan/ 模块集成
+提供进入和退出计划模式的功能
+与 plan_service 和 models 集成
 """
 
 from dataclasses import dataclass, field
@@ -9,14 +9,6 @@ from typing import Optional, Dict, Any, List
 import logging
 
 from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
-from plan import (
-    get_plan_mode_manager,
-    PlanModeState,
-    AlreadyInPlanModeError,
-    NotInPlanModeError,
-    NoPlanContentError,
-    PlanApprovalRequiredError,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +22,15 @@ class EnterPlanModeInput:
 @dataclass
 class ExitPlanModeInput:
     """退出计划模式工具的输入参数"""
-    allowed_prompts: Optional[List[Dict[str, str]]] = field(default_factory=list)
+    plan: Optional[str] = None  # 计划内容
+    allowedPrompts: Optional[List[Dict[str, str]]] = field(default_factory=list)  # 允许的提示列表
+
+
+@dataclass
+class AllowedPrompt:
+    """允许的提示"""
+    tool: str
+    prompt: str
 
 
 @register_tool
@@ -40,9 +40,9 @@ class EnterPlanModeTool(Tool[EnterPlanModeInput, Dict[str, Any]]):
 
     当LLM需要为复杂任务设计实现方案时调用此工具。
     进入计划模式后：
-    1. 系统进入只读探索状态
+    1. 系统设置 conversation.state = 'planning'
     2. LLM应该探索代码库并设计实现方案
-    3. 不能进行任何文件写入操作
+    3. 不能进行任何文件写入操作（只读工具）
     4. 完成后使用 ExitPlanMode 提交计划
     """
 
@@ -51,11 +51,7 @@ class EnterPlanModeTool(Tool[EnterPlanModeInput, Dict[str, Any]]):
         "Requests permission to enter plan mode for complex tasks "
         "requiring exploration and design"
     )
-    version = "2.0"
-
-    def __init__(self):
-        super().__init__()
-        self._manager = get_plan_mode_manager()
+    version = "1.0"
 
     async def validate(self, input_data: EnterPlanModeInput) -> Optional[ToolError]:
         """验证输入"""
@@ -67,10 +63,8 @@ class EnterPlanModeTool(Tool[EnterPlanModeInput, Dict[str, Any]]):
         执行进入计划模式
 
         注意：实际的会话ID从run方法的context参数传入
-        这里只返回工具定义，真正的执行在QueryEngine中处理
+        这里返回一个标记，让QueryEngine知道要进入计划模式
         """
-        # 实际执行在QueryEngine._execute_tools中处理
-        # 这里返回一个标记，让QueryEngine知道要进入计划模式
         return ToolResult.ok(
             data={
                 "action": "enter_plan_mode",
@@ -95,6 +89,13 @@ class EnterPlanModeTool(Tool[EnterPlanModeInput, Dict[str, Any]]):
                 "type": "object",
                 "properties": {},
                 "description": "No parameters needed to enter plan mode"
+            },
+            "returns": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Confirmation message"},
+                    "state": {"type": "string", "description": "New conversation state (planning)"}
+                }
             }
         }
 
@@ -104,29 +105,28 @@ class ExitPlanModeTool(Tool[ExitPlanModeInput, Dict[str, Any]]):
     """
     退出计划模式工具
 
-    当LLM完成计划设计并准备提交审批时调用此工具。
+    当LLM完成计划设计并准备提交时调用此工具。
     调用后会：
-    1. 保存计划到文件
-    2. 提交计划等待用户审批
-    3. 用户批准后退出计划模式
-    4. 恢复之前的权限模式
+    1. 保存计划内容到数据库（使用 PlanService）
+    2. 设置 conversation.state = 'normal'
+    3. 返回计划内容和文件路径
     """
 
     name = "ExitPlanMode"
-    description = "Prompts the user to exit plan mode and start coding"
-    version = "2.0"
-
-    def __init__(self):
-        super().__init__()
-        self._manager = get_plan_mode_manager()
+    description = "Exits plan mode and saves the plan to the database"
+    version = "1.0"
 
     async def validate(self, input_data: ExitPlanModeInput) -> Optional[ToolError]:
         """验证输入"""
-        if input_data.allowed_prompts:
-            for prompt in input_data.allowed_prompts:
+        if input_data.allowedPrompts:
+            for prompt in input_data.allowedPrompts:
                 if not isinstance(prompt, dict) or "tool" not in prompt or "prompt" not in prompt:
                     return ToolValidationError(
-                        "Each allowed_prompt must have 'tool' and 'prompt' fields"
+                        "Each allowedPrompt must have 'tool' and 'prompt' fields"
+                    )
+                if prompt["tool"] not in ["Bash", "Read", "Write", "Edit"]:
+                    return ToolValidationError(
+                        f"Invalid tool '{prompt['tool']}'. Must be one of: Bash, Read, Write, Edit"
                     )
         return None
 
@@ -135,19 +135,20 @@ class ExitPlanModeTool(Tool[ExitPlanModeInput, Dict[str, Any]]):
         执行退出计划模式
 
         注意：实际的会话ID从run方法的context参数传入
-        这里只返回工具定义，真正的执行在QueryEngine中处理
+        这里返回一个标记，让QueryEngine知道要退出计划模式
         """
         return ToolResult.ok(
             data={
                 "action": "exit_plan_mode",
-                "allowed_prompts": input_data.allowed_prompts or [],
+                "plan": input_data.plan,
+                "allowed_prompts": input_data.allowedPrompts or [],
                 "message": "Request to exit plan mode",
             },
             message="Exit plan mode request processed",
         )
 
     def is_read_only(self) -> bool:
-        return False  # 会写入文件
+        return False  # 会写入数据库
 
     def is_destructive(self) -> bool:
         return False
@@ -161,7 +162,11 @@ class ExitPlanModeTool(Tool[ExitPlanModeInput, Dict[str, Any]]):
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "allowed_prompts": {
+                    "plan": {
+                        "type": "string",
+                        "description": "The plan content to save (optional)"
+                    },
+                    "allowedPrompts": {
                         "type": "array",
                         "description": "Prompt-based permissions needed to implement the plan",
                         "items": {
@@ -181,6 +186,14 @@ class ExitPlanModeTool(Tool[ExitPlanModeInput, Dict[str, Any]]):
                         }
                     }
                 },
-                "description": "Optional permissions for implementing the plan"
+                "description": "Optional plan content and permissions for implementing the plan"
+            },
+            "returns": {
+                "type": "object",
+                "properties": {
+                    "plan": {"type": ["string", "null"], "description": "The saved plan content"},
+                    "filePath": {"type": "string", "description": "Path to the saved plan file"},
+                    "state": {"type": "string", "description": "New conversation state (normal)"}
+                }
             }
         }

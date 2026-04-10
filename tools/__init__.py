@@ -32,14 +32,10 @@ __all__ = [
     "AgentDestroyInput",
     # 任务工具
     "TaskGetTool",
-    "TaskStopTool",
-    "TaskOutputTool",
     "TaskCreateTool",
     "TaskUpdateTool",
     "TaskListTool",
     "TaskGetInput",
-    "TaskStopInput",
-    "TaskOutputInput",
     "TaskCreateInput",
     "TaskUpdateInput",
     "TaskListInput",
@@ -159,8 +155,8 @@ from .agent_tool import (
 
 # 任务工具
 from .task_tools import (
-    TaskGetTool, TaskStopTool, TaskOutputTool, TaskCreateTool, TaskUpdateTool, TaskListTool,
-    TaskGetInput, TaskStopInput, TaskOutputInput, TaskCreateInput, TaskUpdateInput, TaskListInput,
+    TaskGetTool, TaskCreateTool, TaskUpdateTool, TaskListTool,
+    TaskGetInput, TaskCreateInput, TaskUpdateInput, TaskListInput,
 )
 
 # Web工具
