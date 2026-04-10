@@ -1,6 +1,5 @@
 import * as React from 'react';
-import { motion, useReducedMotion } from 'framer-motion';
-import { User, Robot, Copy, Check, FileText } from '@phosphor-icons/react';
+import { User, Robot, Copy, Check } from '@phosphor-icons/react';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import hljs from 'highlight.js';
@@ -15,7 +14,7 @@ marked.setOptions({
   breaks: true,
   gfm: true,
   mangle: false,
-  sanitize: false, // We use DOMPurify instead
+  sanitize: false,
 } as any);
 
 // Custom renderer for better code blocks
@@ -46,17 +45,14 @@ renderer.codespan = (code: string) => {
 
 marked.use({ renderer });
 
-// Props interface
 interface MessageProps {
   message: MessageType;
   isLast?: boolean;
   onCopy?: (content: string) => void;
 }
 
-// Hook for copying text to clipboard
 function useCopyToClipboard() {
   const [copied, setCopied] = React.useState(false);
-
   const copy = React.useCallback(async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -68,29 +64,21 @@ function useCopyToClipboard() {
       return false;
     }
   }, []);
-
   return { copied, copy };
 }
 
-// Extract text content from message (for copying)
 const extractTextContent = (content: string): string => {
-  // Simple HTML tag removal for copy functionality
   return content.replace(/<[^>]*>/g, '');
 };
 
-// Memoized message content component for better performance
 const MessageContent = React.memo(function MessageContent({
   content,
-  isUser,
   contentRef,
 }: {
   content: string;
-  isUser: boolean;
   contentRef: React.RefObject<HTMLDivElement>;
 }) {
-  // 使用 useMemo 缓存解析结果，避免重复解析
   const formattedContent = React.useMemo(() => {
-    // 限制内容长度，防止过长内容导致性能问题
     const maxLength = 50000;
     const truncatedContent = content.length > maxLength
       ? content.slice(0, maxLength) + '\n\n[内容已截断...]'
@@ -115,7 +103,6 @@ const MessageContent = React.memo(function MessageContent({
         ],
       });
     } catch (e) {
-      // 解析失败时返回纯文本
       return `<p>${truncatedContent.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</p>`;
     }
   }, [content]);
@@ -123,32 +110,14 @@ const MessageContent = React.memo(function MessageContent({
   return (
     <div
       ref={contentRef}
-      className={cn(
-        'message-content prose dark:prose-invert max-w-none break-words',
-        'prose-headings:mb-3 prose-headings:mt-4 prose-headings:font-semibold',
-        'prose-p:my-2 prose-p:leading-relaxed',
-        'prose-ul:my-2 prose-ol:my-2 prose-li:my-1',
-        'prose-blockquote:border-l-2 prose-blockquote:border-primary/50 prose-blockquote:pl-4 prose-blockquote:italic',
-        'prose-code:before:content-none prose-code:after:content-none',
-        'prose-pre:my-0 prose-pre:p-0',
-        'prose-a:text-primary hover:prose-a:underline',
-        'prose-table:border-collapse prose-table:w-full',
-        'prose-th:border prose-th:border-border prose-th:p-2 prose-th:bg-muted',
-        'prose-td:border prose-td:border-border prose-td:p-2',
-        'prose-img:rounded-lg prose-img:max-w-full',
-        'prose-hr:border-border',
-      )}
+      className="message-content"
       dangerouslySetInnerHTML={{ __html: formattedContent }}
     />
   );
-}, (prevProps, nextProps) => {
-  // 自定义比较函数，只在内容变化超过一定阈值时才重新渲染
-  return prevProps.content === nextProps.content;
 });
 
 MessageContent.displayName = 'MessageContent';
 
-// Copy button component
 const CopyButton = React.memo(function CopyButton({
   onCopy,
   copied,
@@ -162,10 +131,9 @@ const CopyButton = React.memo(function CopyButton({
     <button
       onClick={() => onCopy(content)}
       className={cn(
-        'flex items-center gap-1.5 px-2 py-1 rounded-md text-xs',
-        'transition-all duration-200',
-        'hover:bg-white/10 active:scale-95',
-        copied ? 'text-emerald-400' : 'text-muted-foreground hover:text-foreground'
+        'flex items-center gap-1.5 px-2 py-1 text-xs',
+        'transition-colors',
+        copied ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'
       )}
       aria-label={copied ? 'Copied!' : 'Copy message'}
     >
@@ -186,7 +154,6 @@ const CopyButton = React.memo(function CopyButton({
 
 CopyButton.displayName = 'CopyButton';
 
-// Main Message component
 export const Message = React.memo(function Message({
   message,
   isLast = false,
@@ -194,12 +161,20 @@ export const Message = React.memo(function Message({
 }: MessageProps) {
   const contentRef = React.useRef<HTMLDivElement>(null);
   const isUser = message.role === 'user';
-  const shouldReduceMotion = useReducedMotion();
   const { copied, copy } = useCopyToClipboard();
-
-  // Track expanded states for tool executions
   const [expandedTools, setExpandedTools] = React.useState<Set<string>>(new Set());
   const [isThinkingExpanded, setIsThinkingExpanded] = React.useState(false);
+
+  // 使用 CSS 变量而不是硬编码颜色
+  // 用户消息和助手消息都用浅色背景，保持色调一致
+  const userAvatarClass = 'bg-muted text-foreground';
+  const assistantAvatarClass = 'bg-muted text-foreground';
+
+  const userBubbleClass = 'bg-muted text-foreground';
+  const assistantBubbleClass = 'bg-muted text-foreground';
+
+  const avatarClass = isUser ? userAvatarClass : assistantAvatarClass;
+  const bubbleClass = isUser ? userBubbleClass : assistantBubbleClass;
 
   const toggleTool = React.useCallback((id: string) => {
     setExpandedTools((prev) => {
@@ -217,11 +192,8 @@ export const Message = React.memo(function Message({
     setIsThinkingExpanded((prev) => !prev);
   }, []);
 
-  // Handle copy button clicks for code blocks - 使用稳定的事件委托
   React.useEffect(() => {
     if (!contentRef.current) return;
-
-    // 使用事件委托，只绑定一次到容器
     const contentElement = contentRef.current;
 
     const handleCodeCopy = async (e: MouseEvent) => {
@@ -249,13 +221,11 @@ export const Message = React.memo(function Message({
     };
 
     contentElement.addEventListener('click', handleCodeCopy);
-
     return () => {
       contentElement.removeEventListener('click', handleCodeCopy);
     };
-  }, [copy]); // 只依赖 copy 函数，不依赖 message.content
+  }, [copy]);
 
-  // Handle message copy
   const handleCopyMessage = React.useCallback(async () => {
     const text = extractTextContent(message.content);
     const success = await copy(text);
@@ -265,60 +235,33 @@ export const Message = React.memo(function Message({
     return success;
   }, [message.content, copy, onCopy]);
 
-  // Determine if message has content to display
   const hasContent = Boolean(message.content?.trim());
   const hasToolCalls = message.toolCalls && message.toolCalls.length > 0;
-  const hasToolResults = message.toolResults && message.toolResults.length > 0;
   const hasThinking = Boolean(message.thinking?.trim());
 
-  // Animation variants - 简化动画以提高性能
-  const containerVariants = {
-    initial: { opacity: 1 },
-    animate: { opacity: 1 },
-  };
-
-  const avatarVariants = {
-    initial: { opacity: 1 },
-    animate: { opacity: 1 },
-  };
-
-  const contentVariants = {
-    initial: { opacity: 1 },
-    animate: { opacity: 1 },
-  };
-
   return (
-    <motion.div
-      variants={containerVariants}
-      initial="initial"
-      animate="animate"
-      transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+    <div
       className={cn('group flex gap-3', isUser ? 'flex-row-reverse' : 'flex-row')}
       data-message-id={message.id}
       data-message-role={message.role}
     >
-      {/* Avatar - Glass effect */}
-      <motion.div
-        variants={avatarVariants}
-        initial="initial"
-        animate="animate"
-        transition={{ delay: shouldReduceMotion ? 0 : 0.1 }}
+      {/* Avatar */}
+      <div
         className={cn(
-          'flex h-8 w-8 shrink-0 select-none items-center justify-center rounded-full glass-strong',
-          isUser ? 'bg-secondary' : 'bg-primary/20'
+          'flex h-7 w-7 shrink-0 select-none items-center justify-center rounded-full',
+          avatarClass
         )}
         aria-hidden="true"
       >
         {isUser ? (
-          <User className="h-4 w-4 text-foreground" weight="bold" />
+          <User className="h-3.5 w-3.5" weight="bold" />
         ) : (
-          <Robot className="h-4 w-4 text-primary" weight="bold" />
+          <Robot className="h-3.5 w-3.5" weight="bold" />
         )}
-      </motion.div>
+      </div>
 
       {/* Content Column */}
       <div className={cn('flex-1 min-w-0', isUser ? 'text-right' : 'text-left')}>
-        {/* Thinking Block - Display before content */}
         {hasThinking && (
           <ThinkingBlock
             thinking={message.thinking!}
@@ -328,30 +271,22 @@ export const Message = React.memo(function Message({
           />
         )}
 
-        {/* Message Content */}
+        {/* Message Bubble */}
         {hasContent && (
-          <motion.div
-            variants={contentVariants}
-            initial="initial"
-            animate="animate"
-            transition={{ delay: shouldReduceMotion ? 0 : 0.15, duration: 0.25 }}
+          <div
             className={cn(
-              'inline-block max-w-[90%] rounded-2xl px-4 py-3 text-left tap-highlight',
+              'inline-block max-w-[85%] rounded-lg px-4 py-3',
               'relative group/content',
-              isUser
-                ? 'bg-primary text-primary-foreground'
-                : 'glass border border-border'
+              bubbleClass
             )}
           >
             <MessageContent
               content={message.content}
-              isUser={isUser}
               contentRef={contentRef}
             />
 
-            {/* Copy button - shown on hover for assistant messages */}
             {!isUser && (
-              <div className="absolute -bottom-6 right-0 opacity-0 transition-opacity duration-200 group-hover/content:opacity-100">
+              <div className="absolute -bottom-6 right-0 opacity-0 transition-opacity group-hover/content:opacity-100">
                 <CopyButton
                   onCopy={handleCopyMessage}
                   copied={copied}
@@ -359,14 +294,13 @@ export const Message = React.memo(function Message({
                 />
               </div>
             )}
-          </motion.div>
+          </div>
         )}
 
-        {/* Tool Executions - Combined ToolCall and ToolResult */}
+        {/* Tool Executions */}
         {hasToolCalls && (
-          <div className={cn('mt-3 space-y-2')}>
+          <div className="mt-3 space-y-2">
             {message.toolCalls!.map((toolCall) => {
-              // Find matching tool result
               const toolResult = message.toolResults?.find(
                 (result) => result.id === toolCall.id
               );
@@ -383,32 +317,17 @@ export const Message = React.memo(function Message({
           </div>
         )}
 
-        {/* File attachments indicator (if any) */}
-        {message.role === 'user' && (
-          <div className="mt-1 flex justify-end gap-1">
-            {/* Placeholder for future file attachment support */}
-          </div>
-        )}
-
         {/* Timestamp */}
-        <motion.div
-          initial={shouldReduceMotion ? { opacity: 1 } : { opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ delay: shouldReduceMotion ? 0 : 0.3 }}
-          className={cn(
-            'mt-1 text-xs text-muted-foreground',
-            !hasContent && !hasToolCalls && 'mt-0'
-          )}
-        >
+        <div className="mt-1 text-xs text-neutral-500">
           <time dateTime={new Date(message.timestamp).toISOString()}>
             {new Date(message.timestamp).toLocaleTimeString('en-US', {
               hour: '2-digit',
               minute: '2-digit',
             })}
           </time>
-        </motion.div>
+        </div>
       </div>
-    </motion.div>
+    </div>
   );
 });
 

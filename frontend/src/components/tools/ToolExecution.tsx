@@ -1,5 +1,4 @@
 import * as React from 'react';
-import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import {
   Wrench,
   CaretDown,
@@ -15,7 +14,6 @@ import {
   Copy,
   CheckCircle,
   Spinner,
-  Clock,
   Check,
   X,
   Warning,
@@ -92,29 +90,20 @@ const toolCategories: Record<string, string> = {
 };
 
 const categoryColors: Record<string, string> = {
-  file: 'text-blue-400 bg-blue-500/20 border-blue-500/20',
-  system: 'text-purple-400 bg-purple-500/20 border-purple-500/20',
-  search: 'text-amber-400 bg-amber-500/20 border-amber-500/20',
-  web: 'text-cyan-400 bg-cyan-500/20 border-cyan-500/20',
-  database: 'text-emerald-400 bg-emerald-500/20 border-emerald-500/20',
-  code: 'text-pink-400 bg-pink-500/20 border-pink-500/20',
-  directory: 'text-orange-400 bg-orange-500/20 border-orange-500/20',
-  default: 'text-accent bg-accent/20 border-accent/20',
+  file: 'text-foreground bg-muted',
+  system: 'text-foreground bg-muted',
+  search: 'text-foreground bg-muted',
+  web: 'text-foreground bg-muted',
+  database: 'text-foreground bg-muted',
+  code: 'text-foreground bg-muted',
+  directory: 'text-foreground bg-muted',
+  default: 'text-foreground bg-muted',
 };
 
 type ViewMode = 'preview' | 'json' | 'raw';
 
 const MAX_PREVIEW_LENGTH = 500;
 const MAX_INLINE_LENGTH = 200;
-
-function highlightJson(json: string): string {
-  return json
-    .replace(/"(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"/g, '<span class="text-green-400">$&</span>')
-    .replace(/\b(true|false|null)\b/g, '<span class="text-purple-400">$&</span>')
-    .replace(/\b(\d+\.?\d*)\b/g, '<span class="text-amber-400">$&</span>')
-    .replace(/[{\[}\]]/g, '<span class="text-cyan-400">$&</span>')
-    .replace(/:/g, '<span class="text-muted-foreground">:</span>');
-}
 
 function parseParameters(args: Record<string, unknown>): { key: string; value: unknown; type: string }[] {
   return Object.entries(args).map(([key, value]) => ({
@@ -145,7 +134,6 @@ export const ToolExecution = React.memo(function ToolExecution({
   onToggle,
   className,
 }: ToolExecutionProps) {
-  const shouldReduceMotion = useReducedMotion();
   const [viewMode, setViewMode] = React.useState<ViewMode>('preview');
   const [isCopied, setIsCopied] = React.useState(false);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
@@ -231,19 +219,12 @@ export const ToolExecution = React.memo(function ToolExecution({
 
   const getStatusIcon = () => {
     if (!hasResult) {
-      return (
-        <motion.div
-          animate={shouldReduceMotion ? {} : { rotate: 360 }}
-          transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}
-        >
-          <Spinner className="h-4 w-4 text-accent" weight="bold" />
-        </motion.div>
-      );
+      return <Spinner className="h-4 w-4 text-muted-foreground animate-spin" weight="bold" />;
     }
     if (isSuccess) {
-      return <Check className="h-4 w-4 text-emerald-400" weight="bold" />;
+      return <Check className="h-4 w-4 text-foreground" weight="bold" />;
     }
-    return <X className="h-4 w-4 text-destructive" weight="bold" />;
+    return <X className="h-4 w-4 text-foreground" weight="bold" />;
   };
 
   const getResultStats = () => {
@@ -264,14 +245,13 @@ export const ToolExecution = React.memo(function ToolExecution({
     switch (viewMode) {
       case 'json':
         return (
-          <pre
-            className="overflow-x-auto p-3 text-xs font-mono leading-relaxed scrollbar-thin scrollbar-thumb-accent/20 scrollbar-track-transparent"
-            dangerouslySetInnerHTML={{ __html: highlightJson(jsonFormatted) }}
-          />
+          <pre className="overflow-x-auto p-3 text-xs font-mono leading-relaxed scrollbar-thin">
+            <code>{jsonFormatted}</code>
+          </pre>
         );
       case 'raw':
         return (
-          <pre className="overflow-x-auto p-3 text-xs text-foreground/80 scrollbar-thin scrollbar-thumb-accent/20 scrollbar-track-transparent">
+          <pre className="overflow-x-auto p-3 text-xs text-foreground scrollbar-thin">
             <code>{formattedResult}</code>
           </pre>
         );
@@ -285,7 +265,7 @@ export const ToolExecution = React.memo(function ToolExecution({
                 .map(([key, value]) => (
                   <div key={key} className="flex items-start gap-2 text-sm">
                     <span className="text-muted-foreground font-mono">{key}:</span>
-                    <span className="text-foreground/80 break-all">
+                    <span className="text-foreground break-all">
                       {typeof value === 'object'
                         ? JSON.stringify(value).slice(0, 100) + (JSON.stringify(value).length > 100 ? '...' : '')
                         : String(value).slice(0, 100) + (String(value).length > 100 ? '...' : '')}
@@ -301,7 +281,7 @@ export const ToolExecution = React.memo(function ToolExecution({
           );
         }
         return (
-          <pre className="overflow-x-auto p-3 text-xs text-foreground/80 scrollbar-thin scrollbar-thumb-accent/20 scrollbar-track-transparent">
+          <pre className="overflow-x-auto p-3 text-xs text-foreground scrollbar-thin">
             <code>{displayContent}</code>
           </pre>
         );
@@ -310,16 +290,11 @@ export const ToolExecution = React.memo(function ToolExecution({
 
   return (
     <>
-      <motion.div
-        initial={shouldReduceMotion ? { opacity: 1 } : { opacity: 0, x: -20 }}
-        animate={{ opacity: 1, x: 0 }}
-        transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
-        className={cn('flex gap-3', className)}
-      >
+      <div className={cn('flex gap-3', className)}>
         {/* Tool Icon Avatar */}
         <div
           className={cn(
-            'flex h-8 w-8 shrink-0 items-center justify-center rounded-full glass-strong border',
+            'flex h-8 w-8 shrink-0 items-center justify-center rounded-full border',
             colorClasses
           )}
         >
@@ -330,16 +305,15 @@ export const ToolExecution = React.memo(function ToolExecution({
         <div className="flex-1 min-w-0">
           <div
             className={cn(
-              'glass overflow-hidden rounded-xl border transition-all duration-200',
-              'hover:shadow-lg hover:shadow-accent/5',
-              colorClasses.split(' ').slice(1).join(' '),
-              isFullscreen && 'fixed inset-4 z-50 rounded-2xl'
+              'overflow-hidden rounded-lg border border-border transition-all duration-200',
+              'bg-muted',
+              isFullscreen && 'fixed inset-4 z-50 rounded-xl'
             )}
           >
             {/* Header */}
-            <div className="flex items-center justify-between px-3 py-2.5">
+            <div className="flex items-center justify-between px-3 py-2.5 bg-background">
               <button onClick={onToggle} className="flex items-center gap-2.5 flex-1 text-left">
-                <span className={cn('text-sm font-medium', colorClasses.split(' ')[0])}>
+                <span className="text-sm font-medium text-foreground">
                   {toolCall.name}
                 </span>
                 <span className="text-xs text-muted-foreground">
@@ -364,8 +338,8 @@ export const ToolExecution = React.memo(function ToolExecution({
                       className={cn(
                         'p-1.5 rounded-md transition-colors',
                         viewMode === 'preview'
-                          ? 'bg-white/10 text-foreground'
-                          : 'text-muted-foreground hover:text-foreground hover:bg-white/5'
+                          ? 'bg-muted text-foreground'
+                          : 'text-muted-foreground hover:text-foreground hover:bg-muted'
                       )}
                       title="Preview view"
                     >
@@ -379,8 +353,8 @@ export const ToolExecution = React.memo(function ToolExecution({
                       className={cn(
                         'p-1.5 rounded-md transition-colors',
                         viewMode === 'json'
-                          ? 'bg-white/10 text-foreground'
-                          : 'text-muted-foreground hover:text-foreground hover:bg-white/5'
+                          ? 'bg-muted text-foreground'
+                          : 'text-muted-foreground hover:text-foreground hover:bg-muted'
                       )}
                       title="JSON view"
                     >
@@ -394,8 +368,8 @@ export const ToolExecution = React.memo(function ToolExecution({
                       className={cn(
                         'p-1.5 rounded-md transition-colors',
                         viewMode === 'raw'
-                          ? 'bg-white/10 text-foreground'
-                          : 'text-muted-foreground hover:text-foreground hover:bg-white/5'
+                          ? 'bg-muted text-foreground'
+                          : 'text-muted-foreground hover:text-foreground hover:bg-muted'
                       )}
                       title="Raw view"
                     >
@@ -411,7 +385,7 @@ export const ToolExecution = React.memo(function ToolExecution({
                       e.stopPropagation();
                       setIsFullscreen(!isFullscreen);
                     }}
-                    className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors ml-1"
+                    className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors ml-1"
                     title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
                   >
                     {isFullscreen ? (
@@ -425,30 +399,30 @@ export const ToolExecution = React.memo(function ToolExecution({
                 {/* Expand/Collapse */}
                 <button
                   onClick={onToggle}
-                  className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
+                  className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
                 >
-                  <motion.div
-                    animate={{ rotate: isExpanded ? 180 : 0 }}
-                    transition={{ duration: shouldReduceMotion ? 0 : 0.2 }}
-                  >
-                    <CaretDown className="h-4 w-4" />
-                  </motion.div>
+                  <CaretDown
+                    className={cn(
+                      'h-4 w-4 transition-transform duration-200',
+                      isExpanded && 'rotate-180'
+                    )}
+                  />
                 </button>
               </div>
             </div>
 
             {/* Collapsed Preview */}
             {!isExpanded && (
-              <div className="border-t border-white/5 px-3 py-2">
+              <div className="border-t border-border px-3 py-2">
                 <div className="flex flex-wrap gap-2">
                   {parameters.slice(0, 3).map((param) => (
                     <span
                       key={param.key}
-                      className="inline-flex items-center gap-1 rounded-md bg-white/5 px-2 py-1 text-xs"
+                      className="inline-flex items-center gap-1 rounded-md bg-background px-2 py-1 text-xs"
                       title={`${param.key}: ${formatValue(param.value)}`}
                     >
                       <span className="text-muted-foreground">{param.key}=</span>
-                      <span className="text-foreground/80 truncate max-w-[100px]">
+                      <span className="text-foreground truncate max-w-[100px]">
                         {getValuePreview(param.value, 30)}
                       </span>
                     </span>
@@ -461,158 +435,145 @@ export const ToolExecution = React.memo(function ToolExecution({
             )}
 
             {/* Expanded Content */}
-            <AnimatePresence initial={false}>
-              {isExpanded && (
-                <motion.div
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  transition={{ duration: shouldReduceMotion ? 0 : 0.2, ease: [0.16, 1, 0.3, 1] }}
-                  className="overflow-hidden"
-                >
-                  <div className="border-t border-white/5">
-                    {/* Tool Call Section */}
-                    <div className="px-3 py-3">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-xs text-muted-foreground">Tool Call Parameters</span>
+            {isExpanded && (
+              <div className="overflow-hidden border-t border-border">
+                {/* Tool Call Section */}
+                <div className="px-3 py-3 bg-background">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs text-muted-foreground">Tool Call Parameters</span>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        navigator.clipboard.writeText(formattedArgs);
+                      }}
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                    >
+                      <Copy className="h-3 w-3" />
+                      Copy JSON
+                    </button>
+                  </div>
+
+                  {/* Parameters Grid */}
+                  <div className="space-y-2">
+                    {parameters.map((param) => (
+                      <div
+                        key={param.key}
+                        className="group flex items-start gap-2 rounded-lg bg-muted p-2 transition-colors hover:bg-muted/80"
+                      >
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-medium text-muted-foreground">{param.key}</span>
+                            <span className="text-[10px] text-muted-foreground/50 uppercase">{param.type}</span>
+                          </div>
+                          <div className="mt-0.5 text-sm text-foreground break-all font-mono">
+                            {formatValue(param.value)}
+                          </div>
+                        </div>
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            navigator.clipboard.writeText(formattedArgs);
+                            handleCopyParam(param.key, param.value);
                           }}
-                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
+                          className="opacity-0 group-hover:opacity-100 transition-opacity rounded-md p-1 hover:bg-background"
+                          title="Copy value"
                         >
-                          <Copy className="h-3 w-3" />
-                          Copy JSON
+                          {copiedParam === param.key ? (
+                            <CheckCircle className="h-3 w-3 text-foreground" weight="fill" />
+                          ) : (
+                            <Copy className="h-3 w-3 text-muted-foreground" />
+                          )}
                         </button>
                       </div>
+                    ))}
+                  </div>
 
-                      {/* Parameters Grid */}
-                      <div className="space-y-2">
-                        {parameters.map((param) => (
-                          <div
-                            key={param.key}
-                            className="group flex items-start gap-2 rounded-lg bg-black/20 p-2 transition-colors hover:bg-black/30"
-                          >
-                            <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-2">
-                                <span className="text-xs font-medium text-muted-foreground">{param.key}</span>
-                                <span className="text-[10px] text-muted-foreground/50 uppercase">{param.type}</span>
-                              </div>
-                              <div className="mt-0.5 text-sm text-foreground/90 break-all font-mono">
-                                {formatValue(param.value)}
-                              </div>
-                            </div>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleCopyParam(param.key, param.value);
-                              }}
-                              className="opacity-0 group-hover:opacity-100 transition-opacity rounded-md p-1 hover:bg-white/10"
-                              title="Copy value"
-                            >
-                              {copiedParam === param.key ? (
-                                <CheckCircle className="h-3 w-3 text-emerald-400" weight="fill" />
-                              ) : (
-                                <Copy className="h-3 w-3 text-muted-foreground" />
-                              )}
-                            </button>
+                  {/* Raw JSON */}
+                  <div className="mt-3">
+                    <div className="text-xs text-muted-foreground mb-1">Raw JSON</div>
+                    <pre className="overflow-x-auto rounded-lg bg-muted p-3 text-xs text-foreground scrollbar-thin">
+                      <code>{formattedArgs}</code>
+                    </pre>
+                  </div>
+                </div>
+
+                {/* Tool Result Section (if available) */}
+                {hasResult && (
+                  <div className="border-t border-border px-3 py-3 bg-background">
+                    {/* Error Display */}
+                    {hasError && (
+                      <div className="mb-3 px-3 py-2 bg-muted border border-border rounded-lg">
+                        <div className="flex items-start gap-2">
+                          <Warning className="h-4 w-4 text-foreground shrink-0 mt-0.5" />
+                          <div className="flex-1">
+                            <div className="text-sm font-medium text-foreground">Error</div>
+                            <div className="text-xs text-muted-foreground mt-0.5">{toolResult.error}</div>
                           </div>
-                        ))}
+                        </div>
                       </div>
+                    )}
 
-                      {/* Raw JSON */}
-                      <div className="mt-3">
-                        <div className="text-xs text-muted-foreground mb-1">Raw JSON</div>
-                        <pre className="overflow-x-auto rounded-lg bg-black/30 p-3 text-xs text-foreground/80 scrollbar-thin scrollbar-thumb-accent/20 scrollbar-track-transparent">
-                          <code>{formattedArgs}</code>
-                        </pre>
+                    {/* Result Header */}
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs text-muted-foreground">
+                        Result ({viewMode === 'json' ? 'JSON' : viewMode === 'raw' ? 'Raw' : 'Preview'})
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={handleCopy}
+                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                        >
+                          {isCopied ? (
+                            <>
+                              <CheckCircle className="h-3 w-3 text-foreground" />
+                              <span className="text-foreground">Copied!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="h-3 w-3" />
+                              Copy
+                            </>
+                          )}
+                        </button>
+                        <button
+                          onClick={handleDownload}
+                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                        >
+                          <Download className="h-3 w-3" />
+                          Download
+                        </button>
                       </div>
                     </div>
 
-                    {/* Tool Result Section (if available) */}
-                    {hasResult && (
-                      <div className="border-t border-white/5 px-3 py-3">
-                        {/* Error Display */}
-                        {hasError && (
-                          <div className="mb-3 px-3 py-2 bg-destructive/5 border border-destructive/20 rounded-lg">
-                            <div className="flex items-start gap-2">
-                              <Warning className="h-4 w-4 text-destructive shrink-0 mt-0.5" />
-                              <div className="flex-1">
-                                <div className="text-sm font-medium text-destructive">Error</div>
-                                <div className="text-xs text-destructive/80 mt-0.5">{toolResult.error}</div>
-                              </div>
-                            </div>
-                          </div>
-                        )}
+                    {/* Result Content */}
+                    <div
+                      className={cn(
+                        'bg-muted rounded-lg',
+                        isFullscreen && 'max-h-[calc(100vh-400px)] overflow-auto'
+                      )}
+                    >
+                      {renderResultContent()}
+                    </div>
 
-                        {/* Result Header */}
-                        <div className="flex items-center justify-between mb-2">
-                          <span className="text-xs text-muted-foreground">
-                            Result ({viewMode === 'json' ? 'JSON' : viewMode === 'raw' ? 'Raw' : 'Preview'})
-                          </span>
-                          <div className="flex items-center gap-1">
-                            <button
-                              onClick={handleCopy}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
-                            >
-                              {isCopied ? (
-                                <>
-                                  <CheckCircle className="h-3 w-3 text-emerald-400" />
-                                  <span className="text-emerald-400">Copied!</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Copy className="h-3 w-3" />
-                                  Copy
-                                </>
-                              )}
-                            </button>
-                            <button
-                              onClick={handleDownload}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-white/5 transition-colors"
-                            >
-                              <Download className="h-3 w-3" />
-                              Download
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Result Content */}
-                        <div
-                          className={cn(
-                            'bg-black/20 rounded-lg',
-                            isFullscreen && 'max-h-[calc(100vh-400px)] overflow-auto'
-                          )}
-                        >
-                          {renderResultContent()}
-                        </div>
-
-                        {/* Large Result Warning */}
-                        {isLarge && (
-                          <div className="mt-2 px-3 py-2 border-t border-white/5 bg-white/[0.02] rounded-b-lg">
-                            <p className="text-xs text-muted-foreground">
-                              Large result ({resultSize.toLocaleString()} characters)
-                            </p>
-                          </div>
-                        )}
+                    {/* Large Result Warning */}
+                    {isLarge && (
+                      <div className="mt-2 px-3 py-2 border-t border-border bg-muted/50 rounded-b-lg">
+                        <p className="text-xs text-muted-foreground">
+                          Large result ({resultSize.toLocaleString()} characters)
+                        </p>
                       </div>
                     )}
                   </div>
-                </motion.div>
-              )}
-            </AnimatePresence>
+                )}
+              </div>
+            )}
           </div>
         </div>
-      </motion.div>
+      </div>
 
       {/* Fullscreen Overlay Backdrop */}
       {isFullscreen && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-40"
+        <div
+          className="fixed inset-0 bg-background/80 z-40"
           onClick={() => setIsFullscreen(false)}
         />
       )}

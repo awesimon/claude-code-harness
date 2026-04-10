@@ -8,9 +8,9 @@ interface TaskListProps {
   conversationId?: string;
 }
 
-const statusColors: Record<Task['status'], 'default' | 'primary' | 'success' | 'warning' | 'danger'> = {
+const statusColors: Record<Task['status'], 'default' | 'secondary' | 'success' | 'warning' | 'destructive'> = {
   pending: 'default',
-  in_progress: 'primary',
+  in_progress: 'secondary',
   completed: 'success',
 };
 
@@ -78,20 +78,20 @@ export const TaskList: React.FC<TaskListProps> = ({ conversationId }) => {
   return (
     <div className="space-y-4">
       {/* Create Task Form */}
-      <form onSubmit={handleCreateTask} className="space-y-2 p-4 bg-gray-50 rounded-lg">
+      <form onSubmit={handleCreateTask} className="space-y-2 p-4 bg-muted rounded-lg">
         <h3 className="font-medium">创建新任务</h3>
         <input
           type="text"
           placeholder="任务标题"
           value={newTaskSubject}
           onChange={(e) => setNewTaskSubject(e.target.value)}
-          className="w-full px-3 py-2 border rounded-md text-sm"
+          className="w-full px-3 py-2 border rounded-md text-sm bg-background"
         />
         <textarea
           placeholder="任务描述"
           value={newTaskDescription}
           onChange={(e) => setNewTaskDescription(e.target.value)}
-          className="w-full px-3 py-2 border rounded-md text-sm h-20 resize-none"
+          className="w-full px-3 py-2 border rounded-md text-sm h-20 resize-none bg-background"
         />
         <Button type="submit" size="sm" className="w-full">
           创建任务
@@ -101,14 +101,14 @@ export const TaskList: React.FC<TaskListProps> = ({ conversationId }) => {
       {/* Task List */}
       <div className="space-y-2">
         {tasks.length === 0 ? (
-          <div className="text-center text-gray-500 py-8">暂无任务</div>
+          <div className="text-center text-muted-foreground py-8">暂无任务</div>
         ) : (
           tasks.map((task) => (
             <div
               key={task.id}
               onClick={() => selectTask(task.id === selectedTaskId ? null : task.id)}
               className={`p-3 border rounded-lg cursor-pointer transition-colors ${
-                selectedTaskId === task.id ? 'border-blue-500 bg-blue-50' : 'hover:bg-gray-50'
+                selectedTaskId === task.id ? 'border-foreground bg-muted' : 'border-border hover:bg-muted'
               }`}
             >
               <div className="flex items-start justify-between gap-2">
@@ -119,12 +119,12 @@ export const TaskList: React.FC<TaskListProps> = ({ conversationId }) => {
                       {statusLabels[task.status]}
                     </Badge>
                   </div>
-                  <p className="text-sm text-gray-600 mt-1 line-clamp-2">{task.description}</p>
+                  <p className="text-sm text-muted-foreground mt-1 line-clamp-2">{task.description}</p>
                   {task.owner && (
-                    <p className="text-xs text-gray-500 mt-1">负责人: {task.owner}</p>
+                    <p className="text-xs text-muted-foreground mt-1">负责人: {task.owner}</p>
                   )}
                   {task.blocked_by && task.blocked_by.length > 0 && (
-                    <p className="text-xs text-orange-600 mt-1">
+                    <p className="text-xs text-muted-foreground mt-1">
                       被阻塞: {task.blocked_by.join(', ')}
                     </p>
                   )}
@@ -137,7 +137,7 @@ export const TaskList: React.FC<TaskListProps> = ({ conversationId }) => {
                   {task.status === 'pending' && !task.owner && (
                     <Button
                       size="sm"
-                      variant="primary"
+                      variant="default"
                       onClick={(e) => {
                         e.stopPropagation();
                         handleClaimTask(task.id);
@@ -149,7 +149,7 @@ export const TaskList: React.FC<TaskListProps> = ({ conversationId }) => {
                   {task.status === 'in_progress' && (
                     <Button
                       size="sm"
-                      variant="success"
+                      variant="default"
                       onClick={(e) => {
                         e.stopPropagation();
                         handleCompleteTask(task.id);
@@ -178,7 +178,7 @@ export const TaskList: React.FC<TaskListProps> = ({ conversationId }) => {
       </div>
 
       {/* Task Stats */}
-      <div className="flex gap-4 text-sm text-gray-600 pt-4 border-t">
+      <div className="flex gap-4 text-sm text-muted-foreground pt-4 border-t">
         <span>总计: {tasks.length}</span>
         <span>待处理: {tasks.filter((t) => t.status === 'pending').length}</span>
         <span>进行中: {tasks.filter((t) => t.status === 'in_progress').length}</span>

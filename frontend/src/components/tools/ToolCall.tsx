@@ -97,16 +97,16 @@ const toolCategories: Record<string, string> = {
   ls: 'directory',
 };
 
-// Category colors
+// Category colors - using CSS variables for theming support
 const categoryColors: Record<string, string> = {
-  file: 'text-blue-400 bg-blue-500/20 border-blue-500/20',
+  file: 'text-[hsl(var(--accent-info))] bg-[hsl(var(--accent-info)/0.2)] border-[hsl(var(--accent-info)/0.2)]',
   system: 'text-purple-400 bg-purple-500/20 border-purple-500/20',
   search: 'text-amber-400 bg-amber-500/20 border-amber-500/20',
   web: 'text-cyan-400 bg-cyan-500/20 border-cyan-500/20',
-  database: 'text-emerald-400 bg-emerald-500/20 border-emerald-500/20',
+  database: 'text-[hsl(var(--accent-success))] bg-[hsl(var(--accent-success)/0.2)] border-[hsl(var(--accent-success)/0.2)]',
   code: 'text-pink-400 bg-pink-500/20 border-pink-500/20',
   directory: 'text-orange-400 bg-orange-500/20 border-orange-500/20',
-  default: 'text-accent bg-accent/20 border-accent/20',
+  default: 'text-[hsl(var(--accent))] bg-[hsl(var(--accent)/0.2)] border-[hsl(var(--accent)/0.2)]',
 };
 
 interface Parameter {

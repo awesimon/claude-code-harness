@@ -1,11 +1,9 @@
 import * as React from 'react';
-import { motion, AnimatePresence, useReducedMotion } from 'framer-motion';
 import {
   ChatCircleText,
   MagnifyingGlass,
   X,
   ArrowDown,
-  Sparkle,
 } from '@phosphor-icons/react';
 import { Message } from './Message';
 import type { Message as MessageType } from '@/types';
@@ -32,7 +30,7 @@ type SearchFilter = {
 function highlightText(text: string, query: string): string {
   if (!query.trim()) return text;
   const regex = new RegExp(`(${escapeRegExp(query)})`, 'gi');
-  return text.replace(regex, '<mark class="bg-yellow-500/30 text-yellow-200">$1</mark>');
+  return text.replace(regex, '<mark class="bg-foreground/20 text-foreground">$1</mark>');
 }
 
 function escapeRegExp(string: string): string {
@@ -57,7 +55,7 @@ const SearchBar = React.memo(function SearchBar({
   }, [filter, onFilterChange]);
 
   return (
-    <div className="flex items-center gap-2 px-4 py-2 glass border-b border-white/5">
+    <div className="flex items-center gap-2 px-4 py-2 border-b border-border bg-background">
       <div className="relative flex-1">
         <MagnifyingGlass className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <input
@@ -67,8 +65,8 @@ const SearchBar = React.memo(function SearchBar({
           value={filter.query}
           onChange={(e) => onFilterChange({ ...filter, query: e.target.value })}
           className={cn(
-            'w-full pl-9 pr-8 py-1.5 text-sm bg-white/5 rounded-lg',
-            'border border-transparent focus:border-primary/50',
+            'w-full pl-9 pr-8 py-1.5 text-sm bg-muted rounded-md',
+            'border border-border focus:border-foreground',
             'text-foreground placeholder:text-muted-foreground',
             'transition-colors outline-none'
           )}
@@ -76,7 +74,7 @@ const SearchBar = React.memo(function SearchBar({
         {filter.query && (
           <button
             onClick={handleClear}
-            className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-white/10 text-muted-foreground"
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-muted text-muted-foreground"
           >
             <X className="h-3 w-3" />
           </button>
@@ -86,8 +84,8 @@ const SearchBar = React.memo(function SearchBar({
         value={filter.role}
         onChange={(e) => onFilterChange({ ...filter, role: e.target.value as SearchFilter['role'] })}
         className={cn(
-          'px-2 py-1.5 text-sm bg-white/5 rounded-lg',
-          'border border-transparent focus:border-primary/50',
+          'px-2 py-1.5 text-sm bg-muted rounded-md',
+          'border border-border focus:border-foreground',
           'text-foreground outline-none cursor-pointer'
         )}
       >
@@ -114,31 +112,23 @@ const ScrollToBottomButton = React.memo(function ScrollToBottomButton({
   onClick: () => void;
   visible: boolean;
 }) {
-  const shouldReduceMotion = useReducedMotion();
+  if (!visible) return null;
 
   return (
-    <AnimatePresence>
-      {visible && (
-        <motion.button
-          initial={shouldReduceMotion ? { opacity: 1 } : { opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          exit={shouldReduceMotion ? { opacity: 0 } : { opacity: 0, y: 10 }}
-          transition={{ duration: 0.2 }}
-          onClick={onClick}
-          className={cn(
-            'absolute bottom-4 right-4 z-10',
-            'flex items-center gap-2 px-3 py-2 rounded-full',
-            'bg-primary text-primary-foreground shadow-lg',
-            'hover:bg-primary/90 active:scale-95',
-            'transition-all duration-200'
-          )}
-          aria-label="Scroll to bottom"
-        >
-          <ArrowDown className="h-4 w-4" />
-          <span className="text-sm font-medium">New messages</span>
-        </motion.button>
+    <button
+      onClick={onClick}
+      className={cn(
+        'absolute bottom-4 right-4 z-10',
+        'flex items-center gap-2 px-3 py-2 rounded-full',
+        'bg-foreground text-background',
+        'hover:bg-foreground/90 active:scale-95',
+        'transition-all duration-200'
       )}
-    </AnimatePresence>
+      aria-label="Scroll to bottom"
+    >
+      <ArrowDown className="h-4 w-4" />
+      <span className="text-sm font-medium">New messages</span>
+    </button>
   );
 });
 
@@ -146,46 +136,26 @@ ScrollToBottomButton.displayName = 'ScrollToBottomButton';
 
 // Typing indicator component - isolated for performance
 const TypingIndicator = React.memo(function TypingIndicator() {
-  const shouldReduceMotion = useReducedMotion();
-
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -10 }}
-      className="flex gap-3"
-    >
+    <div className="flex gap-3">
       {/* Avatar */}
-      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full glass-strong bg-primary/20">
-        <Sparkle className="h-4 w-4 text-primary animate-pulse" weight="fill" />
+      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted">
+        <span className="text-xs font-medium">AI</span>
       </div>
 
       {/* Typing dots */}
-      <div className="glass rounded-2xl px-4 py-3">
+      <div className="bg-muted rounded-lg px-4 py-3">
         <div className="flex items-center gap-1.5">
           {[0, 1, 2].map((i) => (
-            <motion.div
+            <div
               key={i}
-              animate={
-                shouldReduceMotion
-                  ? {}
-                  : {
-                      scale: [1, 1.3, 1],
-                      opacity: [0.4, 1, 0.4],
-                    }
-              }
-              transition={{
-                repeat: Infinity,
-                duration: 1.2,
-                delay: i * 0.15,
-                ease: 'easeInOut',
-              }}
-              className="h-2 w-2 rounded-full bg-primary"
+              className="h-2 w-2 rounded-full bg-muted-foreground animate-pulse"
+              style={{ animationDelay: `${i * 0.15}s` }}
             />
           ))}
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 });
 
@@ -193,11 +163,9 @@ TypingIndicator.displayName = 'TypingIndicator';
 
 // Empty state component
 const EmptyState = React.memo(function EmptyState({
-  shouldReduceMotion,
   title,
   description,
 }: {
-  shouldReduceMotion: boolean | null;
   title: string;
   description: string;
 }) {
@@ -210,27 +178,14 @@ const EmptyState = React.memo(function EmptyState({
 
   return (
     <div className="flex h-full flex-col items-center justify-center px-4">
-      <motion.div
-        initial={
-          shouldReduceMotion
-            ? { opacity: 1 }
-            : { opacity: 0, scale: 0.9, y: 20 }
-        }
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
-        className="text-center"
-      >
+      <div className="text-center">
         {/* Logo Icon */}
-        <motion.div
-          className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl glass-strong bg-primary/20"
-          whileHover={shouldReduceMotion ? {} : { scale: 1.05, rotate: 5 }}
-          transition={{ type: 'spring', stiffness: 400, damping: 25 }}
-        >
+        <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-muted">
           <ChatCircleText
-            className="h-8 w-8 text-primary"
+            className="h-8 w-8 text-foreground"
             weight="duotone"
           />
-        </motion.div>
+        </div>
 
         <h2 className="mb-2 text-3xl font-semibold tracking-tight text-foreground">
           {title}
@@ -241,26 +196,18 @@ const EmptyState = React.memo(function EmptyState({
 
         {/* Feature badges */}
         <div className="mt-8 flex flex-wrap justify-center gap-2">
-          {features.map((feature, i) => (
-            <motion.span
+          {features.map((feature) => (
+            <span
               key={feature}
-              initial={shouldReduceMotion ? { opacity: 1 } : { opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.2 + i * 0.1 }}
-              className="px-3 py-1.5 text-xs glass rounded-full text-muted-foreground hover:text-foreground hover:bg-white/10 transition-colors cursor-default"
+              className="px-3 py-1.5 text-xs bg-muted rounded-full text-muted-foreground hover:text-foreground transition-colors cursor-default"
             >
               {feature}
-            </motion.span>
+            </span>
           ))}
         </div>
 
         {/* Quick tips */}
-        <motion.div
-          initial={shouldReduceMotion ? { opacity: 1 } : { opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ delay: 0.6 }}
-          className="mt-10 text-sm text-muted-foreground"
-        >
+        <div className="mt-10 text-sm text-muted-foreground">
           <p className="mb-2">Try asking:</p>
           <div className="space-y-1.5">
             {[
@@ -277,8 +224,8 @@ const EmptyState = React.memo(function EmptyState({
               </p>
             ))}
           </div>
-        </motion.div>
-      </motion.div>
+        </div>
+      </div>
     </div>
   );
 });
@@ -328,7 +275,6 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
     ref
   ) {
     const scrollRef = React.useRef<HTMLDivElement>(null);
-    const shouldReduceMotion = useReducedMotion();
     const [showScrollButton, setShowScrollButton] = React.useState(false);
     const [filter, setFilter] = React.useState<SearchFilter>({
       query: '',
@@ -363,11 +309,11 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
         if (scrollRef.current) {
           scrollRef.current.scrollTo({
             top: scrollRef.current.scrollHeight,
-            behavior: shouldReduceMotion ? 'auto' : behavior,
+            behavior,
           });
         }
       },
-      [shouldReduceMotion]
+      []
     );
 
     // Auto-scroll when new messages arrive (if already near bottom)
@@ -403,7 +349,6 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
           aria-label="Chat messages"
         >
           <EmptyState
-            shouldReduceMotion={shouldReduceMotion}
             title={emptyStateTitle}
             description={emptyStateDescription}
           />
@@ -442,26 +387,22 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
         >
           <div className="mx-auto max-w-3xl space-y-6">
             {filteredMessages.length > maxVisibleMessages && (
-              <div className="text-center py-2 text-xs text-muted-foreground bg-white/5 rounded-lg">
+              <div className="text-center py-2 text-xs text-muted-foreground bg-muted rounded-lg">
                 显示最近 {maxVisibleMessages} 条消息（共 {filteredMessages.length} 条）
               </div>
             )}
             {isSearching && filteredMessages.length === 0 ? (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                className="text-center py-12"
-              >
+              <div className="text-center py-12">
                 <p className="text-muted-foreground">
                   No messages match your search.
                 </p>
                 <button
                   onClick={() => setFilter({ query: '', role: 'all' })}
-                  className="mt-2 text-sm text-primary hover:underline"
+                  className="mt-2 text-sm text-foreground hover:underline"
                 >
                   Clear search
                 </button>
-              </motion.div>
+              </div>
             ) : (
               <>
                 {visibleMessages.map((message, index) => (
@@ -480,17 +421,11 @@ export const MessageList = React.forwardRef<HTMLDivElement, MessageListProps>(
             )}
 
             {/* Loading/Typing indicator */}
-            <AnimatePresence>
-              {isLoading && !isSearching && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                >
-                  <TypingIndicator />
-                </motion.div>
-              )}
-            </AnimatePresence>
+            {isLoading && !isSearching && (
+              <div>
+                <TypingIndicator />
+              </div>
+            )}
 
             {/* Bottom spacer for scrolling */}
             <div className="h-4" aria-hidden="true" />

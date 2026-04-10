@@ -1,5 +1,4 @@
 import * as React from 'react';
-import { motion, useReducedMotion } from 'framer-motion';
 import { cn } from '@/lib/utils';
 
 interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
@@ -11,8 +10,6 @@ interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
   onRemove?: () => void;
   /** 是否为点状徽章 */
   dot?: boolean;
-  /** 是否显示脉冲动画 */
-  pulse?: boolean;
 }
 
 /**
@@ -28,21 +25,18 @@ const Badge = React.forwardRef<HTMLSpanElement, BadgeProps>(
       size = 'default',
       onRemove,
       dot = false,
-      pulse = false,
       children,
       ...props
     },
     ref
   ) => {
-    const shouldReduceMotion = useReducedMotion();
-
     const variantClasses = {
-      default: 'bg-primary text-primary-foreground hover:bg-primary/90',
-      secondary: 'bg-secondary text-secondary-foreground hover:bg-secondary/90',
-      destructive: 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
-      outline: 'border border-input bg-background hover:bg-accent hover:text-accent-foreground',
-      success: 'bg-emerald-500/10 text-emerald-600 border border-emerald-500/20',
-      warning: 'bg-amber-500/10 text-amber-600 border border-amber-500/20',
+      default: 'bg-foreground text-background',
+      secondary: 'bg-muted text-foreground',
+      destructive: 'bg-foreground text-background',
+      outline: 'border border-border bg-background text-foreground',
+      success: 'bg-muted text-foreground',
+      warning: 'bg-muted text-foreground',
     };
 
     const sizeClasses = {
@@ -51,16 +45,11 @@ const Badge = React.forwardRef<HTMLSpanElement, BadgeProps>(
       lg: 'text-sm px-3 py-1',
     };
 
-    const pulseAnimation = pulse && !shouldReduceMotion && {
-      animate: { scale: [1, 1.05, 1] },
-      transition: { duration: 2, repeat: Infinity, ease: 'easeInOut' },
-    };
-
     return (
       <span
         ref={ref}
         className={cn(
-          'inline-flex items-center gap-1 rounded-full font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2',
+          'inline-flex items-center gap-1 rounded-full font-medium transition-colors',
           variantClasses[variant],
           sizeClasses[size],
           onRemove && 'pr-1',
@@ -72,12 +61,12 @@ const Badge = React.forwardRef<HTMLSpanElement, BadgeProps>(
           <span
             className={cn(
               'h-1.5 w-1.5 rounded-full',
-              variant === 'default' && 'bg-primary-foreground',
-              variant === 'secondary' && 'bg-secondary-foreground',
-              variant === 'destructive' && 'bg-destructive-foreground',
+              variant === 'default' && 'bg-background',
+              variant === 'secondary' && 'bg-foreground',
+              variant === 'destructive' && 'bg-background',
               variant === 'outline' && 'bg-foreground',
-              variant === 'success' && 'bg-emerald-600',
-              variant === 'warning' && 'bg-amber-600'
+              variant === 'success' && 'bg-foreground',
+              variant === 'warning' && 'bg-foreground'
             )}
           />
         )}
@@ -86,7 +75,7 @@ const Badge = React.forwardRef<HTMLSpanElement, BadgeProps>(
           <button
             type="button"
             onClick={onRemove}
-            className="ml-1 rounded-full p-0.5 hover:bg-black/10 dark:hover:bg-white/10 transition-colors"
+            className="ml-1 rounded-full p-0.5 hover:bg-muted transition-colors"
             aria-label="移除标签"
           >
             <svg
@@ -122,10 +111,10 @@ interface StatusBadgeProps extends Omit<BadgeProps, 'variant' | 'dot'> {
 
 function StatusBadge({ status, className, ...props }: StatusBadgeProps) {
   const statusConfig = {
-    online: { variant: 'success' as const, label: '在线' },
+    online: { variant: 'default' as const, label: '在线' },
     offline: { variant: 'secondary' as const, label: '离线' },
-    busy: { variant: 'destructive' as const, label: '忙碌' },
-    away: { variant: 'warning' as const, label: '离开' },
+    busy: { variant: 'default' as const, label: '忙碌' },
+    away: { variant: 'secondary' as const, label: '离开' },
     default: { variant: 'default' as const, label: '默认' },
   };
 
@@ -158,7 +147,7 @@ function CountBadge({
   count,
   max = 99,
   showZero = false,
-  variant = 'destructive',
+  variant = 'default',
   size = 'sm',
   className,
   ...props
@@ -196,9 +185,8 @@ const Tag = React.forwardRef<HTMLSpanElement, TagProps>(
         ref={ref}
         variant={selected ? 'default' : 'outline'}
         className={cn(
-          'cursor-pointer transition-all',
+          'cursor-pointer transition-colors',
           disabled && 'cursor-not-allowed opacity-50',
-          selected && 'shadow-sm',
           className
         )}
         {...props}

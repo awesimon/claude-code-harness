@@ -1,5 +1,4 @@
 import * as React from 'react';
-import { motion, useReducedMotion } from 'framer-motion';
 import { cn } from '@/lib/utils';
 
 interface SkeletonProps extends React.HTMLAttributes<HTMLDivElement> {
@@ -32,35 +31,16 @@ function Skeleton({
     rect: 'rounded-none',
   };
 
-  const shouldReduceMotion = useReducedMotion();
-  const showAnimation = animated && !shouldReduceMotion;
-
   return (
     <div
-      className={cn(baseClasses, variantClasses[variant], className)}
+      className={cn(baseClasses, variantClasses[variant], animated && 'skeleton-pulse', className)}
       style={{
         width,
         height,
         ...style,
       }}
       {...props}
-    >
-      {showAnimation && (
-        <motion.div
-          className="absolute inset-0 -translate-x-full"
-          style={{
-            background: 'linear-gradient(90deg, transparent, hsl(var(--muted-foreground) / 0.1), transparent)',
-          }}
-          initial={{ x: '-100%' }}
-          animate={{ x: '100%' }}
-          transition={{
-            repeat: Infinity,
-            duration: 1.5,
-            ease: 'linear',
-          }}
-        />
-      )}
-    </div>
+    />
   );
 }
 
@@ -82,15 +62,13 @@ function SkeletonText({
   lastLineWidth = '60%',
   animated = true,
 }: SkeletonTextProps) {
-  const shouldReduceMotion = useReducedMotion();
-
   return (
     <div className={cn('space-y-2', className)} aria-hidden="true">
       {Array.from({ length: lines }).map((_, i) => (
         <Skeleton
           key={i}
           variant="text"
-          animated={animated && !shouldReduceMotion}
+          animated={animated}
           className={cn(
             'h-4 w-full',
             i === lines - 1 && lastLineWidth !== '100%' ? lastLineWidth : '',
@@ -114,9 +92,6 @@ interface MessageSkeletonProps {
 }
 
 function MessageSkeleton({ isUser = false, count = 1, animated = true }: MessageSkeletonProps) {
-  const shouldReduceMotion = useReducedMotion();
-  const showAnimation = animated && !shouldReduceMotion;
-
   return (
     <div className={cn('flex gap-4', isUser ? 'flex-row-reverse' : 'flex-row')}>
       {/* Avatar */}
@@ -124,7 +99,7 @@ function MessageSkeleton({ isUser = false, count = 1, animated = true }: Message
         variant="circular"
         width={32}
         height={32}
-        animated={showAnimation}
+        animated={animated}
         className="shrink-0"
       />
 
@@ -132,14 +107,14 @@ function MessageSkeleton({ isUser = false, count = 1, animated = true }: Message
       <div className={cn('flex-1', isUser ? 'text-right' : 'text-left')}>
         <div
           className={cn(
-            'inline-block max-w-[85%] rounded-lg px-4 py-3 bg-muted/50',
-            isUser ? 'bg-primary/10' : ''
+            'inline-block max-w-[85%] rounded-lg px-4 py-3 bg-muted',
+            isUser ? 'bg-muted' : ''
           )}
         >
           <div className="space-y-2">
-            <Skeleton width="100%" height={16} animated={showAnimation} />
-            <Skeleton width="80%" height={16} animated={showAnimation} />
-            {count > 1 && <Skeleton width="60%" height={16} animated={showAnimation} />}
+            <Skeleton width="100%" height={16} animated={animated} />
+            <Skeleton width="80%" height={16} animated={animated} />
+            {count > 1 && <Skeleton width="60%" height={16} animated={animated} />}
           </div>
         </div>
       </div>
@@ -158,31 +133,28 @@ interface ToolCallSkeletonProps {
 }
 
 function ToolCallSkeleton({ showInput = true, animated = true }: ToolCallSkeletonProps) {
-  const shouldReduceMotion = useReducedMotion();
-  const showAnimation = animated && !shouldReduceMotion;
-
   return (
     <div className="flex gap-3">
       <Skeleton
         variant="circular"
         width={28}
         height={28}
-        animated={showAnimation}
+        animated={animated}
         className="shrink-0"
       />
       <div className="flex-1">
-        <div className="border rounded-lg p-3 bg-card">
+        <div className="border rounded-lg p-3 bg-muted">
           <div className="flex items-center gap-2 mb-2">
             <Skeleton
               variant="circular"
               width={20}
               height={20}
-              animated={showAnimation}
+              animated={animated}
             />
-            <Skeleton width={100} height={16} animated={showAnimation} />
+            <Skeleton width={100} height={16} animated={animated} />
           </div>
           {showInput && (
-            <Skeleton width="100%" height={60} animated={showAnimation} />
+            <Skeleton width="100%" height={60} animated={animated} />
           )}
         </div>
       </div>
@@ -208,16 +180,13 @@ function CardSkeleton({
   hasFooter = false,
   animated = true,
 }: CardSkeletonProps) {
-  const shouldReduceMotion = useReducedMotion();
-  const showAnimation = animated && !shouldReduceMotion;
-
   return (
-    <div className="border rounded-lg p-4 space-y-3 bg-card">
+    <div className="border rounded-lg p-4 space-y-3 bg-background">
       {/* Image */}
       {hasImage && (
         <Skeleton
           className="w-full h-40 rounded-lg"
-          animated={showAnimation}
+          animated={animated}
         />
       )}
 
@@ -226,26 +195,26 @@ function CardSkeleton({
           variant="circular"
           width={24}
           height={24}
-          animated={showAnimation}
+          animated={animated}
         />
-        <Skeleton width={120} height={18} animated={showAnimation} />
+        <Skeleton width={120} height={18} animated={animated} />
       </div>
       {Array.from({ length: lines }).map((_, i) => (
         <Skeleton
           key={i}
           width={i === lines - 1 ? '60%' : '100%'}
           height={14}
-          animated={showAnimation}
+          animated={animated}
         />
       ))}
 
       {/* Footer */}
       {hasFooter && (
         <div className="pt-2 flex items-center justify-between">
-          <Skeleton width={80} height={32} animated={showAnimation} />
+          <Skeleton width={80} height={32} animated={animated} />
           <div className="flex gap-2">
-            <Skeleton width={32} height={32} variant="circular" animated={showAnimation} />
-            <Skeleton width={32} height={32} variant="circular" animated={showAnimation} />
+            <Skeleton width={32} height={32} variant="circular" animated={animated} />
+            <Skeleton width={32} height={32} variant="circular" animated={animated} />
           </div>
         </div>
       )}
@@ -264,9 +233,6 @@ interface ChatListSkeletonProps {
 }
 
 function ChatListSkeleton({ count = 5, animated = true }: ChatListSkeletonProps) {
-  const shouldReduceMotion = useReducedMotion();
-  const showAnimation = animated && !shouldReduceMotion;
-
   return (
     <div className="space-y-1">
       {Array.from({ length: count }).map((_, i) => (
@@ -275,14 +241,14 @@ function ChatListSkeleton({ count = 5, animated = true }: ChatListSkeletonProps)
             variant="circular"
             width={36}
             height={36}
-            animated={showAnimation}
+            animated={animated}
           />
           <div className="flex-1 min-w-0 space-y-1">
             <div className="flex items-center justify-between">
-              <Skeleton width="50%" height={16} animated={showAnimation} />
-              <Skeleton width={35} height={12} animated={showAnimation} />
+              <Skeleton width="50%" height={16} animated={animated} />
+              <Skeleton width={35} height={12} animated={animated} />
             </div>
-            <Skeleton width="80%" height={14} animated={showAnimation} />
+            <Skeleton width="80%" height={14} animated={animated} />
           </div>
         </div>
       ))}
@@ -301,23 +267,20 @@ interface InputSkeletonProps {
 }
 
 function InputSkeleton({ showActions = true, animated = true }: InputSkeletonProps) {
-  const shouldReduceMotion = useReducedMotion();
-  const showAnimation = animated && !shouldReduceMotion;
-
   return (
     <div className="rounded-lg border bg-background p-3 space-y-3">
       {/* Text area */}
-      <Skeleton className="w-full h-20" animated={showAnimation} />
+      <Skeleton className="w-full h-20" animated={animated} />
 
       {/* Actions */}
       {showActions && (
         <div className="flex items-center justify-between">
           <div className="flex gap-2">
-            <Skeleton width={32} height={32} variant="circular" animated={showAnimation} />
-            <Skeleton width={32} height={32} variant="circular" animated={showAnimation} />
-            <Skeleton width={32} height={32} variant="circular" animated={showAnimation} />
+            <Skeleton width={32} height={32} variant="circular" animated={animated} />
+            <Skeleton width={32} height={32} variant="circular" animated={animated} />
+            <Skeleton width={32} height={32} variant="circular" animated={animated} />
           </div>
-          <Skeleton width={80} height={36} animated={showAnimation} className="rounded-md" />
+          <Skeleton width={80} height={36} animated={animated} className="rounded-md" />
         </div>
       )}
     </div>
