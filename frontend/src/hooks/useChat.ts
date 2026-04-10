@@ -23,9 +23,10 @@ export function useChat() {
       // Create new conversation if needed
       if (!conversationId) {
         try {
-          conversationId = await createConversation();
+          const conversation = await createConversation();
+          conversationId = conversation.id;
           store.addConversation({
-            id: conversationId,
+            id: conversation.id,
             title: content.slice(0, 30) + (content.length > 30 ? '...' : ''),
             messages: [],
             createdAt: Date.now(),
@@ -199,16 +200,16 @@ export function useChat() {
 
   const newChat = useCallback(async () => {
     try {
-      const conversationId = await createConversation();
+      const conversation = await createConversation();
       store.addConversation({
-        id: conversationId,
+        id: conversation.id,
         title: 'New Chat',
         messages: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
       streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false };
-      return conversationId;
+      return conversation.id;
     } catch (error) {
       store.setError('Failed to create conversation');
       return null;
