@@ -87,6 +87,11 @@ You have access to a wide range of tools including:
 - hooks_remove - 移除 hook
 - hooks_events - 列出可用的 hook 事件类型
 
+**User Preferences**
+- theme_get/theme_set - 获取/设置主题
+- editor_mode_get/editor_mode_set - 获取/设置编辑器模式 (normal/vim)
+- user_config_get - 获取所有用户配置
+
 **System**
 - Bash - 执行命令
 - doctor - 运行系统诊断

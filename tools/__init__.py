@@ -189,6 +189,17 @@ __all__ = [
     "HooksAddInput",
     "HooksRemoveInput",
     "HooksEventsInput",
+    # 用户配置工具
+    "ThemeGetTool",
+    "ThemeSetTool",
+    "EditorModeGetTool",
+    "EditorModeSetTool",
+    "UserConfigGetTool",
+    "ThemeGetInput",
+    "ThemeSetInput",
+    "EditorModeGetInput",
+    "EditorModeSetInput",
+    "UserConfigGetInput",
 ]
 
 
@@ -330,4 +341,10 @@ from .skill_manager_tools import (
 from .hooks_tools import (
     HooksListTool, HooksAddTool, HooksRemoveTool, HooksEventsTool,
     HooksListInput, HooksAddInput, HooksRemoveInput, HooksEventsInput,
+)
+
+# 用户配置工具
+from .user_config_tools import (
+    ThemeGetTool, ThemeSetTool, EditorModeGetTool, EditorModeSetTool, UserConfigGetTool,
+    ThemeGetInput, ThemeSetInput, EditorModeGetInput, EditorModeSetInput, UserConfigGetInput,
 )
