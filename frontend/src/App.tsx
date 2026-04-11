@@ -13,7 +13,6 @@ import { useSSE } from '@/hooks/useSSE';
 import { useChatStore } from '@/stores/chatStore';
 import { ThemeToggleSimple } from '@/components/ThemeToggle';
 import { fetchModels, selectModel, type ModelInfo } from '@/services/modelService';
-import { cn } from '@/lib/utils';
 
 export default function App() {
   const {
@@ -28,22 +27,27 @@ export default function App() {
     newChat,
   } = useChat();
 
-  const { connectionStatus } = useSSE();
+  const { apiHealthy } = useSSE();
   const { selectedModel, setSelectedModel, setError } = useChatStore();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = React.useState(false);
   const [models, setModels] = React.useState<ModelInfo[]>([]);
   const [isLoadingModels, setIsLoadingModels] = React.useState(true);
   const messagesEndRef = React.useRef<HTMLDivElement>(null);
 
-  // 加载模型列表
+  // 加载模型列表（仅挂载时拉取，避免每次切换模型重复请求）
   React.useEffect(() => {
     const loadModels = async () => {
       try {
         setIsLoadingModels(true);
         const data = await fetchModels();
         setModels(data.models);
-        // 如果没有选中的模型，使用默认模型
-        if (!selectedModel && data.default_model) {
+        const ids = new Set(data.models.map((m) => m.model_id));
+        const current = useChatStore.getState().selectedModel;
+        if (data.models.length > 0) {
+          if (!current || !ids.has(current)) {
+            setSelectedModel(data.default_model || data.models[0].model_id);
+          }
+        } else if (data.default_model) {
           setSelectedModel(data.default_model);
         }
       } catch (err) {
@@ -55,7 +59,7 @@ export default function App() {
     };
 
     loadModels();
-  }, [selectedModel, setSelectedModel, setError]);
+  }, [setSelectedModel, setError]);
 
   const handleQuickAction = React.useCallback(
     (command: string) => {
@@ -166,7 +170,7 @@ export default function App() {
         <ChatInput
           onSend={sendMessage}
           onStop={cancelMessage}
-          disabled={connectionStatus !== 'connected'}
+          disabled={!apiHealthy}
           isLoading={isProcessing}
         />
       </main>

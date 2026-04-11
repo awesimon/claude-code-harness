@@ -162,6 +162,69 @@ async def get_messages(
     return messages
 
 
+@conversations_router.delete("/{conversation_id}/messages/{message_id}")
+async def delete_message(
+    conversation_id: str,
+    message_id: str,
+    db: Session = Depends(get_db)
+):
+    """Delete a single message from a conversation"""
+    service = ConversationService(db)
+
+    # Verify conversation exists
+    conversation = service.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Delete the message
+    success = service.delete_message(message_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    # Broadcast to conversation
+    await manager.broadcast_to_conversation(
+        conversation_id,
+        {
+            "type": WSEventType.MESSAGE_DELETED,
+            "data": {"id": message_id, "conversation_id": conversation_id}
+        }
+    )
+
+    return {"success": True, "message": "Message deleted"}
+
+
+@conversations_router.delete("/{conversation_id}/messages")
+async def clear_messages(
+    conversation_id: str,
+    db: Session = Depends(get_db)
+):
+    """Clear all messages in a conversation"""
+    service = ConversationService(db)
+
+    # Verify conversation exists
+    conversation = service.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Clear all messages
+    success = service.clear_messages(conversation_id)
+
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    # Broadcast to conversation
+    await manager.broadcast_to_conversation(
+        conversation_id,
+        {
+            "type": WSEventType.MESSAGES_CLEARED,
+            "data": {"conversation_id": conversation_id}
+        }
+    )
+
+    return {"success": True, "message": "All messages cleared"}
+
+
 # ==================== Task Routes ====================
 
 @tasks_router.post("", response_model=TaskResponse)

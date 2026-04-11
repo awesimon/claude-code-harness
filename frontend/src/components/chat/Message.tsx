@@ -262,13 +262,16 @@ export const Message = React.memo(function Message({
 
       {/* Content Column */}
       <div className={cn('flex-1 min-w-0', isUser ? 'text-right' : 'text-left')}>
+        {/* 思考发生在模型输出与工具调用之前，始终排在最前 */}
         {hasThinking && (
-          <ThinkingBlock
-            thinking={message.thinking!}
-            thinkingTime={message.thinkingTime}
-            isExpanded={isThinkingExpanded}
-            onToggle={toggleThinking}
-          />
+          <div className="mb-3">
+            <ThinkingBlock
+              thinking={message.thinking!}
+              thinkingTime={message.thinkingTime}
+              isExpanded={isThinkingExpanded}
+              onToggle={toggleThinking}
+            />
+          </div>
         )}
 
         {/* Message Bubble */}

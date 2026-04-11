@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { Plus, Trash, ChatCircle } from '@phosphor-icons/react';
+import { Plus, Trash, ChatCircle, CaretDoubleLeft, CaretDoubleRight } from '@phosphor-icons/react';
 import { Button } from '@/components/ui/Button';
 import { useChatStore } from '@/stores/chatStore';
 import type { ConnectionStatus } from '@/types';
@@ -72,8 +72,16 @@ function ConversationItem({
 
 export const Sidebar = React.memo(function Sidebar({
   onNewChat,
+  isCollapsed = false,
+  onToggleCollapse,
 }: SidebarProps) {
-  const { conversations, currentConversationId, setCurrentConversation, removeConversation, connectionStatus } = useChatStore();
+  const {
+    conversations,
+    currentConversationId,
+    setCurrentConversation,
+    deleteConversation,
+    connectionStatus,
+  } = useChatStore();
   const [isMobileOpen, setIsMobileOpen] = React.useState(false);
 
   const handleSelectConversation = React.useCallback(
@@ -85,11 +93,11 @@ export const Sidebar = React.memo(function Sidebar({
   );
 
   const handleDelete = React.useCallback(
-    (e: React.MouseEvent, id: string) => {
+    async (e: React.MouseEvent, id: string) => {
       e.stopPropagation();
-      removeConversation(id);
+      await deleteConversation(id);
     },
-    [removeConversation]
+    [deleteConversation]
   );
 
   return (
@@ -105,32 +113,70 @@ export const Sidebar = React.memo(function Sidebar({
       {/* Sidebar */}
       <aside
         className={cn(
-          'flex h-full w-64 flex-col border-r border-border',
-          'bg-background',
-          'fixed left-0 top-0 z-50 lg:relative',
-          !isMobileOpen && '-translate-x-full lg:translate-x-0'
+          'flex h-full w-64 flex-col border-r border-border bg-background',
+          'fixed left-0 top-0 z-50 transition-[width] duration-200 ease-out lg:relative',
+          isMobileOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0',
+          isCollapsed ? 'lg:w-14' : 'lg:w-64'
         )}
       >
         {/* Header */}
-        <div className="flex h-14 items-center justify-between border-b border-border px-3">
-          <div className="flex items-center gap-2">
-            <span className="font-medium text-sm">Claude Code</span>
+        <div
+          className={cn(
+            'flex h-14 items-center gap-1 border-b border-border px-2',
+            isCollapsed ? 'lg:justify-center' : 'justify-between'
+          )}
+        >
+          <div
+            className={cn(
+              'flex min-w-0 items-center gap-2',
+              isCollapsed && 'lg:hidden',
+              !isCollapsed && 'flex-1'
+            )}
+          >
+            <span className="truncate font-medium text-sm">Claude Code</span>
           </div>
+          {onToggleCollapse && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="hidden h-8 w-8 shrink-0 lg:flex"
+              onClick={onToggleCollapse}
+              aria-label={isCollapsed ? '展开侧栏' : '收起侧栏'}
+            >
+              {isCollapsed ? (
+                <CaretDoubleRight className="h-4 w-4" />
+              ) : (
+                <CaretDoubleLeft className="h-4 w-4" />
+              )}
+            </Button>
+          )}
         </div>
 
         {/* New Chat Button */}
-        <div className="p-2">
+        <div className={cn('p-2', isCollapsed && 'lg:px-1')}>
           <Button
-            onClick={onNewChat}
-            className="w-full justify-start gap-2 rounded-md bg-foreground text-background hover:bg-foreground/90"
+            onClick={() => {
+              void onNewChat();
+            }}
+            className={cn(
+              'rounded-md bg-foreground text-background hover:bg-foreground/90',
+              isCollapsed ? 'lg:h-9 lg:w-full lg:justify-center lg:p-0' : 'w-full justify-start gap-2'
+            )}
+            title="New Chat"
           >
             <Plus className="h-4 w-4 shrink-0" />
-            <span>New Chat</span>
+            <span className={cn(isCollapsed && 'lg:sr-only')}>New Chat</span>
           </Button>
         </div>
 
         {/* Conversation List */}
-        <div className="flex-1 overflow-y-auto px-2 py-1">
+        <div
+          className={cn(
+            'flex-1 overflow-y-auto px-2 py-1',
+            isCollapsed && 'lg:hidden'
+          )}
+        >
           {conversations.map((conversation) => (
             <ConversationItem
               key={conversation.id}
@@ -152,10 +198,17 @@ export const Sidebar = React.memo(function Sidebar({
         </div>
 
         {/* Footer - Connection Status */}
-        <div className="border-t border-border p-3">
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <div className={cn('border-t border-border p-3', isCollapsed && 'lg:p-2')}>
+          <div
+            className={cn(
+              'flex items-center gap-2 text-xs text-muted-foreground',
+              isCollapsed && 'lg:justify-center'
+            )}
+          >
             <ConnectionDot status={connectionStatus} />
-            <span className="capitalize">{connectionStatus}</span>
+            <span className={cn('capitalize', isCollapsed && 'lg:sr-only')}>
+              {connectionStatus}
+            </span>
           </div>
         </div>
       </aside>

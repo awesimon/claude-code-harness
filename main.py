@@ -706,6 +706,43 @@ async def chat_stream(request: ChatRequest):
         has_user_message_saved = False
         assistant_message_saved = False  # Track if assistant message has been saved
 
+        from schemas import MessageCreate
+
+        def flush_pre_tool_assistant():
+            """工具执行完成后落库：助手先说的话 + 工具调用/结果；清空缓冲供下一轮助手续写。"""
+            nonlocal assistant_content, assistant_thinking, current_tool_calls, current_tool_results
+            has_body = bool((assistant_content or "").strip())
+            has_tools = bool(current_tool_calls) or bool(current_tool_results)
+            if not has_body and not has_tools:
+                return
+            db = SessionLocal()
+            try:
+                service = ConversationService(db)
+                service.add_message(
+                    conversation_id,
+                    MessageCreate(
+                        role="assistant",
+                        content=assistant_content or "",
+                        thinking=assistant_thinking if assistant_thinking else None,
+                        tool_calls=current_tool_calls if current_tool_calls else None,
+                        tool_results=current_tool_results if current_tool_results else None,
+                    ),
+                )
+                logger.info(
+                    "Saved pre-tool assistant: content_len=%s tools=%s results=%s",
+                    len(assistant_content or ""),
+                    len(current_tool_calls or []),
+                    len(current_tool_results or []),
+                )
+            except Exception as e:
+                logger.error(f"Failed to save pre-tool assistant: {e}")
+            finally:
+                db.close()
+            assistant_content = ""
+            assistant_thinking = ""
+            current_tool_calls = []
+            current_tool_results = []
+
         async for event in query_engine.chat_stream(conversation_id, request.message):
             # Save user message on first event
             if not has_user_message_saved:
@@ -718,7 +755,6 @@ async def chat_stream(request: ChatRequest):
                         from schemas import ConversationCreate
                         service.create_conversation(ConversationCreate())
                     # Save user message
-                    from schemas import MessageCreate
                     service.add_message(conversation_id, MessageCreate(
                         role="user",
                         content=request.message
@@ -746,17 +782,16 @@ async def chat_stream(request: ChatRequest):
                 # Check if this is the final message (has finish_reason)
                 finish_reason = event.get("finish_reason")
                 if finish_reason and not assistant_message_saved:
-                    # Save final assistant message to database
+                    # 仅保存「工具后」最终助手正文（工具轮次已在 observing 时落库）
                     db = SessionLocal()
                     try:
                         service = ConversationService(db)
-                        from schemas import MessageCreate
                         service.add_message(conversation_id, MessageCreate(
                             role="assistant",
                             content=assistant_content,
                             thinking=assistant_thinking if assistant_thinking else None,
-                            tool_calls=current_tool_calls if current_tool_calls else None,
-                            tool_results=current_tool_results if current_tool_results else None
+                            tool_calls=None,
+                            tool_results=None,
                         ))
                         assistant_message_saved = True
                         logger.info(f"Saved assistant message with content length: {len(assistant_content)}")
@@ -789,20 +824,27 @@ async def chat_stream(request: ChatRequest):
                 }
                 current_tool_results.append(tool_result)
 
+            # 工具跑完后进入 observing：此时先落库「工具前」助手 + 工具，再展示后续续写
+            elif event_type == "state_change" and event.get("state") == "observing":
+                flush_pre_tool_assistant()
+
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+        # 未收到 observing 就结束流时（如 PlanMode 提前 return），补落库工具轮
+        if current_tool_calls or current_tool_results:
+            flush_pre_tool_assistant()
 
         # Ensure assistant message is saved at the end if not already saved
         if not assistant_message_saved and assistant_content:
             db = SessionLocal()
             try:
                 service = ConversationService(db)
-                from schemas import MessageCreate
                 service.add_message(conversation_id, MessageCreate(
                     role="assistant",
                     content=assistant_content,
                     thinking=assistant_thinking if assistant_thinking else None,
-                    tool_calls=current_tool_calls if current_tool_calls else None,
-                    tool_results=current_tool_results if current_tool_results else None
+                    tool_calls=None,
+                    tool_results=None,
                 ))
                 logger.info(f"Saved assistant message at end with content length: {len(assistant_content)}")
             except Exception as e:

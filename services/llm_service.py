@@ -32,9 +32,20 @@ class Message:
     tool_call_id: Optional[str] = None
 
     def to_openai(self) -> Dict[str, Any]:
-        """转换为OpenAI格式"""
-        msg = {"role": self.role, "content": self.content}
-        if self.name:
+        """转换为 OpenAI Chat Completions 格式（兼容多数国产网关的校验规则）"""
+        msg: Dict[str, Any] = {"role": self.role}
+
+        # 带 tool_calls 且无正文时须用 null，部分网关对 content:"" 会报 400（表现为偶发）
+        if self.role == "assistant" and self.tool_calls:
+            text = (self.content or "").strip()
+            msg["content"] = text if text else None
+        elif self.role == "tool":
+            msg["content"] = self.content if self.content is not None else ""
+        else:
+            msg["content"] = self.content if self.content is not None else ""
+
+        # Chat Completions 的 tool 消息标准字段不含 name，严格网关可能对多余字段报错
+        if self.name and self.role != "tool":
             msg["name"] = self.name
         if self.tool_calls:
             msg["tool_calls"] = self.tool_calls
@@ -186,9 +197,13 @@ class LLMService:
         else:
             kwargs["max_tokens"] = self._default_max_tokens
 
-        # Only add tools if explicitly provided and not empty
-        # Some providers (like infini-ai) don't support tools
-        if request.tools and len(request.tools) > 0:
+        # Only add tools if explicitly provided and not empty.
+        # Some gateways (e.g. infini-ai MaaS) return 400 if `tools` / `tool_choice` are sent.
+        if (
+            request.tools
+            and len(request.tools) > 0
+            and not os.getenv("LLM_DISABLE_TOOLS", "").lower() in ("1", "true", "yes")
+        ):
             kwargs["tools"] = request.tools
             if request.tool_choice:
                 kwargs["tool_choice"] = request.tool_choice
@@ -241,10 +256,14 @@ class LLMService:
             "max_tokens": request.max_tokens or self._default_max_tokens,
         }
 
-        if request.tools:
+        if (
+            request.tools
+            and len(request.tools) > 0
+            and not os.getenv("LLM_DISABLE_TOOLS", "").lower() in ("1", "true", "yes")
+        ):
             payload["tools"] = request.tools
-        if request.tool_choice:
-            payload["tool_choice"] = request.tool_choice
+            if request.tool_choice:
+                payload["tool_choice"] = request.tool_choice
 
         async with httpx.AsyncClient() as client:
             async with client.stream(
@@ -257,6 +276,17 @@ class LLMService:
                 json=payload,
                 timeout=httpx.Timeout(60.0, connect=10.0),
             ) as response:
+                # 偶发 400 时网关常在 body 里带具体原因；默认 raise_for_status 只有状态码，这里记下来便于排查
+                if response.status_code >= 400:
+                    err_body = (await response.aread()).decode("utf-8", errors="replace")
+                    logger.error(
+                        "LLM /chat/completions error status=%s model=%s payload_messages=%s tools=%s body=%s",
+                        response.status_code,
+                        model,
+                        len(messages),
+                        len(payload.get("tools") or []),
+                        err_body[:12000],
+                    )
                 response.raise_for_status()
 
                 async for line in response.aiter_lines():

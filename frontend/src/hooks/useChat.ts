@@ -184,6 +184,10 @@ export function useChat() {
               store.setStatus('idle');
               setRetryCount(0);
               streamingStateRef.current = { currentAssistantId: null, hasReceivedToolCalls: false, thinkingContent: '' };
+              const { currentConversationId, loadConversation } = useChatStore.getState();
+              if (currentConversationId) {
+                void loadConversation(currentConversationId);
+              }
             },
           },
           abortControllerRef.current.signal

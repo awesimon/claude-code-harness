@@ -229,17 +229,23 @@ class ConversationContext:
         for turn in self.messages:
             if turn.role == "assistant" and turn.tool_calls:
                 # 助手消息带工具调用
+                tool_calls_payload = []
+                for tc in turn.tool_calls:
+                    try:
+                        arg_str = json.dumps(
+                            tc.arguments, ensure_ascii=False, default=str, allow_nan=False
+                        )
+                    except (TypeError, ValueError):
+                        arg_str = "{}"
+                    tool_calls_payload.append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": arg_str},
+                    })
                 msg = Message(
                     role="assistant",
                     content=turn.content,
-                    tool_calls=[{
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments, ensure_ascii=False)
-                        }
-                    } for tc in turn.tool_calls]
+                    tool_calls=tool_calls_payload,
                 )
                 llm_messages.append(msg)
             elif turn.role == "tool":
@@ -260,13 +266,18 @@ class ConversationContext:
         return llm_messages
 
     def _format_tool_result(self, data: Any) -> str:
-        """格式化工具结果为字符串"""
+        """格式化工具结果为字符串（过长时截断，避免偶发超出网关单条 message 限制而 400）"""
+        max_chars = int(os.getenv("LLM_TOOL_RESULT_MAX_CHARS", "120000"))
         if isinstance(data, str):
-            return data
-        try:
-            return json.dumps(data, ensure_ascii=False, indent=2)
-        except:
-            return str(data)
+            s = data
+        else:
+            try:
+                s = json.dumps(data, ensure_ascii=False, indent=2, default=str, allow_nan=False)
+            except Exception:
+                s = str(data)
+        if len(s) > max_chars:
+            return s[:max_chars] + "\n\n[工具输出过长已截断，可通过 LLM_TOOL_RESULT_MAX_CHARS 调整上限]"
+        return s
 
 
 class QueryEngine:

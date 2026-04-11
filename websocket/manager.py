@@ -94,6 +94,8 @@ class WSEventType:
     TASK_CLAIMED = "task_claimed"
     MESSAGE_CREATED = "message_created"
     MESSAGE_UPDATED = "message_updated"
+    MESSAGE_DELETED = "message_deleted"
+    MESSAGES_CLEARED = "messages_cleared"
     CONVERSATION_UPDATED = "conversation_updated"
     AGENT_STATUS_CHANGED = "agent_status_changed"
     PLAN_UPDATED = "plan_updated"

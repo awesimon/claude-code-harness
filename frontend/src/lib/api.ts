@@ -336,31 +336,49 @@ export async function streamMessage(
     const decoder = new TextDecoder();
     let buffer = '';
 
+    const processPayload = (raw: string): boolean => {
+      const data = raw.trim();
+      if (data === '[DONE]') {
+        callbacks.onComplete();
+        return true;
+      }
+      if (!data) return false;
+      try {
+        const event: SSEEvent = JSON.parse(data);
+        callbacks.onEvent(event);
+      } catch (e) {
+        console.error('Failed to parse SSE event:', e);
+      }
+      return false;
+    };
+
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
+        if (value) {
+          buffer += decoder.decode(value, { stream: true });
+        }
+        buffer = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
         const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        buffer = done ? '' : (lines.pop() ?? '');
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-
-            if (data === '[DONE]') {
-              callbacks.onComplete();
+          if (line.startsWith('data:')) {
+            const payload = line.startsWith('data: ') ? line.slice(6) : line.slice(5);
+            if (processPayload(payload)) {
               return;
             }
-
-            try {
-              const event: SSEEvent = JSON.parse(data);
-              callbacks.onEvent(event);
-            } catch (e) {
-              console.error('Failed to parse SSE event:', e);
-            }
           }
+        }
+
+        if (done) break;
+      }
+
+      const tail = buffer.trim();
+      if (tail.startsWith('data:')) {
+        const payload = tail.startsWith('data: ') ? tail.slice(6) : tail.slice(5);
+        if (processPayload(payload)) {
+          return;
         }
       }
 

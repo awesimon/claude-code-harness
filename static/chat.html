@@ -169,14 +169,98 @@
 
         // 加载会话列表
         async function loadSessions() {
-            // 简化版：从 localStorage 加载
-            const sessions = JSON.parse(localStorage.getItem('sessions') || '[]');
-            const list = document.getElementById('session-list');
-            list.innerHTML = sessions.map(s => `
-                <div onclick="loadConversation('${s.id}')" class="p-2 hover:bg-gray-700 rounded cursor-pointer text-sm truncate ${s.id === currentConversationId ? 'bg-gray-700' : ''}">
-                    ${s.title}
-                </div>
-            `).join('');
+            try {
+                const response = await fetch('/api/v1/conversations');
+                const result = await response.json();
+
+                if (result.success !== false) {
+                    const sessions = result.data || result;
+                    const list = document.getElementById('session-list');
+                    list.innerHTML = sessions.map(s => `
+                        <div class="group flex items-center justify-between p-2 hover:bg-gray-700 rounded cursor-pointer text-sm ${s.id === currentConversationId ? 'bg-gray-700' : ''}" data-id="${s.id}" onclick="loadConversation('${s.id}')">
+                            <div class="flex-1 truncate">
+                                ${s.title || '新会话'}
+                            </div>
+                            <button class="delete-btn invisible group-hover:visible p-1 hover:bg-red-600 rounded transition" title="删除会话" data-conversation-id="${s.id}">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path>
+                                </svg>
+                            </button>
+                        </div>
+                    `).join('');
+
+                    // 绑定删除按钮事件
+                    list.querySelectorAll('.delete-btn').forEach(btn => {
+                        btn.addEventListener('click', (e) => {
+                            e.stopPropagation();
+                            const conversationId = btn.getAttribute('data-conversation-id');
+                            deleteSession(conversationId);
+                        });
+                    });
+                }
+            } catch (error) {
+                console.error('加载会话列表失败:', error);
+            }
+        }
+
+        // 删除会话
+        async function deleteSession(conversationId) {
+            if (!confirm('确定要删除这个会话吗？此操作不可恢复。')) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/v1/conversations/${conversationId}`, {
+                    method: 'DELETE'
+                });
+                const result = await response.json();
+
+                if (result.success) {
+                    // 如果删除的是当前会话，清空界面
+                    if (conversationId === currentConversationId) {
+                        clearMessages();
+                        currentConversationId = null;
+                        document.getElementById('chat-title').textContent = '新会话';
+                    }
+                    // 重新加载会话列表
+                    loadSessions();
+                } else {
+                    showError('删除会话失败: ' + (result.message || '未知错误'));
+                }
+            } catch (error) {
+                console.error('删除会话失败:', error);
+                showError('删除会话失败: ' + error.message);
+            }
+        }
+
+        // 加载指定会话
+        async function loadConversation(conversationId) {
+            try {
+                const response = await fetch(`/api/v1/conversations/${conversationId}`);
+                const result = await response.json();
+
+                if (result.success !== false) {
+                    const conversation = result.data || result;
+                    currentConversationId = conversationId;
+                    document.getElementById('chat-title').textContent = conversation.title || `会话 ${conversationId}`;
+
+                    // 清空并加载消息
+                    clearMessages();
+                    if (conversation.messages && conversation.messages.length > 0) {
+                        conversation.messages.forEach(msg => {
+                            addMessage(msg.role, msg.content);
+                        });
+                    } else {
+                        addMessage('system', '会话加载成功，开始对话吧！');
+                    }
+
+                    // 更新列表选中状态
+                    loadSessions();
+                }
+            } catch (error) {
+                console.error('加载会话失败:', error);
+                showError('加载会话失败: ' + error.message);
+            }
         }
 
         // 发送消息

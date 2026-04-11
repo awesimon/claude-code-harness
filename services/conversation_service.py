@@ -89,28 +89,24 @@ class ConversationService:
         """Get a single message by ID"""
         return self.db.query(Message).filter(Message.id == message_id).first()
 
-    def update_message(
-        self,
-        message_id: str,
-        content: Optional[str] = None,
-        thinking: Optional[str] = None,
-        tool_calls: Optional[list] = None,
-        tool_results: Optional[list] = None
-    ) -> Optional[Message]:
-        """Update a message"""
+    def delete_message(self, message_id: str) -> bool:
+        """Delete a message by ID"""
         message = self.get_message(message_id)
         if not message:
-            return None
+            return False
 
-        if content is not None:
-            message.content = content
-        if thinking is not None:
-            message.thinking = thinking
-        if tool_calls is not None:
-            message.tool_calls = tool_calls
-        if tool_results is not None:
-            message.tool_results = tool_results
-
+        self.db.delete(message)
         self.db.commit()
-        self.db.refresh(message)
-        return message
+        return True
+
+    def clear_messages(self, conversation_id: str) -> bool:
+        """Delete all messages in a conversation"""
+        conversation = self.get_conversation(conversation_id)
+        if not conversation:
+            return False
+
+        self.db.query(Message).filter(
+            Message.conversation_id == conversation_id
+        ).delete()
+        self.db.commit()
+        return True

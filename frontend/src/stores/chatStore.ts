@@ -26,7 +26,6 @@ interface ExtendedChatActions extends ChatActions {
   loadConversation: (id: string) => Promise<void>;
   createConversation: (title?: string) => Promise<string>;
   deleteConversation: (id: string) => Promise<void>;
-  saveMessage: (conversationId: string, message: Message) => Promise<void>;
   connectWebSocket: (conversationId?: string) => void;
   disconnectWebSocket: () => void;
 }
@@ -82,7 +81,15 @@ export const useChatStore = create<ExtendedChatState & ExtendedChatActions>()(
             content: m.content,
             timestamp: new Date(m.timestamp).getTime(),
             toolCalls: m.tool_calls,
-            toolResults: m.tool_results,
+            toolResults: Array.isArray(m.tool_results)
+              ? m.tool_results.map((tr: Record<string, unknown>) => ({
+                  id: String(tr.tool_call_id ?? tr.id ?? ''),
+                  name: String(tr.name ?? ''),
+                  success: Boolean(tr.success),
+                  result: tr.result,
+                  error: tr.error as string | undefined,
+                }))
+              : undefined,
             thinking: m.thinking,
           })),
         });
@@ -131,20 +138,6 @@ export const useChatStore = create<ExtendedChatState & ExtendedChatActions>()(
       }
     },
 
-    saveMessage: async (conversationId, message) => {
-      try {
-        await api.addMessage(
-          conversationId,
-          message.role,
-          message.content,
-          message.toolCalls,
-          message.toolResults
-        );
-      } catch (error) {
-        console.error('Failed to save message:', error);
-      }
-    },
-
     addMessage: (message) => {
       const newMessage = createMessage(message.role, message.content, message.toolCalls, message.toolResults);
       set((state) => {
@@ -155,10 +148,7 @@ export const useChatStore = create<ExtendedChatState & ExtendedChatActions>()(
           newMessages = newMessages.slice(-maxMessages);
         }
 
-        // Save to API if in a conversation
-        if (state.currentConversationId) {
-          get().saveMessage(state.currentConversationId, newMessage);
-        }
+        // 持久化由后端 POST /chat/stream 统一写入，避免与流式 UI 重复 POST 造成重复用户行、碎片助手行
 
         return { messages: newMessages };
       });
