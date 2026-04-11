@@ -1,0 +1,8 @@
+{
+  "name": "example-skill",
+  "version": "1.0.0",
+  "description": "An example skill demonstrating the skill system",
+  "author": "Claude Code",
+  "entry_point": "skill.py",
+  "tools": ["hello_world", "get_time"]
+}

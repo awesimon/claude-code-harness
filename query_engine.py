@@ -27,6 +27,10 @@ from tools.base import ToolResult
 from plan import get_plan_mode_manager, PlanModeState, NotInPlanModeError
 from agents import get_agent_manager, AgentExecutionConfig
 
+# 启动时加载所有已安装的 skills
+from services.skill_manager import skill_manager
+skill_manager.load_all_skills()
+
 # 系统提示词 - 定义AI助手的行为和能力
 SYSTEM_PROMPT = """You are Claude Code, a powerful AI coding assistant created by Anthropic.
 
@@ -71,10 +75,11 @@ You have access to a wide range of tools including:
 - pr_view - 查看 PR 详情
 - pr_diff - 查看 PR 代码差异
 
-**Session Management**
-- session_save - 保存当前会话
-- session_list - 列出保存的会话
-- session_load - 加载之前的会话
+**Skill Management**
+- skill_install - 从 Git/本地安装 Skill（动态添加工具）
+- skill_list - 列出已安装的 Skills
+- skill_uninstall - 卸载 Skill
+- skill_enable/skill_disable - 启用/禁用 Skill
 
 **System**
 - Bash - 执行命令
@@ -90,6 +95,17 @@ You have access to a wide range of tools including:
 **Agent & Plan**
 - Agent - 创建子代理执行复杂任务
 - EnterPlanMode/ExitPlanMode - 计划模式
+
+## Skill System
+
+Skills are dynamically installable tool packages:
+1. Install from Git: `skill_install` with Git URL
+2. Install from local: `skill_install` with local path
+3. Skills are stored in ~/.claude_code/skills/
+4. Each skill contains:
+   - skill.json (manifest)
+   - skill.py (entry point with tools)
+   - requirements.txt (optional dependencies)
 
 ## Git Safety Protocol
 

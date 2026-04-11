@@ -182,12 +182,18 @@ class Tool(ABC, Generic[InputType, OutputType]):
             ToolResult: 执行结果
         """
         try:
-            # 如果输入是 dict，尝试转换为 dataclass
+            # 如果输入是 dict，尝试转换为 dataclass 或 Pydantic model
             if isinstance(input_data, dict):
                 import dataclasses
                 # 获取输入类型（从泛型参数）
                 input_type = self.__class__.__orig_bases__[0].__args__[0]
                 if dataclasses.is_dataclass(input_type):
+                    input_data = input_type(**input_data)
+                elif hasattr(input_type, 'model_validate'):
+                    # Pydantic BaseModel
+                    input_data = input_type.model_validate(input_data)
+                elif hasattr(input_type, '__init__'):
+                    # 其他类型，尝试直接实例化
                     input_data = input_type(**input_data)
         except Exception as e:
             return ToolResult.error(

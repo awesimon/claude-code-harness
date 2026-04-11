@@ -169,6 +169,17 @@ __all__ = [
     "DoctorInput",
     "HelpInput",
     "VersionInput",
+    # Skill 管理工具
+    "SkillInstallTool",
+    "SkillUninstallTool",
+    "SkillListTool",
+    "SkillEnableTool",
+    "SkillDisableTool",
+    "SkillInstallInput",
+    "SkillUninstallInput",
+    "SkillListInput",
+    "SkillEnableInput",
+    "SkillDisableInput",
 ]
 
 
@@ -298,4 +309,10 @@ from .session_tools import (
 from .system_tools import (
     StatsTool, DoctorTool, HelpTool, VersionTool,
     StatsInput, DoctorInput, HelpInput, VersionInput,
+)
+
+# Skill 管理工具
+from .skill_manager_tools import (
+    SkillInstallTool, SkillUninstallTool, SkillListTool, SkillEnableTool, SkillDisableTool,
+    SkillInstallInput, SkillUninstallInput, SkillListInput, SkillEnableInput, SkillDisableInput,
 )
