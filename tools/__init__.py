@@ -130,6 +130,45 @@ __all__ = [
     # 验证计划工具
     "VerifyPlanExecutionTool",
     "VerifyPlanInput",
+    # Git工具
+    "GitStatusTool",
+    "GitDiffTool",
+    "GitCommitTool",
+    "GitStatusInput",
+    "GitDiffInput",
+    "GitCommitInput",
+    # 分支工具
+    "BranchListTool",
+    "BranchCreateTool",
+    "BranchSwitchTool",
+    "BranchDeleteTool",
+    "BranchListInput",
+    "BranchCreateInput",
+    "BranchSwitchInput",
+    "BranchDeleteInput",
+    # PR工具
+    "PRListTool",
+    "PRViewTool",
+    "PRDiffTool",
+    "PRListInput",
+    "PRViewInput",
+    "PRDiffInput",
+    # 会话工具
+    "SessionSaveTool",
+    "SessionListTool",
+    "SessionLoadTool",
+    "SessionSaveInput",
+    "SessionListInput",
+    "SessionLoadInput",
+    # 系统工具
+    "StatsTool",
+    "DoctorTool",
+    "HelpTool",
+    "VersionTool",
+    "StatsInput",
+    "DoctorInput",
+    "HelpInput",
+    "VersionInput",
 ]
 
 
@@ -230,3 +269,33 @@ from .mcp_auth_tool import McpAuthTool, McpAuthInput
 
 # 验证计划工具
 from .verify_plan_tool import VerifyPlanExecutionTool, VerifyPlanInput
+
+# Git工具
+from .git_tools import (
+    GitStatusTool, GitDiffTool, GitCommitTool,
+    GitStatusInput, GitDiffInput, GitCommitInput,
+)
+
+# 分支工具
+from .branch_tools import (
+    BranchListTool, BranchCreateTool, BranchSwitchTool, BranchDeleteTool,
+    BranchListInput, BranchCreateInput, BranchSwitchInput, BranchDeleteInput,
+)
+
+# PR工具
+from .pr_tools import (
+    PRListTool, PRViewTool, PRDiffTool,
+    PRListInput, PRViewInput, PRDiffInput,
+)
+
+# 会话工具
+from .session_tools import (
+    SessionSaveTool, SessionListTool, SessionLoadTool,
+    SessionSaveInput, SessionListInput, SessionLoadInput,
+)
+
+# 系统工具
+from .system_tools import (
+    StatsTool, DoctorTool, HelpTool, VersionTool,
+    StatsInput, DoctorInput, HelpInput, VersionInput,
+)
