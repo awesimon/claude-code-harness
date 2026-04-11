@@ -101,6 +101,7 @@ class SkillManager:
                 shutil.rmtree(install_path)
                 return ToolResult(
                     success=False,
+                    data=None,
                     message="Invalid skill: skill.json not found",
                     error="Missing skill.json"
                 )
@@ -115,6 +116,7 @@ class SkillManager:
                     shutil.rmtree(install_path)
                     return ToolResult(
                         success=False,
+                        data=None,
                         message=f"Invalid skill.json: missing '{field}'",
                         error=f"Missing field: {field}"
                     )
@@ -159,12 +161,14 @@ class SkillManager:
         except subprocess.CalledProcessError as e:
             return ToolResult(
                 success=False,
+                data=None,
                 message="Failed to clone repository",
                 error=str(e)
             )
         except Exception as e:
             return ToolResult(
                 success=False,
+                data=None,
                 message="Installation failed",
                 error=str(e)
             )
@@ -176,6 +180,7 @@ class SkillManager:
             if not source_path.exists():
                 return ToolResult(
                     success=False,
+                    data=None,
                     message=f"Path not found: {local_path}",
                     error="Path does not exist"
                 )
@@ -188,6 +193,7 @@ class SkillManager:
             if name in self._skills:
                 return ToolResult(
                     success=False,
+                    data=None,
                     message=f"Skill '{name}' already installed",
                     error="Skill already exists"
                 )
@@ -197,6 +203,7 @@ class SkillManager:
             if not skill_json.exists():
                 return ToolResult(
                     success=False,
+                    data=None,
                     message="Invalid skill: skill.json not found",
                     error="Missing skill.json"
                 )
@@ -242,6 +249,7 @@ class SkillManager:
         except Exception as e:
             return ToolResult(
                 success=False,
+                data=None,
                 message="Installation failed",
                 error=str(e)
             )
@@ -293,6 +301,7 @@ class SkillManager:
             if name not in self._skills:
                 return ToolResult(
                     success=False,
+                    data=None,
                     message=f"Skill '{name}' not found",
                     error="Skill not installed"
                 )
@@ -345,6 +354,7 @@ class SkillManager:
         except Exception as e:
             return ToolResult(
                 success=False,
+                data=None,
                 message="Failed to list skills",
                 error=str(e)
             )
@@ -359,6 +369,7 @@ class SkillManager:
             if name not in self._skills:
                 return ToolResult(
                     success=False,
+                    data=None,
                     message=f"Skill '{name}' not found",
                     error="Skill not installed"
                 )
@@ -368,12 +379,14 @@ class SkillManager:
 
             return ToolResult(
                 success=True,
+                data={"name": name},
                 message=f"Skill '{name}' enabled"
             )
 
         except Exception as e:
             return ToolResult(
                 success=False,
+                data=None,
                 message="Failed to enable skill",
                 error=str(e)
             )
@@ -384,6 +397,7 @@ class SkillManager:
             if name not in self._skills:
                 return ToolResult(
                     success=False,
+                    data=None,
                     message=f"Skill '{name}' not found",
                     error="Skill not installed"
                 )
@@ -393,12 +407,14 @@ class SkillManager:
 
             return ToolResult(
                 success=True,
+                data={"name": name},
                 message=f"Skill '{name}' disabled"
             )
 
         except Exception as e:
             return ToolResult(
                 success=False,
+                data=None,
                 message="Failed to disable skill",
                 error=str(e)
             )
