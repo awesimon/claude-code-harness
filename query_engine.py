@@ -451,11 +451,12 @@ class QueryEngine:
             yield {"type": "error", "error": f"Conversation {conversation_id} not found"}
             return
 
-        # 添加用户消息
-        context.messages.append(ConversationTurn(
-            role="user",
-            content=user_message
-        ))
+        # 添加用户消息（避免重复添加）
+        if not context.messages or context.messages[-1].role != "user" or context.messages[-1].content != user_message:
+            context.messages.append(ConversationTurn(
+                role="user",
+                content=user_message
+            ))
 
         yield {"type": "user_message", "content": user_message}
 
@@ -734,11 +735,12 @@ class QueryEngine:
             yield {"type": "error", "error": f"Conversation {conversation_id} not found"}
             return
 
-        # 添加用户消息
-        context.messages.append(ConversationTurn(
-            role="user",
-            content=user_message
-        ))
+        # 添加用户消息（避免重复添加）
+        if not context.messages or context.messages[-1].role != "user" or context.messages[-1].content != user_message:
+            context.messages.append(ConversationTurn(
+                role="user",
+                content=user_message
+            ))
 
         yield {"type": "user_message", "content": user_message}
 
