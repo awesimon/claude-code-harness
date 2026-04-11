@@ -81,6 +81,12 @@ You have access to a wide range of tools including:
 - skill_uninstall - 卸载 Skill
 - skill_enable/skill_disable - 启用/禁用 Skill
 
+**Hooks Configuration**
+- hooks_list - 列出已配置的 hooks
+- hooks_add - 添加 hook
+- hooks_remove - 移除 hook
+- hooks_events - 列出可用的 hook 事件类型
+
 **System**
 - Bash - 执行命令
 - doctor - 运行系统诊断

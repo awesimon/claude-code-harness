@@ -180,6 +180,15 @@ __all__ = [
     "SkillListInput",
     "SkillEnableInput",
     "SkillDisableInput",
+    # Hooks 工具
+    "HooksListTool",
+    "HooksAddTool",
+    "HooksRemoveTool",
+    "HooksEventsTool",
+    "HooksListInput",
+    "HooksAddInput",
+    "HooksRemoveInput",
+    "HooksEventsInput",
 ]
 
 
@@ -315,4 +324,10 @@ from .system_tools import (
 from .skill_manager_tools import (
     SkillInstallTool, SkillUninstallTool, SkillListTool, SkillEnableTool, SkillDisableTool,
     SkillInstallInput, SkillUninstallInput, SkillListInput, SkillEnableInput, SkillDisableInput,
+)
+
+# Hooks 工具
+from .hooks_tools import (
+    HooksListTool, HooksAddTool, HooksRemoveTool, HooksEventsTool,
+    HooksListInput, HooksAddInput, HooksRemoveInput, HooksEventsInput,
 )
