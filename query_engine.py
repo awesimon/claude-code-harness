@@ -530,7 +530,8 @@ class QueryEngine:
                 # 没有工具调用，对话完成
                 assistant_turn = ConversationTurn(
                     role="assistant",
-                    content=response.content
+                    content=response.content,
+                    thinking=response.reasoning_content
                 )
                 context.messages.append(assistant_turn)
                 self._update_state(context, ConversationState.COMPLETED)
@@ -548,7 +549,8 @@ class QueryEngine:
             assistant_turn = ConversationTurn(
                 role="assistant",
                 content=response.content or "",
-                tool_calls=tool_calls
+                tool_calls=tool_calls,
+                thinking=response.reasoning_content
             )
             context.messages.append(assistant_turn)
 
