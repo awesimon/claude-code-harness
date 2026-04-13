@@ -5,7 +5,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Generic, Optional, TypeVar, Dict, Protocol, runtime_checkable
+from typing import Any, Generic, Optional, TypeVar, Dict, Protocol, runtime_checkable, get_args
 from enum import Enum, auto
 import asyncio
 
@@ -129,6 +129,25 @@ InputType = TypeVar("InputType")
 OutputType = TypeVar("OutputType")
 
 
+def _resolve_tool_input_type(tool_cls: type) -> Optional[type]:
+    """
+    解析工具 dict → 模型 时使用的输入类型。
+
+    优先 ``input_model``（未写 ``Tool[Input, Output]`` 的工具常用）；
+    否则从 ``Tool[Input, ...]`` 泛型实参取第一个。
+    不能再用 ``__orig_bases__[0].__args__``：``Tool`` 定义为 ``(ABC, Generic[...])`` 时
+    第一个基类是 ``ABC``，会触发 ``'ABC' has no attribute '__args__'``。
+    """
+    im = getattr(tool_cls, "input_model", None)
+    if im is not None:
+        return im
+    for base in getattr(tool_cls, "__orig_bases__", ()) or ():
+        args = get_args(base)
+        if args:
+            return args[0]
+    return None
+
+
 class Tool(ABC, Generic[InputType, OutputType]):
     """
     工具抽象基类
@@ -185,8 +204,14 @@ class Tool(ABC, Generic[InputType, OutputType]):
             # 如果输入是 dict，尝试转换为 dataclass 或 Pydantic model
             if isinstance(input_data, dict):
                 import dataclasses
-                # 获取输入类型（从泛型参数）
-                input_type = self.__class__.__orig_bases__[0].__args__[0]
+                input_type = _resolve_tool_input_type(self.__class__)
+                if input_type is None:
+                    return ToolResult.error(
+                        ToolValidationError(
+                            "Invalid input data: cannot resolve tool input type "
+                            "(use Tool[Input, Output] or set class attribute input_model=...)"
+                        )
+                    )
                 if dataclasses.is_dataclass(input_type):
                     input_data = input_type(**input_data)
                 elif hasattr(input_type, 'model_validate'):
