@@ -1,4 +1,4 @@
-"""AgentManager: Manages creation, lifecycle, and execution of Agents."""
+"""WorkerPoolManager: 线程池/进程池风格的 Worker Agent 生命周期管理。"""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ from .task import Task, TaskResult
 from .enums import AgentStatus, Result
 
 
-class AgentManager:
+class WorkerPoolManager:
     """
-    AgentManager handles the creation, destruction, and coordination of Agents.
+    WorkerPoolManager handles the creation, destruction, and coordination of Agents.
 
     Similar to the coordinator mode in Claude Code, this class manages:
     - Creating and destroying worker agents
@@ -388,4 +388,4 @@ class AgentManager:
         await self.shutdown(wait=wait, timeout=timeout)
 
     def __repr__(self) -> str:
-        return f"AgentManager(agents={len(self._agents)})"
+        return f"WorkerPoolManager(agents={len(self._agents)})"

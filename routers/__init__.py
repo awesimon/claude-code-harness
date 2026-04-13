@@ -5,5 +5,11 @@
 from .models import router as models_router
 from .plan import router as plan_router
 from .agents import router as agents_router
+from .chat_legacy import router as chat_legacy_router
 
-__all__ = ["models_router", "plan_router", "agents_router"]
+__all__ = [
+    "models_router",
+    "plan_router",
+    "agents_router",
+    "chat_legacy_router",
+]

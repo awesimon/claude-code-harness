@@ -11,6 +11,10 @@ aiofiles>=23.2.0
 # HTTP客户端（用于MCP等外部调用）
 httpx>=0.25.0
 
+# LLM SDK（与 uv 锁文件一致时可 pin：openai==2.31.0 anthropic==0.94.0）
+openai>=2.31.0
+anthropic>=0.94.0
+
 # 工具依赖
 python-multipart>=0.0.6
 

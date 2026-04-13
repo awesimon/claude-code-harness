@@ -1,8 +1,15 @@
 """
-Agent 模块
+Agent 子系统（统一包）
 
-全面对齐 Claude Code 的 Agent 系统
+- **根模块**（本目录 `types` / `engine` / `built_in` / `fork` / `tool`）：对齐 Claude Code 的
+  内置 Agent 定义、`AgentExecutor`、`SpawnAgentManager`（spawn/abort 子会话）。
+- **`worker_pool`**：线程池式 Worker、`Coordinator`、Plan/Explore Runner 等。
+
+导入建议：
+- 子 Agent 执行：`from agents import get_spawn_agent_manager, SpawnAgentManager`
+- Worker 池：`from agents.worker_pool import WorkerPoolManager, Agent, Task`
 """
+
 from .types import (
     AgentDefinition,
     BuiltInAgentDefinition,
@@ -38,8 +45,9 @@ from .built_in import (
 )
 from .engine import (
     AgentExecutor,
-    AgentManager,
+    SpawnAgentManager,
     get_agent_manager,
+    get_spawn_agent_manager,
 )
 from .fork import (
     ForkSubagentManager,
@@ -55,8 +63,10 @@ from .fork import (
 )
 from .tool import AgentTool, AgentToolInput
 
+# 兼容：旧代码 `from agents import AgentManager` 仍指向 SpawnAgentManager
+from .engine import AgentManager
+
 __all__ = [
-    # 类型
     "AgentDefinition",
     "BuiltInAgentDefinition",
     "CustomAgentDefinition",
@@ -72,10 +82,8 @@ __all__ = [
     "AgentNotFoundError",
     "AgentValidationError",
     "AgentExecutionError",
-    # 常量
     "ONE_SHOT_BUILTIN_AGENT_TYPES",
     "VERIFICATION_AGENT_TYPE",
-    # 内置Agent
     "EXPLORE_AGENT",
     "PLAN_AGENT",
     "GENERAL_PURPOSE_AGENT",
@@ -84,11 +92,11 @@ __all__ = [
     "VERIFICATION_AGENT",
     "get_built_in_agents",
     "get_agent_by_type",
-    # 执行引擎
     "AgentExecutor",
+    "SpawnAgentManager",
     "AgentManager",
     "get_agent_manager",
-    # Fork机制
+    "get_spawn_agent_manager",
     "ForkSubagentManager",
     "ForkConfig",
     "build_forked_messages",
@@ -99,10 +107,8 @@ __all__ = [
     "FORK_BOILERPLATE_TAG",
     "FORK_DIRECTIVE_PREFIX",
     "FORK_PLACEHOLDER_RESULT",
-    # 工具
     "AgentTool",
     "AgentToolInput",
-    # 工具函数
     "is_built_in_agent",
     "is_custom_agent",
     "is_plugin_agent",

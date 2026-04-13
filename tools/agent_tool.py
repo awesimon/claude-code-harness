@@ -8,8 +8,8 @@ from typing import Optional, Dict, Any, List
 import asyncio
 
 from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
-from agent import AgentManager, AgentConfig, AgentCapabilities, Agent
-from agent.enums import Result
+from agents.worker_pool import AgentManager, AgentConfig, AgentCapabilities, Agent
+from agents.worker_pool.enums import Result
 
 
 @dataclass

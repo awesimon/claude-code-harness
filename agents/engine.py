@@ -377,11 +377,11 @@ Output format:
         logger.info(f"Agent {self.agent_id} abort requested")
 
 
-class AgentManager:
+class SpawnAgentManager:
     """
-    Agent 管理器
+    Claude Code 对齐的「子 Agent / spawn」运行时注册表。
 
-    管理所有运行中的 Agent
+    管理由 `AgentExecutor` 承载的、通过 `spawn_agent` 创建的任务会话。
     """
 
     def __init__(self):
@@ -478,13 +478,22 @@ class AgentManager:
             del self._results[agent_id]
 
 
-# 全局 Agent 管理器
-_agent_manager: Optional[AgentManager] = None
+# 全局 spawn 运行时（与 agents.worker_pool.WorkerPoolManager 不同）
+_spawn_agent_manager: Optional[SpawnAgentManager] = None
 
 
-def get_agent_manager() -> AgentManager:
-    """获取全局 Agent 管理器"""
-    global _agent_manager
-    if _agent_manager is None:
-        _agent_manager = AgentManager()
-    return _agent_manager
+def get_spawn_agent_manager() -> SpawnAgentManager:
+    """获取全局 SpawnAgentManager（子 Agent 执行）。"""
+    global _spawn_agent_manager
+    if _spawn_agent_manager is None:
+        _spawn_agent_manager = SpawnAgentManager()
+    return _spawn_agent_manager
+
+
+def get_agent_manager() -> SpawnAgentManager:
+    """兼容旧名：等同于 get_spawn_agent_manager。"""
+    return get_spawn_agent_manager()
+
+
+# 兼容旧代码中的类型名
+AgentManager = SpawnAgentManager

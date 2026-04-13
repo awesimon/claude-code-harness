@@ -2,7 +2,7 @@
 
 import asyncio
 import pytest
-from python_api.agent import (
+from agents.worker_pool import (
     Coordinator,
     Agent,
     AgentConfig,
@@ -203,7 +203,7 @@ async def test_execution_plan():
 @pytest.mark.asyncio
 async def test_task_dependencies():
     """Test task dependency resolution."""
-    from python_api.agent.task_queue import TaskQueue
+    from agents.worker_pool.task_queue import TaskQueue
 
     queue = TaskQueue()
     execution_order = []
@@ -268,7 +268,7 @@ async def test_coordinator_statistics():
 @pytest.mark.asyncio
 async def test_message_notification():
     """Test task notification system."""
-    from python_api.agent.coordinator import TaskNotification
+    from agents.worker_pool.coordinator import TaskNotification
 
     notification = TaskNotification(
         task_id="agent-123",

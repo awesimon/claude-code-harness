@@ -9,7 +9,7 @@ import asyncio
 import random
 from typing import Any
 
-from python_api.agent import (
+from agents.worker_pool import (
     Coordinator,
     CoordinatorConfig,
     AgentConfig,

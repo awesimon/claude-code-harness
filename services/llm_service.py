@@ -6,12 +6,16 @@ LLM服务模块
 import logging
 import os
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, AsyncIterator, Union
 
-import httpx
-from openai import AsyncOpenAI
+from anthropic import (
+    APIStatusError as AnthropicAPIStatusError,
+    AsyncAnthropic,
+    NOT_GIVEN,
+)
+from openai import APIStatusError, AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +97,7 @@ class LLMService:
 
     def __init__(self):
         self._openai_client: Optional[AsyncOpenAI] = None
-        self._anthropic_client: Optional[httpx.AsyncClient] = None
+        self._anthropic_client: Optional[AsyncAnthropic] = None
         self._default_model = os.getenv("DEFAULT_MODEL", "gpt-4o")
         self._default_max_tokens = int(os.getenv("DEFAULT_MAX_TOKENS", "4096"))
         self._default_temperature = float(os.getenv("DEFAULT_TEMPERATURE", "0.7"))
@@ -112,23 +116,102 @@ class LLMService:
             )
         return self._openai_client
 
-    def _get_anthropic_client(self) -> httpx.AsyncClient:
-        """获取Anthropic客户端"""
+    def _get_anthropic_client(self) -> AsyncAnthropic:
+        """获取 Anthropic 官方 Async SDK 客户端"""
         if self._anthropic_client is None:
             api_key = os.getenv("ANTHROPIC_API_KEY")
             if not api_key:
                 raise ValueError("ANTHROPIC_API_KEY environment variable not set")
 
-            self._anthropic_client = httpx.AsyncClient(
-                base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                timeout=60.0,
+            base = os.getenv("ANTHROPIC_BASE_URL") or None
+            self._anthropic_client = AsyncAnthropic(
+                api_key=api_key,
+                base_url=base,
             )
         return self._anthropic_client
+
+    @staticmethod
+    def _openai_tools_to_anthropic(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """将 OpenAI 风格的 tools 转为 Anthropic Messages API 的 tool 定义。"""
+        out: List[Dict[str, Any]] = []
+        for t in tools:
+            if t.get("type") == "function" and isinstance(t.get("function"), dict):
+                fn = t["function"]
+                params = fn.get("parameters")
+                if not isinstance(params, dict):
+                    params = {"type": "object", "properties": {}}
+                out.append(
+                    {
+                        "name": fn.get("name", ""),
+                        "description": fn.get("description") or "",
+                        "input_schema": params,
+                    }
+                )
+            elif "name" in t and "input_schema" in t:
+                out.append(t)
+        return out
+
+    @staticmethod
+    def _anthropic_tool_choice_param(
+        tool_choice: Optional[Union[str, Dict[str, Any]]],
+    ) -> Any:
+        if tool_choice is None:
+            return NOT_GIVEN
+        if isinstance(tool_choice, dict):
+            return tool_choice
+        if tool_choice == "auto":
+            return {"type": "auto"}
+        if tool_choice == "none":
+            return {"type": "none"}
+        if tool_choice == "required":
+            return {"type": "any"}
+        return NOT_GIVEN
+
+    @staticmethod
+    def _anthropic_stop_to_finish_reason(stop_reason: Optional[str]) -> Optional[str]:
+        if not stop_reason:
+            return None
+        mapping = {
+            "end_turn": "stop",
+            "tool_use": "tool_calls",
+            "max_tokens": "length",
+        }
+        return mapping.get(stop_reason, stop_reason)
+
+    def _build_anthropic_create_kwargs(self, request: ChatCompletionRequest) -> Dict[str, Any]:
+        model = request.model or os.getenv(
+            "ANTHROPIC_DEFAULT_MODEL", "claude-3-5-sonnet-20241022"
+        )
+        raw_messages = [m.to_anthropic() for m in request.messages]
+        system_message: Optional[str] = None
+        chat_messages: List[Dict[str, Any]] = []
+        for msg in raw_messages:
+            if msg["role"] == "system":
+                system_message = msg["content"]
+            else:
+                chat_messages.append(msg)
+
+        max_tokens = request.max_tokens or self._default_max_tokens
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": chat_messages,
+            "temperature": self._get_temperature(request.temperature),
+        }
+        if system_message:
+            kwargs["system"] = system_message
+
+        if (
+            request.tools
+            and len(request.tools) > 0
+            and not os.getenv("LLM_DISABLE_TOOLS", "").lower() in ("1", "true", "yes")
+        ):
+            kwargs["tools"] = self._openai_tools_to_anthropic(request.tools)
+            tc = self._anthropic_tool_choice_param(request.tool_choice)
+            if tc is not NOT_GIVEN:
+                kwargs["tool_choice"] = tc
+
+        return kwargs
 
     async def chat_completion(
         self,
@@ -176,29 +259,19 @@ class LLMService:
         """获取 temperature，优先使用请求中的值，否则使用默认值"""
         return request_temp if request_temp is not None else 1.0
 
-    async def _openai_chat_completion(
-        self,
-        request: ChatCompletionRequest,
-    ) -> ChatCompletionResponse:
-        """OpenAI聊天完成"""
-        client = self._get_openai_client()
-
+    def _build_openai_chat_kwargs(self, request: ChatCompletionRequest) -> Dict[str, Any]:
+        """构建 OpenAI Chat Completions 请求参数（流式与非流式共用）"""
         model = request.model or self._default_model
         messages = [m.to_openai() for m in request.messages]
-
-        kwargs = {
+        kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
             "temperature": self._get_temperature(request.temperature),
         }
-
         if request.max_tokens:
             kwargs["max_tokens"] = request.max_tokens
         else:
             kwargs["max_tokens"] = self._default_max_tokens
-
-        # Only add tools if explicitly provided and not empty.
-        # Some gateways (e.g. infini-ai MaaS) return 400 if `tools` / `tool_choice` are sent.
         if (
             request.tools
             and len(request.tools) > 0
@@ -207,21 +280,26 @@ class LLMService:
             kwargs["tools"] = request.tools
             if request.tool_choice:
                 kwargs["tool_choice"] = request.tool_choice
+        return kwargs
 
-        try:
-            response = await client.chat.completions.create(**kwargs)
-        except Exception as e:
-            logger.error(f"OpenAI API call failed: {e}")
-            logger.error(f"Request kwargs: {kwargs}")
-            raise
+    async def _openai_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        """OpenAI聊天完成"""
+        client = self._get_openai_client()
+        kwargs = self._build_openai_chat_kwargs(request)
+
+        response = await client.chat.completions.create(**kwargs, timeout=60.0)
 
         choice = response.choices[0]
         message = choice.message
-
+        content = message.content
+        reasoning_content = choice.model_extra.get("reasoning_content")
         return ChatCompletionResponse(
             id=response.id,
             model=response.model,
-            content=message.content or "",
+            content=content,
             role=message.role,
             tool_calls=[tc.model_dump() for tc in message.tool_calls] if message.tool_calls else None,
             usage={
@@ -231,239 +309,294 @@ class LLMService:
             } if response.usage else None,
             finish_reason=choice.finish_reason,
             raw_response=response.model_dump(),
+            reasoning_content=reasoning_content,
         )
 
     async def _openai_chat_completion_stream(
         self,
         request: ChatCompletionRequest,
     ) -> AsyncIterator[ChatCompletionResponse]:
-        """OpenAI流式聊天完成 - 直接使用httpx处理SSE"""
-        base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        api_key = os.getenv("OPENAI_API_KEY")
-
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable not set")
-
+        """OpenAI 流式聊天完成（AsyncOpenAI SDK）"""
+        client = self._get_openai_client()
+        kwargs = self._build_openai_chat_kwargs(request)
         model = request.model or self._default_model
-        messages = [m.to_openai() for m in request.messages]
+        n_messages = len(kwargs.get("messages") or [])
+        n_tools = len(kwargs.get("tools") or [])
 
-        # 构建请求体
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": request.temperature if request.temperature is not None else 0.7,
-            "stream": True,
-            "max_tokens": request.max_tokens or self._default_max_tokens,
-        }
+        try:
+            stream = await client.chat.completions.create(
+                **kwargs,
+                stream=True,
+                timeout=60.0,
+            )
+        except APIStatusError as e:
+            body = ""
+            if e.response is not None:
+                try:
+                    body = e.response.text
+                except Exception:
+                    body = str(e.body) if getattr(e, "body", None) else ""
+            logger.error(
+                "OpenAI stream create failed status=%s model=%s messages=%s tools=%s body=%s",
+                getattr(e, "status_code", None),
+                model,
+                n_messages,
+                n_tools,
+                (body or str(e))[:12000],
+            )
+            raise
+        except Exception as e:
+            logger.error("OpenAI stream create failed: %s kwargs_keys=%s", e, list(kwargs.keys()))
+            raise
 
-        if (
-            request.tools
-            and len(request.tools) > 0
-            and not os.getenv("LLM_DISABLE_TOOLS", "").lower() in ("1", "true", "yes")
-        ):
-            payload["tools"] = request.tools
-            if request.tool_choice:
-                payload["tool_choice"] = request.tool_choice
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+            delta_dict = delta.model_dump(exclude_none=False)
 
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST",
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=httpx.Timeout(60.0, connect=10.0),
-            ) as response:
-                # 偶发 400 时网关常在 body 里带具体原因；默认 raise_for_status 只有状态码，这里记下来便于排查
-                if response.status_code >= 400:
-                    err_body = (await response.aread()).decode("utf-8", errors="replace")
-                    logger.error(
-                        "LLM /chat/completions error status=%s model=%s payload_messages=%s tools=%s body=%s",
-                        response.status_code,
-                        model,
-                        len(messages),
-                        len(payload.get("tools") or []),
-                        err_body[:12000],
-                    )
-                response.raise_for_status()
+            tool_calls = None
+            if delta.tool_calls:
+                tool_calls = [tc.model_dump(exclude_none=True) for tc in delta.tool_calls]
 
-                async for line in response.aiter_lines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
+            reasoning_content = delta_dict.get("reasoning_content")
 
-                        try:
-                            data = json.loads(data_str)
-                            choices = data.get("choices", [])
-                            if not choices:
-                                continue
+            raw: Optional[Dict[str, Any]] = None
+            try:
+                raw = chunk.model_dump()
+            except Exception:
+                raw = None
 
-                            choice = choices[0]
-                            delta = choice.get("delta", {})
-
-                            # 提取工具调用
-                            tool_calls = None
-                            if delta.get("tool_calls"):
-                                tool_calls = delta["tool_calls"]
-
-                            # 提取推理内容 (kimi-k2.5等模型)
-                            reasoning_content = delta.get("reasoning_content")
-
-                            yield ChatCompletionResponse(
-                                id=data.get("id", ""),
-                                model=data.get("model", model),
-                                content=delta.get("content", ""),
-                                role=delta.get("role", "assistant"),
-                                tool_calls=tool_calls,
-                                finish_reason=choice.get("finish_reason"),
-                                raw_response=data,
-                                reasoning_content=reasoning_content,
-                            )
-                        except json.JSONDecodeError:
-                            # 忽略无法解析的行
-                            continue
+            yield ChatCompletionResponse(
+                id=chunk.id or "",
+                model=chunk.model or model,
+                content=delta.content or "",
+                role=delta.role or "assistant",
+                tool_calls=tool_calls,
+                finish_reason=choice.finish_reason,
+                raw_response=raw,
+                reasoning_content=reasoning_content,
+            )
 
     async def _anthropic_chat_completion(
         self,
         request: ChatCompletionRequest,
     ) -> ChatCompletionResponse:
-        """Anthropic聊天完成"""
+        """Anthropic 聊天完成（官方 SDK）"""
         client = self._get_anthropic_client()
+        kwargs = self._build_anthropic_create_kwargs(request)
+        model = kwargs["model"]
 
-        model = request.model or "claude-3-sonnet-20240229"
-        messages = [m.to_anthropic() for m in request.messages]
-
-        # 分离system消息
-        system_message = None
-        chat_messages = []
-        for msg in messages:
-            if msg["role"] == "system":
-                system_message = msg["content"]
-            else:
-                chat_messages.append(msg)
-
-        data = {
-            "model": model,
-            "messages": chat_messages,
-            "max_tokens": request.max_tokens or self._default_max_tokens,
-            "temperature": self._get_temperature(request.temperature),
-        }
-        if system_message:
-            data["system"] = system_message
-
-        # 添加工具支持（Anthropic 使用 tools 参数）
-        if request.tools:
-            # Anthropic 工具格式与 OpenAI 类似
-            data["tools"] = request.tools
-
-        response = await client.post("/v1/messages", json=data)
-        response.raise_for_status()
-        result = response.json()
+        try:
+            msg = await client.messages.create(**kwargs, timeout=60.0)
+        except AnthropicAPIStatusError as e:
+            body = ""
+            if getattr(e, "response", None) is not None:
+                try:
+                    body = e.response.text
+                except Exception:
+                    body = str(getattr(e, "body", None) or "")
+            logger.error(
+                "Anthropic messages.create failed status=%s body=%s",
+                getattr(e, "status_code", None),
+                (body or str(e))[:12000],
+            )
+            raise
+        except Exception as e:
+            logger.error("Anthropic API call failed: %s", e)
+            raise
 
         content = ""
-        tool_calls = None
+        tool_calls: Optional[List[Dict[str, Any]]] = None
 
-        if result.get("content"):
-            for block in result["content"]:
-                if block["type"] == "text":
-                    content += block["text"]
-                elif block["type"] == "tool_use":
-                    # Anthropic 工具调用格式
-                    if tool_calls is None:
-                        tool_calls = []
-                    tool_calls.append({
-                        "id": block.get("id", ""),
+        for block in msg.content:
+            btype = getattr(block, "type", None)
+            if btype == "text":
+                content += getattr(block, "text", "") or ""
+            elif btype == "tool_use":
+                if tool_calls is None:
+                    tool_calls = []
+                inp = getattr(block, "input", None)
+                if inp is None and hasattr(block, "model_dump"):
+                    inp = block.model_dump().get("input", {})
+                if not isinstance(inp, dict):
+                    inp = {}
+                tool_calls.append(
+                    {
+                        "id": getattr(block, "id", "") or "",
                         "type": "function",
                         "function": {
-                            "name": block.get("name", ""),
-                            "arguments": json.dumps(block.get("input", {}))
-                        }
-                    })
+                            "name": getattr(block, "name", "") or "",
+                            "arguments": json.dumps(inp, ensure_ascii=False, default=str),
+                        },
+                    }
+                )
+
+        usage = None
+        if msg.usage is not None:
+            usage = {
+                "input_tokens": getattr(msg.usage, "input_tokens", 0),
+                "output_tokens": getattr(msg.usage, "output_tokens", 0),
+            }
+
+        raw: Optional[Dict[str, Any]] = None
+        try:
+            raw = msg.model_dump()
+        except Exception:
+            raw = None
 
         return ChatCompletionResponse(
-            id=result["id"],
-            model=result["model"],
+            id=msg.id,
+            model=msg.model,
             content=content,
             role="assistant",
             tool_calls=tool_calls,
-            usage={
-                "input_tokens": result["usage"]["input_tokens"],
-                "output_tokens": result["usage"]["output_tokens"],
-            } if "usage" in result else None,
-            finish_reason=result.get("stop_reason"),
-            raw_response=result,
+            usage=usage,
+            finish_reason=getattr(msg, "stop_reason", None),
+            raw_response=raw,
         )
 
     async def _anthropic_chat_completion_stream(
         self,
         request: ChatCompletionRequest,
     ) -> AsyncIterator[ChatCompletionResponse]:
-        """Anthropic流式聊天完成"""
+        """Anthropic 流式（messages.create(stream=True)，事件映射为与 OpenAI 流一致的 ChatCompletionResponse）"""
         client = self._get_anthropic_client()
+        kwargs = self._build_anthropic_create_kwargs(request)
+        model = kwargs["model"]
 
-        model = request.model or "claude-3-sonnet-20240229"
-        messages = [m.to_anthropic() for m in request.messages]
+        try:
+            stream = await client.messages.create(**kwargs, stream=True, timeout=60.0)
+        except AnthropicAPIStatusError as e:
+            body = ""
+            if getattr(e, "response", None) is not None:
+                try:
+                    body = e.response.text
+                except Exception:
+                    body = str(getattr(e, "body", None) or "")
+            logger.error(
+                "Anthropic stream create failed status=%s model=%s body=%s",
+                getattr(e, "status_code", None),
+                model,
+                (body or str(e))[:12000],
+            )
+            raise
+        except Exception as e:
+            logger.error("Anthropic stream create failed: %s", e)
+            raise
 
-        # 分离system消息
-        system_message = None
-        chat_messages = []
-        for msg in messages:
-            if msg["role"] == "system":
-                system_message = msg["content"]
-            else:
-                chat_messages.append(msg)
+        msg_id = ""
+        # 当前 tool_use 块（按 content block index）
+        tool_meta: Dict[int, Dict[str, str]] = {}
 
-        data = {
-            "model": model,
-            "messages": chat_messages,
-            "max_tokens": request.max_tokens or self._default_max_tokens,
-            "temperature": self._get_temperature(request.temperature),
-            "stream": True,
-        }
-        if system_message:
-            data["system"] = system_message
+        async for event in stream:
+            et = getattr(event, "type", None)
+            raw_evt: Optional[Dict[str, Any]] = None
+            try:
+                raw_evt = event.model_dump()
+            except Exception:
+                raw_evt = None
 
-        async with client.stream("POST", "/v1/messages", json=data) as response:
-            response.raise_for_status()
+            if et == "message_start":
+                m = getattr(event, "message", None)
+                msg_id = getattr(m, "id", "") if m is not None else ""
 
-            current_content = ""
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    json_str = line[6:]
-                    if json_str == "[DONE]":
-                        break
+            elif et == "content_block_start":
+                idx = getattr(event, "index", 0)
+                cb = getattr(event, "content_block", None)
+                cb_type = getattr(cb, "type", None) if cb is not None else None
+                if cb_type == "tool_use":
+                    tool_meta[idx] = {
+                        "id": getattr(cb, "id", "") or "",
+                        "name": getattr(cb, "name", "") or "",
+                    }
+                    yield ChatCompletionResponse(
+                        id=msg_id,
+                        model=model,
+                        content="",
+                        role="assistant",
+                        tool_calls=[
+                            {
+                                "index": idx,
+                                "id": tool_meta[idx]["id"],
+                                "function": {
+                                    "name": tool_meta[idx]["name"],
+                                    "arguments": "",
+                                },
+                            }
+                        ],
+                        raw_response=raw_evt,
+                    )
 
-                    try:
-                        event = json.loads(json_str)
-                        event_type = event.get("type")
+            elif et == "content_block_delta":
+                delta = getattr(event, "delta", None)
+                if delta is None:
+                    continue
+                dt = getattr(delta, "type", None)
+                idx = getattr(event, "index", 0)
 
-                        if event_type == "content_block_delta":
-                            delta = event.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                text = delta.get("text", "")
-                                current_content += text
+                if dt == "text_delta":
+                    text = getattr(delta, "text", "") or ""
+                    if text:
+                        yield ChatCompletionResponse(
+                            id=msg_id,
+                            model=model,
+                            content=text,
+                            role="assistant",
+                            raw_response=raw_evt,
+                        )
+                elif dt == "input_json_delta":
+                    partial = getattr(delta, "partial_json", "") or ""
+                    meta = tool_meta.get(idx, {"id": "", "name": ""})
+                    yield ChatCompletionResponse(
+                        id=msg_id,
+                        model=model,
+                        content="",
+                        role="assistant",
+                        tool_calls=[
+                            {
+                                "index": idx,
+                                "id": meta.get("id", ""),
+                                "function": {
+                                    "name": meta.get("name", ""),
+                                    "arguments": partial,
+                                },
+                            }
+                        ],
+                        raw_response=raw_evt,
+                    )
+                elif dt == "thinking_delta":
+                    think = getattr(delta, "thinking", "") or ""
+                    if think:
+                        yield ChatCompletionResponse(
+                            id=msg_id,
+                            model=model,
+                            content="",
+                            role="assistant",
+                            reasoning_content=think,
+                            raw_response=raw_evt,
+                        )
 
-                                yield ChatCompletionResponse(
-                                    id=event.get("message", {}).get("id", ""),
-                                    model=model,
-                                    content=text,
-                                    role="assistant",
-                                    raw_response=event,
-                                )
-                    except json.JSONDecodeError:
-                        continue
+            elif et == "message_delta":
+                md = getattr(event, "delta", None)
+                sr = getattr(md, "stop_reason", None) if md is not None else None
+                fr = self._anthropic_stop_to_finish_reason(sr)
+                if fr:
+                    yield ChatCompletionResponse(
+                        id=msg_id,
+                        model=model,
+                        content="",
+                        role="assistant",
+                        finish_reason=fr,
+                        raw_response=raw_evt,
+                    )
 
     async def close(self):
         """关闭客户端"""
-        if self._anthropic_client:
-            await self._anthropic_client.aclose()
+        if self._anthropic_client is not None:
+            await self._anthropic_client.close()
+            self._anthropic_client = None
 
 
 # 全局LLM服务实例

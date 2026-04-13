@@ -10,7 +10,7 @@ from enum import Enum
 
 from .enums import AgentStatus, TaskStatus, TaskPriority, Result
 from .agent import Agent, AgentConfig, AgentCapabilities
-from .agent_manager import AgentManager
+from .agent_manager import WorkerPoolManager
 from .task import Task, TaskConfig, TaskResult
 from .task_queue import TaskQueue
 
@@ -153,7 +153,7 @@ class Coordinator:
 
     def __init__(self, config: Optional[CoordinatorConfig] = None):
         self.config = config or CoordinatorConfig()
-        self._agent_manager = AgentManager(max_agents=self.config.max_workers)
+        self._agent_manager = WorkerPoolManager(max_agents=self.config.max_workers)
 
         # State
         self._phase = CoordinatorPhase.IDLE

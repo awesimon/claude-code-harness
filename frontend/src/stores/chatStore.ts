@@ -26,6 +26,7 @@ interface ExtendedChatActions extends ChatActions {
   loadConversation: (id: string) => Promise<void>;
   createConversation: (title?: string) => Promise<string>;
   deleteConversation: (id: string) => Promise<void>;
+  updateConversationTitle: (id: string, title: string) => Promise<void>;
   connectWebSocket: (conversationId?: string) => void;
   disconnectWebSocket: () => void;
 }
@@ -135,6 +136,26 @@ export const useChatStore = create<ExtendedChatState & ExtendedChatActions>()(
       } catch (error) {
         console.error('Failed to delete conversation:', error);
         set({ error: 'Failed to delete conversation' });
+      }
+    },
+
+    updateConversationTitle: async (id, title) => {
+      try {
+        const updated = await api.updateConversation(id, title);
+        set((state) => ({
+          conversations: state.conversations.map((c) =>
+            c.id === id
+              ? {
+                  ...c,
+                  title: updated.title,
+                  updatedAt: updated.updatedAt,
+                }
+              : c
+          ),
+        }));
+      } catch (error) {
+        console.error('Failed to update conversation title:', error);
+        set({ error: 'Failed to update conversation title' });
       }
     },
 
@@ -286,9 +307,25 @@ export const useChatStore = create<ExtendedChatState & ExtendedChatActions>()(
               case 'message_created':
                 // New message from another source
                 break;
-              case 'conversation_updated':
-                get().loadConversations();
+              case 'conversation_updated': {
+                const d = data.data as {
+                  id?: string;
+                  title?: string;
+                  updated_at?: string;
+                };
+                if (d?.id != null && d.title != null) {
+                  const updatedAt = d.updated_at
+                    ? new Date(d.updated_at).getTime()
+                    : Date.now();
+                  set((state) => ({
+                    conversations: state.conversations.map((c) =>
+                      c.id === d.id ? { ...c, title: d.title!, updatedAt } : c
+                    ),
+                  }));
+                }
+                void get().loadConversations();
                 break;
+              }
             }
           } catch (error) {
             console.error('Failed to parse WebSocket message:', error);

@@ -185,6 +185,21 @@ class APIResponse(BaseModel):
     data: Optional[Any] = None
     message: str = ""
     error: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+# ==================== Legacy /chat HTTP（前端 SSE 等）====================
+
+
+class LegacyChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+
+class LegacyChatResponse(BaseModel):
+    type: str
+    content: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
 
 
 # ==================== WebSocket Schemas ====================
