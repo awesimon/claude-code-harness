@@ -216,13 +216,27 @@ class SkillInstallToolV2(Tool[SkillInstallInput, str]):
     """
     安装 Agent Skill
 
-    从本地路径安装 skill 到 .claude/skills/ 目录。
+    支持从以下源安装 skill：
+    1. 本地目录：/path/to/skill-directory
+    2. GitHub URL：
+       - https://github.com/user/repo/tree/main/skills/my-skill
+       - https://github.com/user/repo/blob/main/skills/my-skill/SKILL.md
+       - github.com/user/repo/skills/my-skill
+
+    源目录必须包含有效的 SKILL.md 文件。
     """
 
     name = "skill_install"
-    description = """Install an Agent Skill from a local directory.
+    description = """Install an Agent Skill from a local directory or GitHub URL.
 
-The source directory must contain a valid SKILL.md file following
+Local installation:
+  source: /path/to/skill-directory
+
+GitHub installation:
+  source: https://github.com/user/repo/tree/main/path/to/skill
+  source: github.com/user/repo/path/to/skill
+
+The source must contain a valid SKILL.md file following
 the agentskills.io standard protocol.
 """
     version = "2.0"
@@ -291,7 +305,7 @@ the agentskills.io standard protocol.
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Path to the skill directory to install"
+                        "description": "Path to the skill directory or GitHub URL (e.g., https://github.com/user/repo/tree/main/path/to/skill)"
                     },
                     "name": {
                         "type": "string",
