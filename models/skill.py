@@ -3,16 +3,15 @@ Agent Skills 标准协议数据模型
 对应 agentskills.io 规范
 """
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
-from enum import Enum
 
 
 class SkillMetadata(BaseModel):
     """Skill 元数据（metadata 字段）"""
     author: Optional[str] = None
     version: Optional[str] = None
-    # 允许任意额外字段
+
     class Config:
         extra = "allow"
 
@@ -23,7 +22,7 @@ class SkillDefinition(BaseModel):
     对应 SKILL.md 的 frontmatter + 内容
     """
     # 必需字段
-    name: str = Field(..., min_length=1, max_length=64, regex=r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
+    name: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*[a-z0-9]$")
     description: str = Field(..., min_length=1, max_length=1024)
 
     # 可选字段
@@ -44,8 +43,9 @@ class SkillDefinition(BaseModel):
     # 加载时间戳
     loaded_at: Optional[datetime] = None
 
-    @validator('name')
-    def validate_name(cls, v):
+    @field_validator('name')
+    @classmethod
+    def validate_name(cls, v: str) -> str:
         """验证 name 字段符合规范"""
         if '--' in v:
             raise ValueError('name cannot contain consecutive hyphens')
@@ -53,7 +53,8 @@ class SkillDefinition(BaseModel):
             raise ValueError('name cannot start or end with hyphen')
         return v
 
-    @validator('allowed_tools', pre=True)
+    @field_validator('allowed_tools', mode='before')
+    @classmethod
     def parse_allowed_tools(cls, v):
         """解析 allowed-tools（空格分隔的字符串或列表）"""
         if isinstance(v, str):
