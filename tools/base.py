@@ -4,10 +4,9 @@
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Generic, Optional, TypeVar, Dict, Protocol, runtime_checkable, get_args
-from enum import Enum, auto
-import asyncio
+from dataclasses import dataclass, field
+from typing import Any, Generic, Optional, TypeVar, Dict, get_args
+import re
 
 
 class ToolError(Exception):
@@ -111,12 +110,16 @@ class ToolResult:
         )
 
     @classmethod
-    def error(
+    def fail(
         cls,
-        error: ToolError,
+        error: Exception | str,
         message: str = "",
     ) -> "ToolResult":
         """创建错误的结果"""
+        if isinstance(error, str):
+            error = ToolExecutionError(error)
+        elif not isinstance(error, ToolError):
+            error = ToolExecutionError(str(error))
         return cls(
             success=False,
             data=None,
@@ -127,6 +130,36 @@ class ToolResult:
 
 InputType = TypeVar("InputType")
 OutputType = TypeVar("OutputType")
+
+
+_EXPLICIT_TOOL_ALIASES = {
+    "Read": "read_file",
+    "Write": "write_file",
+    "Edit": "edit_file",
+    "Glob": "glob",
+    "Grep": "grep",
+    "Bash": "bash",
+    "Agent": "agent",
+    "EnterPlanMode": "enter_plan_mode",
+    "ExitPlanMode": "exit_plan_mode",
+    "AskUserQuestion": "ask_user_question",
+}
+
+
+def canonical_tool_name(name: str) -> str:
+    """Return the stable lower-snake-case name used by the harness."""
+    if name in _EXPLICIT_TOOL_ALIASES:
+        return _EXPLICIT_TOOL_ALIASES[name]
+    value = name.replace("-", "_").replace(" ", "_")
+    value = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value)
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return re.sub(r"_+", "_", value).strip("_").lower()
+
+
+def tool_flag(tool: Any, attribute: str, default: bool = False) -> bool:
+    """Read a legacy tool trait implemented as either a method or a boolean."""
+    value = getattr(tool, attribute, default)
+    return bool(value() if callable(value) else value)
 
 
 def _resolve_tool_input_type(tool_cls: type) -> Optional[type]:
@@ -146,6 +179,77 @@ def _resolve_tool_input_type(tool_cls: type) -> Optional[type]:
         if args:
             return args[0]
     return None
+
+
+def _schema_from_input_type(tool_cls: type) -> Optional[Dict[str, Any]]:
+    input_type = _resolve_tool_input_type(tool_cls)
+    if input_type is None:
+        return None
+    try:
+        from pydantic import TypeAdapter
+
+        schema = TypeAdapter(input_type).json_schema()
+        return schema if isinstance(schema, dict) else None
+    except Exception:
+        return None
+
+
+def _normalize_object_schema(schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = dict(schema) if isinstance(schema, dict) else {}
+    normalized["type"] = "object"
+    normalized.setdefault("properties", {})
+    return normalized
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    """Canonical, provider-neutral description of a registered tool."""
+
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+    aliases: tuple[str, ...] = field(default_factory=tuple)
+
+    @classmethod
+    def from_tool(
+        cls,
+        tool: "Tool",
+        *,
+        name: Optional[str] = None,
+        aliases: tuple[str, ...] = (),
+    ) -> "ToolSpec":
+        raw_schema = tool.get_schema() or {}
+        parameters = raw_schema.get("parameters")
+        if parameters is None:
+            parameters = raw_schema.get("input_schema") or raw_schema.get("inputSchema")
+        if parameters is None:
+            getter = getattr(tool, "get_input_schema", None)
+            if callable(getter):
+                try:
+                    parameters = getter()
+                except TypeError:
+                    parameters = None
+        if parameters is None:
+            parameters = getattr(tool, "input_schema", None)
+        if parameters is None:
+            parameters = _schema_from_input_type(tool.__class__)
+
+        return cls(
+            name=name or canonical_tool_name(tool.name),
+            description=raw_schema.get("description", tool.description),
+            parameters=_normalize_object_schema(parameters),
+            aliases=aliases,
+        )
+
+    def to_openai(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
 
 
 class Tool(ABC, Generic[InputType, OutputType]):
@@ -206,7 +310,7 @@ class Tool(ABC, Generic[InputType, OutputType]):
                 import dataclasses
                 input_type = _resolve_tool_input_type(self.__class__)
                 if input_type is None:
-                    return ToolResult.error(
+                    return ToolResult.fail(
                         ToolValidationError(
                             "Invalid input data: cannot resolve tool input type "
                             "(use Tool[Input, Output] or set class attribute input_model=...)"
@@ -221,22 +325,22 @@ class Tool(ABC, Generic[InputType, OutputType]):
                     # 其他类型，尝试直接实例化
                     input_data = input_type(**input_data)
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolValidationError(f"Invalid input data: {str(e)}")
             )
 
         # 验证输入
         validation_error = await self.validate(input_data)
         if validation_error:
-            return ToolResult.error(validation_error)
+            return ToolResult.fail(validation_error)
 
         # 执行工具
         try:
             return await self.execute(input_data)
         except ToolError as e:
-            return ToolResult.error(e)
+            return ToolResult.fail(e)
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(
                     message=f"Unexpected error: {str(e)}",
                     details={"exception_type": type(e).__name__},
@@ -273,16 +377,38 @@ class ToolRegistry:
     """工具注册表"""
 
     _tools: Dict[str, Tool] = {}
+    _aliases: Dict[str, str] = {}
 
     @classmethod
     def register(cls, tool: Tool) -> None:
         """注册工具"""
-        cls._tools[tool.name] = tool
+        canonical = canonical_tool_name(tool.name)
+        cls._tools[canonical] = tool
+        cls._aliases[canonical] = canonical
+        cls._aliases[tool.name] = canonical
+        cls._aliases[tool.name.lower()] = canonical
+        for alias, target in _EXPLICIT_TOOL_ALIASES.items():
+            if target == canonical:
+                cls._aliases[alias] = canonical
 
     @classmethod
     def get(cls, name: str) -> Optional[Tool]:
         """获取工具"""
-        return cls._tools.get(name)
+        canonical = cls.resolve_name(name)
+        return cls._tools.get(canonical) if canonical else None
+
+    @classmethod
+    def resolve_name(cls, name: str) -> Optional[str]:
+        """Resolve canonical and legacy names without duplicate registrations."""
+        if name in cls._aliases:
+            return cls._aliases[name]
+        normalized = canonical_tool_name(name)
+        if normalized in cls._tools:
+            return normalized
+        explicit = _EXPLICIT_TOOL_ALIASES.get(name)
+        if explicit in cls._tools:
+            return explicit
+        return None
 
     @classmethod
     def list_tools(cls) -> list[str]:
@@ -290,9 +416,24 @@ class ToolRegistry:
         return list(cls._tools.keys())
 
     @classmethod
+    def get_spec(cls, name: str) -> Optional[ToolSpec]:
+        canonical = cls.resolve_name(name)
+        if canonical is None:
+            return None
+        tool = cls._tools[canonical]
+        aliases = tuple(
+            sorted(alias for alias, target in cls._aliases.items() if target == canonical)
+        )
+        return ToolSpec.from_tool(tool, name=canonical, aliases=aliases)
+
+    @classmethod
+    def list_specs(cls) -> list[ToolSpec]:
+        return [cls.get_spec(name) for name in cls.list_tools()]
+
+    @classmethod
     def get_all_schemas(cls) -> Dict[str, Dict[str, Any]]:
         """获取所有工具的Schema"""
-        return {name: tool.get_schema() for name, tool in cls._tools.items()}
+        return {spec.name: spec.to_openai()["function"] for spec in cls.list_specs()}
 
 
 # 装饰器用于自动注册工具

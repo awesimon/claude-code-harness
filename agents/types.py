@@ -4,6 +4,7 @@ Agent 系统核心类型定义
 """
 from enum import Enum
 from typing import Optional, Dict, Any, List, Callable, Union, Literal
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -163,6 +164,8 @@ class AgentToolResult:
     total_duration_ms: int
     total_tokens: int
     usage: Dict[str, Any]
+    termination_reason: str = "completed"
+    error: Optional[str] = None
 
 
 @dataclass
@@ -177,6 +180,10 @@ class AgentExecutionConfig:
     use_exact_tools: bool = False
     worktree_path: Optional[str] = None
     description: Optional[str] = None
+    workspace_root: Optional[Path] = None
+    approval_callback: Optional[Callable[[Any], Any]] = None
+    tool_timeout: Optional[float] = 60.0
+    parent_cancellation: Optional[Any] = None
 
 
 class AgentError(Exception):

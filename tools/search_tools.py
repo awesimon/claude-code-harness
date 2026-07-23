@@ -91,7 +91,7 @@ class GlobTool(Tool[GlobInput, List[str]]):
                 }
             )
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"搜索失败: {str(e)}")
             )
 
@@ -224,11 +224,11 @@ class GrepTool(Tool[GrepInput, Any]):
                 }
             )
         except re.error as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolValidationError(f"无效的正则表达式: {str(e)}")
             )
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"搜索失败: {str(e)}")
             )
 

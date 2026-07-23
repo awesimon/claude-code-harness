@@ -9,20 +9,21 @@ import uuid
 import json
 from typing import Optional, Dict, Any, List, Callable, AsyncIterator
 from datetime import datetime
+from pathlib import Path
 
 from agents.types import (
     AgentDefinition,
     AgentContext,
     AgentToolResult,
     AgentExecutionConfig,
-    is_built_in_agent,
-    is_one_shot_agent,
     AgentError,
     AgentExecutionError,
 )
 from agents.built_in import get_agent_by_type
 from tools import ToolRegistry
-from tools.base import Tool
+from tools.base import Tool, canonical_tool_name
+from harness import CancellationToken, PermissionMode, RuntimeContext, ToolRuntime
+from services import LLMService, Message, ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,18 @@ class AgentExecutor:
         prompt: str,
         parent_session_id: Optional[str] = None,
         config: Optional[AgentExecutionConfig] = None,
+        llm_service: Optional[LLMService] = None,
+        tool_runtime: Optional[ToolRuntime] = None,
     ):
         self.agent_definition = agent_definition
         self.prompt = prompt
         self.parent_session_id = parent_session_id
         self.config = config or AgentExecutionConfig()
+        self.llm_service = llm_service or LLMService()
+        self.tool_runtime = tool_runtime or ToolRuntime(
+            ToolRegistry,
+            default_timeout=self.config.tool_timeout,
+        )
         self.agent_id = self._generate_agent_id()
         self.context = AgentContext(
             agent_id=self.agent_id,
@@ -59,7 +67,9 @@ class AgentExecutor:
             started_at=datetime.now(),
             is_async=self.config.is_async,
         )
-        self._abort_event = asyncio.Event()
+        self.cancellation = CancellationToken(parent=self.config.parent_cancellation)
+        self._termination_reason = "max_turns"
+        self._usage: Dict[str, int] = {}
 
     def _generate_agent_id(self) -> str:
         """生成 Agent ID"""
@@ -71,7 +81,7 @@ class AgentExecutor:
 
         根据 agent_definition.tools 和 disallowed_tools 过滤
         """
-        all_tools = []
+        all_tools: List[Tool] = []
         for name in ToolRegistry.list_tools():
             tool = ToolRegistry.get(name)
             if tool:
@@ -82,14 +92,21 @@ class AgentExecutor:
         if allowed_tools is None or (len(allowed_tools) == 1 and allowed_tools[0] == "*"):
             resolved = all_tools
         else:
-            # 过滤指定工具
-            resolved = [t for t in all_tools if t.name in allowed_tools]
+            allowed = {canonical_tool_name(name) for name in allowed_tools}
+            resolved = [t for t in all_tools if self.tool_name(t) in allowed]
 
         # 应用禁止工具列表
         if self.agent_definition.disallowed_tools:
-            resolved = [t for t in resolved if t.name not in self.agent_definition.disallowed_tools]
+            denied = {
+                canonical_tool_name(name) for name in self.agent_definition.disallowed_tools
+            }
+            resolved = [t for t in resolved if self.tool_name(t) not in denied]
 
         return resolved
+
+    @staticmethod
+    def tool_name(tool: Tool) -> str:
+        return ToolRegistry.resolve_name(tool.name) or canonical_tool_name(tool.name)
 
     def _build_system_prompt(self) -> str:
         """构建系统提示词"""
@@ -126,12 +143,7 @@ Output format:
 
         实现 LLM → Tool → Observation → LLM 的闭环
         """
-        from query_engine import QueryEngine
-        from services import LLMService, Message, ChatCompletionRequest
-
         messages: List[Dict[str, Any]] = []
-        llm_service = LLMService()
-        query_engine = QueryEngine()
 
         # 构建初始消息
         system_prompt = self._build_system_prompt()
@@ -147,33 +159,35 @@ Output format:
         max_turns = self.agent_definition.max_turns or self.config.max_turns
 
         for turn in range(max_turns):
-            if self._abort_event.is_set():
+            if self.cancellation.cancelled:
                 logger.info(f"Agent {self.agent_id} aborted")
+                self._termination_reason = "cancelled"
                 break
 
             # 构建工具 schema
-            tools_schema = []
-            for tool in tools:
-                schema = tool.get_schema()
-                tools_schema.append({
-                    "type": "function",
-                    "function": {
-                        "name": schema["name"],
-                        "description": schema["description"],
-                        "parameters": schema.get("parameters", {"type": "object", "properties": {}})
-                    }
-                })
+            tools_schema = [
+                ToolRegistry.get_spec(self.tool_name(tool)).to_openai()
+                for tool in tools
+            ]
 
             try:
                 # 调用 LLM
-                response = await llm_service.chat_completion(
-                    ChatCompletionRequest(
-                        messages=llm_messages,
-                        model=self.config.model,
-                        tools=tools_schema if tools_schema else None,
-                        tool_choice="auto" if tools_schema else None,
+                llm_task = asyncio.create_task(
+                    self.llm_service.chat_completion(
+                        ChatCompletionRequest(
+                            messages=llm_messages,
+                            model=self.config.model,
+                            temperature=self.config.temperature,
+                            tools=tools_schema if tools_schema else None,
+                            tool_choice="auto" if tools_schema else None,
+                        )
                     )
                 )
+                self.cancellation.track(llm_task)
+                response = await llm_task
+                for key, value in (response.usage or {}).items():
+                    if isinstance(value, int):
+                        self._usage[key] = self._usage.get(key, 0) + value
             except Exception as e:
                 logger.error(f"LLM call failed in agent {self.agent_id}: {e}")
                 raise AgentExecutionError(f"LLM call failed: {e}")
@@ -190,6 +204,7 @@ Output format:
             llm_messages.append(Message(
                 role="assistant",
                 content=response.content,
+                tool_calls=response.tool_calls,
             ))
 
             if on_message:
@@ -203,6 +218,7 @@ Output format:
             if not response.tool_calls:
                 # 没有工具调用，任务完成
                 logger.info(f"Agent {self.agent_id} completed after {turn + 1} turns")
+                self._termination_reason = "completed"
                 break
 
             # 执行工具
@@ -217,22 +233,34 @@ Output format:
                 except json.JSONDecodeError:
                     tool_args = {}
 
-                # 查找工具
-                tool = ToolRegistry.get(tool_name)
-                if not tool:
-                    result_data = {"error": f"Tool '{tool_name}' not found"}
-                    result_success = False
-                else:
-                    try:
-                        tool_result = await tool.run(tool_args, {
-                            "session_id": self.agent_id,
-                            "agent_context": self.context,
-                        })
-                        result_data = tool_result.data if tool_result.success else {"error": str(tool_result.error)}
-                        result_success = tool_result.success
-                    except Exception as e:
-                        result_data = {"error": str(e)}
-                        result_success = False
+                permission_mode = PermissionMode.DEFAULT
+                configured_mode = self.agent_definition.permission_mode
+                if configured_mode and configured_mode.value == "bypass":
+                    permission_mode = PermissionMode.BYPASS
+                elif configured_mode and configured_mode.value == "plan":
+                    permission_mode = PermissionMode.PLAN
+                runtime_context = RuntimeContext(
+                    session_id=self.agent_id,
+                    workspace_root=(self.config.workspace_root or Path.cwd()).resolve(),
+                    permission_mode=permission_mode,
+                    approval_callback=self.config.approval_callback,
+                    cancellation=self.cancellation,
+                    tool_timeout=self.config.tool_timeout,
+                    metadata={"agent_context": self.context},
+                )
+                execution = await self.tool_runtime.execute(
+                    tool_name,
+                    tool_args,
+                    runtime_context,
+                )
+                tool_name = execution.tool_name
+                tool_result = execution.result
+                result_data = (
+                    tool_result.data
+                    if tool_result.success
+                    else {"error": str(tool_result.error)}
+                )
+                result_success = tool_result.success
 
                 # 添加工具结果到消息
                 tool_result_message = {
@@ -297,7 +325,9 @@ Output format:
             if not content:
                 content = [{"type": "text", "text": "Agent completed without output"}]
 
-            self.context.status = "completed"
+            self.context.status = (
+                "killed" if self._termination_reason == "cancelled" else "completed"
+            )
             self.context.completed_at = end_time
             self.context.messages = messages
 
@@ -307,13 +337,21 @@ Output format:
                 content=content,
                 total_tool_use_count=self.context.tool_use_count,
                 total_duration_ms=duration_ms,
-                total_tokens=0,  # TODO: 计算token
-                usage={},
+                total_tokens=self._usage.get(
+                    "total_tokens",
+                    self._usage.get("input_tokens", 0) + self._usage.get("output_tokens", 0),
+                ),
+                usage=dict(self._usage),
+                termination_reason=self._termination_reason,
             )
 
             logger.info(f"Agent {self.agent_id} completed in {duration_ms}ms")
             return result
 
+        except asyncio.CancelledError:
+            self.context.status = "killed"
+            self.context.completed_at = datetime.now()
+            raise
         except Exception as e:
             self.context.status = "failed"
             logger.error(f"Agent {self.agent_id} failed: {e}")
@@ -339,9 +377,6 @@ Output format:
         }
 
         try:
-            # 解析工具
-            tools = self._resolve_tools()
-
             # 运行对话循环，带回调
             messages = []
 
@@ -372,7 +407,8 @@ Output format:
 
     def abort(self):
         """中止 Agent 执行"""
-        self._abort_event.set()
+        self.cancellation.cancel()
+        self._termination_reason = "cancelled"
         self.context.status = "killed"
         logger.info(f"Agent {self.agent_id} abort requested")
 
@@ -384,9 +420,11 @@ class SpawnAgentManager:
     管理由 `AgentExecutor` 承载的、通过 `spawn_agent` 创建的任务会话。
     """
 
-    def __init__(self):
+    def __init__(self, executor_factory: Callable[..., AgentExecutor] = AgentExecutor):
+        self._executor_factory = executor_factory
         self._agents: Dict[str, AgentExecutor] = {}
         self._results: Dict[str, AgentToolResult] = {}
+        self._tasks: Dict[str, asyncio.Task[AgentToolResult]] = {}
 
     async def spawn_agent(
         self,
@@ -415,7 +453,7 @@ class SpawnAgentManager:
             raise AgentError(f"Unknown agent type: {agent_type}")
 
         # 创建执行器
-        executor = AgentExecutor(
+        executor = self._executor_factory(
             agent_definition=agent_def,
             prompt=prompt,
             parent_session_id=parent_session_id,
@@ -426,19 +464,60 @@ class SpawnAgentManager:
 
         if is_async:
             # 异步执行，立即返回 Agent ID
-            asyncio.create_task(self._run_async(executor))
+            self._tasks[executor.agent_id] = asyncio.create_task(
+                self._run_async(executor)
+            )
             return executor.agent_id
         else:
             # 同步执行
+            await self._run_async(executor)
             return executor.agent_id
 
-    async def _run_async(self, executor: AgentExecutor):
+    async def _run_async(self, executor: AgentExecutor) -> AgentToolResult:
         """异步运行 Agent"""
         try:
             result = await executor.execute()
             self._results[executor.agent_id] = result
+            return result
+        except asyncio.CancelledError:
+            executor.context.status = "killed"
+            result = self._cancelled_result(executor)
+            self._results[executor.agent_id] = result
+            return result
         except Exception as e:
             logger.error(f"Async agent {executor.agent_id} failed: {e}")
+            executor.context.status = "failed"
+            result = self._failed_result(executor, e)
+            self._results[executor.agent_id] = result
+            return result
+
+    @staticmethod
+    def _cancelled_result(executor: AgentExecutor) -> AgentToolResult:
+        return AgentToolResult(
+            agent_id=executor.agent_id,
+            agent_type=executor.context.agent_type,
+            content=[{"type": "text", "text": "Agent execution cancelled"}],
+            total_tool_use_count=executor.context.tool_use_count,
+            total_duration_ms=0,
+            total_tokens=0,
+            usage={},
+            termination_reason="cancelled",
+            error="Agent execution cancelled",
+        )
+
+    @staticmethod
+    def _failed_result(executor: AgentExecutor, error: Exception) -> AgentToolResult:
+        return AgentToolResult(
+            agent_id=executor.agent_id,
+            agent_type=executor.context.agent_type,
+            content=[{"type": "text", "text": f"Agent execution failed: {error}"}],
+            total_tool_use_count=executor.context.tool_use_count,
+            total_duration_ms=0,
+            total_tokens=0,
+            usage={},
+            termination_reason="failed",
+            error=str(error),
+        )
 
     async def wait_for_agent(self, agent_id: str, timeout: Optional[float] = None) -> AgentToolResult:
         """等待 Agent 完成"""
@@ -446,8 +525,23 @@ class SpawnAgentManager:
         if not executor:
             raise AgentError(f"Agent {agent_id} not found")
 
-        # TODO: 实现等待逻辑
-        return self._results.get(agent_id)
+        if agent_id in self._results:
+            return self._results[agent_id]
+
+        task = self._tasks.get(agent_id)
+        if task is None:
+            raise AgentError(f"Agent {agent_id} has not been started")
+
+        try:
+            if timeout is None:
+                return await asyncio.shield(task)
+            return await asyncio.wait_for(asyncio.shield(task), timeout)
+        except asyncio.TimeoutError as exc:
+            raise AgentError(f"Timed out waiting for agent {agent_id}") from exc
+        except asyncio.CancelledError:
+            result = self._cancelled_result(executor)
+            self._results[agent_id] = result
+            return result
 
     def get_agent_status(self, agent_id: str) -> Optional[Dict[str, Any]]:
         """获取 Agent 状态"""
@@ -469,9 +563,15 @@ class SpawnAgentManager:
         executor = self._agents.get(agent_id)
         if executor:
             executor.abort()
+        task = self._tasks.get(agent_id)
+        if task and not task.done():
+            task.cancel()
 
     def cleanup_agent(self, agent_id: str):
         """清理 Agent 资源"""
+        task = self._tasks.pop(agent_id, None)
+        if task and not task.done():
+            task.cancel()
         if agent_id in self._agents:
             del self._agents[agent_id]
         if agent_id in self._results:

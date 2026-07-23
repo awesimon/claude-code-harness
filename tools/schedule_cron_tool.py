@@ -344,7 +344,7 @@ class ScheduleCreateTool(Tool[ScheduleCreateInput, Dict[str, Any]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"创建定时任务失败: {str(e)}")
             )
 
@@ -447,7 +447,7 @@ class ScheduleListTool(Tool[ScheduleListInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"列出定时任务失败: {str(e)}")
             )
 
@@ -530,12 +530,12 @@ class ScheduleDeleteTool(Tool[ScheduleDeleteInput, Dict[str, Any]]):
                     message=f"成功删除定时任务: {input_data.task_id}"
                 )
             else:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"任务不存在: {input_data.task_id}")
                 )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"删除定时任务失败: {str(e)}")
             )
 
@@ -619,12 +619,12 @@ class ScheduleToggleTool(Tool[ScheduleToggleInput, Dict[str, Any]]):
                     message=f"成功{action}定时任务: {input_data.task_id}"
                 )
             else:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"任务不存在: {input_data.task_id}")
                 )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"切换任务状态失败: {str(e)}")
             )
 
@@ -704,7 +704,7 @@ class CronValidateTool(Tool[Dict[str, Any], Dict[str, Any]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"验证 Cron 表达式失败: {str(e)}")
             )
 

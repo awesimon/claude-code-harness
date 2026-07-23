@@ -150,7 +150,7 @@ class AskUserQuestionTool(Tool[AskUserQuestionInput, List[UserAnswer]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"提问过程失败: {str(e)}")
             )
 

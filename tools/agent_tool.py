@@ -40,10 +40,13 @@ class AgentToolOutput:
     tools: List[str]
 
 
-@register_tool
 class AgentTool(Tool[AgentToolInput, AgentToolOutput]):
     """
-    Agent 管理工具 - 创建和管理子 Agent
+    Legacy worker-pool Agent constructor.
+
+    This class remains importable for direct worker-pool callers, but is not
+    registered in the primary harness. The canonical `agent` tool is provided
+    by `agents.tool.AgentTool` and executed by `SpawnAgentManager`.
 
     用于创建新的子 Agent 来并行执行任务，支持多种配置选项：
     - 指定 Agent 类型和名称
@@ -142,7 +145,7 @@ class AgentTool(Tool[AgentToolInput, AgentToolOutput]):
             )
 
             if result.is_err():
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolExecutionError(f"创建 Agent 失败: {result.error}")
                 )
 
@@ -180,7 +183,7 @@ class AgentTool(Tool[AgentToolInput, AgentToolOutput]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"创建 Agent 时发生错误: {str(e)}")
             )
 
@@ -346,7 +349,7 @@ class AgentListTool(Tool[AgentListInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"列出 Agent 失败: {str(e)}")
             )
 
@@ -402,7 +405,7 @@ class AgentDestroyTool(Tool[AgentDestroyInput, bool]):
             )
 
             if result.is_err():
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolExecutionError(f"销毁 Agent 失败: {result.error}")
                 )
 
@@ -416,7 +419,7 @@ class AgentDestroyTool(Tool[AgentDestroyInput, bool]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"销毁 Agent 时发生错误: {str(e)}")
             )
 

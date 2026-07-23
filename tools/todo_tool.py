@@ -192,7 +192,7 @@ class TodoWriteTool(Tool[TodoWriteInput, TodoWriteOutput]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"更新待办事项失败: {str(e)}")
             )
 

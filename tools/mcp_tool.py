@@ -231,7 +231,7 @@ class MCPListServersTool(Tool[MCPListServersInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"列出 MCP 服务器失败: {str(e)}")
             )
 
@@ -327,7 +327,7 @@ class MCPListToolsTool(Tool[MCPListToolsInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"列出 MCP 工具失败: {str(e)}")
             )
 
@@ -427,7 +427,7 @@ class MCPExecuteToolTool(Tool[MCPExecuteToolInput, Dict[str, Any]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"执行 MCP 工具失败: {str(e)}")
             )
 

@@ -97,7 +97,7 @@ class ReadFileTool(Tool[ReadFileInput, str]):
             end = min(start + limit, total_lines)
 
             if start < 0 or start >= total_lines:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"起始行号超出范围: {input_data.offset}, 文件共 {total_lines} 行")
                 )
 
@@ -116,11 +116,11 @@ class ReadFileTool(Tool[ReadFileInput, str]):
                 }
             )
         except UnicodeDecodeError:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"文件编码错误，无法作为文本读取: {path}")
             )
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"读取文件失败: {str(e)}")
             )
 
@@ -190,7 +190,7 @@ class WriteFileTool(Tool[WriteFileInput, str]):
                 }
             )
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"写入文件失败: {str(e)}")
             )
 
@@ -250,7 +250,7 @@ class EditFileTool(Tool[EditFileInput, str]):
 
             # 检查old_string是否存在
             if input_data.old_string not in content:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(
                         f"未找到要替换的字符串",
                         details={
@@ -263,7 +263,7 @@ class EditFileTool(Tool[EditFileInput, str]):
             # 检查是否有多个匹配
             matches = content.count(input_data.old_string)
             if matches > 1:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(
                         f"找到 {matches} 处匹配，请提供更具体的字符串以确保唯一性",
                         details={"matches": matches}
@@ -287,7 +287,7 @@ class EditFileTool(Tool[EditFileInput, str]):
                 }
             )
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"编辑文件失败: {str(e)}")
             )
 

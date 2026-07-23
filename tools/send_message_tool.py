@@ -362,7 +362,7 @@ class SendMessageTool(Tool[SendMessageInput, Dict[str, Any]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"发送消息失败: {str(e)}")
             )
 
@@ -470,7 +470,7 @@ class MessageHistoryTool(Tool[MessageHistoryInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"获取消息历史失败: {str(e)}")
             )
 

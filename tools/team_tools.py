@@ -121,7 +121,7 @@ class TeamCreateTool(Tool[TeamCreateInput, Dict[str, Any]]):
             # Check if team name already exists
             existing = db.query(Team).filter(Team.name == input_data.team_name).first()
             if existing:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"Team '{input_data.team_name}' already exists")
                 )
 
@@ -178,7 +178,7 @@ class TeamCreateTool(Tool[TeamCreateInput, Dict[str, Any]]):
 
         except Exception as e:
             db.rollback()
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"创建团队失败: {str(e)}")
             )
         finally:
@@ -223,7 +223,7 @@ class TeamDeleteTool(Tool[TeamDeleteInput, Dict[str, Any]]):
             # Get team from database
             team = db.query(Team).filter(Team.id == input_data.team_id).first()
             if not team:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"Team '{input_data.team_id}' not found")
                 )
 
@@ -236,7 +236,7 @@ class TeamDeleteTool(Tool[TeamDeleteInput, Dict[str, Any]]):
                     Task.status != TaskStatus.COMPLETED
                 ).all()
                 if incomplete_tasks:
-                    return ToolResult.error(
+                    return ToolResult.fail(
                         ToolValidationError(
                             f"团队有 {len(incomplete_tasks)} 个未完成任务，设置 force=True 以强制删除"
                         )
@@ -270,7 +270,7 @@ class TeamDeleteTool(Tool[TeamDeleteInput, Dict[str, Any]]):
 
         except Exception as e:
             db.rollback()
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"删除团队失败: {str(e)}")
             )
         finally:
@@ -326,7 +326,7 @@ class TeamAddMemberTool(Tool[TeamAddMemberInput, Dict[str, Any]]):
             # Check if team exists
             team = db.query(Team).filter(Team.id == input_data.team_id).first()
             if not team:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"Team '{input_data.team_id}' not found")
                 )
 
@@ -336,7 +336,7 @@ class TeamAddMemberTool(Tool[TeamAddMemberInput, Dict[str, Any]]):
                 TeamMember.agent_id == input_data.agent_id
             ).first()
             if existing:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError("Agent is already a member of this team")
                 )
 
@@ -367,7 +367,7 @@ class TeamAddMemberTool(Tool[TeamAddMemberInput, Dict[str, Any]]):
 
         except Exception as e:
             db.rollback()
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"添加成员失败: {str(e)}")
             )
         finally:
@@ -442,7 +442,7 @@ class TeamRemoveMemberTool(Tool[TeamRemoveMemberInput, Dict[str, Any]]):
             # Check if team exists
             team = db.query(Team).filter(Team.id == input_data.team_id).first()
             if not team:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"Team '{input_data.team_id}' not found")
                 )
 
@@ -453,7 +453,7 @@ class TeamRemoveMemberTool(Tool[TeamRemoveMemberInput, Dict[str, Any]]):
             ).first()
 
             if not member:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError("Agent is not a member of this team")
                 )
 
@@ -475,7 +475,7 @@ class TeamRemoveMemberTool(Tool[TeamRemoveMemberInput, Dict[str, Any]]):
 
         except Exception as e:
             db.rollback()
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"移除成员失败: {str(e)}")
             )
         finally:
@@ -568,7 +568,7 @@ class TeamListTool(Tool[TeamListInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"获取团队列表失败: {str(e)}")
             )
         finally:
@@ -606,7 +606,7 @@ class TeamGetTool(Tool[TeamGetInput, Dict[str, Any]]):
         try:
             team = db.query(Team).filter(Team.id == input_data.team_id).first()
             if not team:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"Team '{input_data.team_id}' not found")
                 )
 
@@ -636,7 +636,7 @@ class TeamGetTool(Tool[TeamGetInput, Dict[str, Any]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"获取团队详情失败: {str(e)}")
             )
         finally:
@@ -675,7 +675,7 @@ class TeamGetStatusTool(Tool[TeamGetStatusInput, List[Dict[str, Any]]]):
         try:
             team = db.query(Team).filter(Team.id == input_data.team_id).first()
             if not team:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"Team '{input_data.team_id}' not found")
                 )
 
@@ -711,7 +711,7 @@ class TeamGetStatusTool(Tool[TeamGetStatusInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"获取团队成员状态失败: {str(e)}")
             )
         finally:

@@ -4,7 +4,6 @@
 提供Token计数、压缩策略和自动压缩功能
 """
 
-import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Callable
 from enum import Enum
@@ -140,7 +139,10 @@ class ContextCompactor:
         self.max_tokens = max_tokens
         self.strategy = strategy
         self.token_counter = token_counter or TokenCounter()
-        self.safety_margin = self.SAFETY_MARGIN
+        self.safety_margin = min(
+            self.SAFETY_MARGIN,
+            max(1, int(self.max_tokens * 0.1)),
+        )
 
     def _estimate_tokens(self, messages: List[Any]) -> int:
         """估算token数"""
@@ -162,7 +164,6 @@ class ContextCompactor:
 
     def _compress_truncate(self, messages: List[Any], target_tokens: int) -> CompressionResult:
         """截断压缩策略"""
-        original_count = len(messages)
         original_tokens = self._estimate_tokens(messages)
 
         compressed = []
@@ -202,7 +203,6 @@ class ContextCompactor:
 
     def _compress_remove_oldest(self, messages: List[Any], target_tokens: int) -> CompressionResult:
         """移除最早消息策略"""
-        original_count = len(messages)
         original_tokens = self._estimate_tokens(messages)
 
         # 保留系统消息

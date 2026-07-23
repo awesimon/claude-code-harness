@@ -190,14 +190,14 @@ class WebFetchTool(Tool[WebFetchInput, WebFetchOutput]):
             )
 
         except httpx.TimeoutException:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(
                     f"请求超时（{self.DEFAULT_TIMEOUT}秒）",
                     details={"timeout": self.DEFAULT_TIMEOUT, "url": url}
                 )
             )
         except httpx.HTTPStatusError as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(
                     f"HTTP 错误: {e.response.status_code}",
                     details={
@@ -208,14 +208,14 @@ class WebFetchTool(Tool[WebFetchInput, WebFetchOutput]):
                 )
             )
         except httpx.RequestError as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(
                     f"请求错误: {str(e)}",
                     details={"url": url, "error_type": "request_error"}
                 )
             )
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(
                     f"获取网页失败: {str(e)}",
                     details={

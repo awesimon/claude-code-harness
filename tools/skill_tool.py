@@ -371,7 +371,7 @@ class SkillExecuteTool(Tool[SkillExecuteInput, Dict[str, Any]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"执行技能失败: {str(e)}")
             )
 
@@ -452,7 +452,7 @@ class SkillListTool(Tool[SkillListInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"列出技能失败: {str(e)}")
             )
 

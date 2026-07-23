@@ -237,6 +237,7 @@ class TruncateHistoryRecovery(TokenRecoveryStrategy):
                 success=False,
                 action=RecoveryAction.ABORT,
                 message=f"History too short to truncate ({len(messages)} messages)",
+                new_request=request,
                 original_error=error,
                 attempts=1,
             )
@@ -250,6 +251,7 @@ class TruncateHistoryRecovery(TokenRecoveryStrategy):
                 success=False,
                 action=RecoveryAction.ABORT,
                 message="Not enough non-system messages to truncate",
+                new_request=request,
                 original_error=error,
                 attempts=1,
             )

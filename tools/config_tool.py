@@ -501,7 +501,7 @@ class ConfigGetTool(Tool[ConfigGetInput, ConfigGetOutput]):
                 )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"获取配置失败: {str(e)}")
             )
 
@@ -603,12 +603,12 @@ class ConfigSetTool(Tool[ConfigSetInput, ConfigSetOutput]):
                     }
                 )
             else:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolExecutionError(f"配置项 '{key}' 设置失败")
                 )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"设置配置失败: {str(e)}")
             )
 
@@ -722,7 +722,7 @@ class ConfigDeleteTool(Tool[ConfigDeleteInput, ConfigDeleteOutput]):
                 )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"删除配置失败: {str(e)}")
             )
 
@@ -828,7 +828,7 @@ class ConfigListTool(Tool[ConfigListInput, ConfigListOutput]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"列出配置失败: {str(e)}")
             )
 

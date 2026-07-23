@@ -5,29 +5,18 @@
 """
 
 import asyncio
+import time
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Callable, List, AsyncIterator, Union
 from enum import Enum, auto
 
 from .error_types import (
-    APIError,
     classify_error,
-    RecoverableError,
-    NonRecoverableError,
     TokenLimitError,
-    PromptTooLongError,
-    RateLimitError,
-    ServerError,
-    TimeoutError,
-    NetworkError,
 )
-from .retry_handler import RetryConfig, ExponentialBackoff, RetryContext
-from .token_recovery import (
-    TokenRecoveryManager,
-    TokenRecoveryResult,
-    RecoveryAction,
-)
+from .retry_handler import RetryConfig, ExponentialBackoff
+from .token_recovery import TokenRecoveryManager
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +86,7 @@ class CircuitBreaker:
         返回是否应该触发熔断
         """
         self.failure_count += 1
-        self.last_failure_time = asyncio.get_event_loop().time()
+        self.last_failure_time = time.monotonic()
 
         if self.failure_count >= self.threshold:
             self.state = "open"
@@ -111,7 +100,7 @@ class CircuitBreaker:
         elif self.state == "open":
             # 检查是否应该进入half-open
             if self.last_failure_time:
-                elapsed = asyncio.get_event_loop().time() - self.last_failure_time
+                elapsed = time.monotonic() - self.last_failure_time
                 if elapsed >= self.reset_timeout:
                     self.state = "half-open"
                     return True

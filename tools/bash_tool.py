@@ -6,9 +6,17 @@ Bash命令执行工具模块
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 import asyncio
-import shlex
 
-from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, ToolTimeoutError, register_tool
+from .base import (
+    Tool,
+    ToolError,
+    ToolExecutionError,
+    ToolPermissionError,
+    ToolResult,
+    ToolTimeoutError,
+    ToolValidationError,
+    register_tool,
+)
 
 
 @dataclass
@@ -119,9 +127,14 @@ class BashTool(Tool[BashInput, Dict[str, Any]]):
                     await process.wait()
                 except:
                     pass
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolTimeoutError(timeout)
                 )
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+                raise
 
             # 解析输出
             stdout_text = stdout.decode('utf-8', errors='replace') if stdout else ""
@@ -137,7 +150,7 @@ class BashTool(Tool[BashInput, Dict[str, Any]]):
             if process.returncode == 0:
                 return ToolResult.ok(
                     data=result,
-                    message=input_data.description or f"命令执行成功",
+                    message=input_data.description or "命令执行成功",
                     metadata={
                         "return_code": process.returncode,
                         "stdout_length": len(stdout_text),
@@ -156,7 +169,7 @@ class BashTool(Tool[BashInput, Dict[str, Any]]):
                 )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"执行命令失败: {str(e)}")
             )
 

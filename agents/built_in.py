@@ -129,8 +129,8 @@ EXPLORE_AGENT = BuiltInAgentDefinition(
         "\"quick\" for basic searches, \"medium\" for moderate exploration, or \"very thorough\" "
         "for comprehensive analysis across multiple locations and naming conventions."
     ),
-    tools=["Glob", "Grep", "Read", "Bash"],
-    disallowed_tools=["Agent", "ExitPlanMode", "Edit", "Write"],
+    tools=["glob", "grep", "read_file", "bash"],
+    disallowed_tools=["agent", "exit_plan_mode", "edit_file", "write_file"],
     source="built-in",
     base_dir="built-in",
     model="inherit",
@@ -146,8 +146,8 @@ PLAN_AGENT = BuiltInAgentDefinition(
         "to plan the implementation strategy for a task. Returns step-by-step plans, identifies "
         "critical files, and considers architectural trade-offs."
     ),
-    tools=["Glob", "Grep", "Read", "Bash"],
-    disallowed_tools=["Agent", "ExitPlanMode", "Edit", "Write"],
+    tools=["glob", "grep", "read_file", "bash"],
+    disallowed_tools=["agent", "exit_plan_mode", "edit_file", "write_file"],
     source="built-in",
     base_dir="built-in",
     model="inherit",
@@ -191,7 +191,7 @@ TEST_AGENT = BuiltInAgentDefinition(
         "Specialized agent for writing and running tests. Use this when you need to "
         "create unit tests, integration tests, or test fixtures."
     ),
-    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+    tools=["read_file", "write_file", "edit_file", "bash", "glob", "grep"],
     source="built-in",
     base_dir="built-in",
     model="inherit",
@@ -204,8 +204,8 @@ VERIFICATION_AGENT = BuiltInAgentDefinition(
         "Verification agent for checking implementation correctness. Use this when you "
         "need to verify that code changes meet requirements and follow best practices."
     ),
-    tools=["Read", "Bash", "Glob", "Grep"],
-    disallowed_tools=["Write", "Edit"],
+    tools=["read_file", "bash", "glob", "grep"],
+    disallowed_tools=["write_file", "edit_file"],
     source="built-in",
     base_dir="built-in",
     model="inherit",

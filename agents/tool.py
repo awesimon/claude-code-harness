@@ -3,10 +3,10 @@ Agent 工具模块
 实现 AgentTool，对齐 Claude Code 的 AgentTool.tsx
 """
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
-from tools.base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
+from tools.base import Tool, ToolResult, ToolValidationError, register_tool
 from agents.types import AgentExecutionConfig
 from agents.engine import get_agent_manager
 from agents.built_in import get_agent_by_type
@@ -110,12 +110,6 @@ Example usage:
         context: Dict[str, Any]
     ) -> tuple[bool, Optional[str]]:
         """检查权限"""
-        # 检查是否在 Fork 子Agent中（防止递归）
-        from agents.fork import is_in_fork_child
-
-        session_id = context.get("session_id")
-        # TODO: 获取会话消息并检查
-
         return True, None
 
     async def execute(self, input_data: AgentToolInput) -> ToolResult:
@@ -125,13 +119,17 @@ Example usage:
         这是 execute 方法的具体实现
         """
         prompt = input_data.prompt if hasattr(input_data, 'prompt') else input_data.get("prompt", "")
-        agent_type = input_data.subagent_type if hasattr(input_data, 'subagent_type') else input_data.get("subagent_type", "general-purpose")
+        agent_type = (
+            input_data.subagent_type
+            if hasattr(input_data, "subagent_type")
+            else input_data.get("subagent_type")
+        ) or "general-purpose"
 
         try:
             # 获取 Agent 定义
             agent_def = get_agent_by_type(agent_type)
             if not agent_def:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"Unknown agent type: {agent_type}")
                 )
 
@@ -144,16 +142,9 @@ Example usage:
                 is_async=False,
             )
 
-            # 获取执行器并执行
-            executor = self.manager._agents.get(agent_id)
-            if not executor:
-                return ToolResult.error(
-                    ToolExecutionError(f"Failed to create agent: {agent_id}")
-                )
+            result = await self.manager.wait_for_agent(agent_id)
 
-            result = await executor.execute()
-
-            return ToolResult.success({
+            return ToolResult.ok({
                 "agent_id": result.agent_id,
                 "agent_type": result.agent_type,
                 "content": result.content,
@@ -161,11 +152,12 @@ Example usage:
                 "total_duration_ms": result.total_duration_ms,
                 "total_tokens": result.total_tokens,
                 "usage": result.usage,
+                "termination_reason": result.termination_reason,
             })
 
         except Exception as e:
             logger.error(f"Agent tool execution failed: {e}")
-            return ToolResult.error(e)
+            return ToolResult.fail(e)
 
     def get_tool_result_for_llm(
         self,

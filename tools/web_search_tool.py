@@ -132,7 +132,7 @@ class WebSearchTool(Tool[WebSearchInput, WebSearchOutput]):
             )
 
         except httpx.HTTPStatusError as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(
                     f"搜索 API 请求失败: {e.response.status_code}",
                     details={
@@ -142,14 +142,14 @@ class WebSearchTool(Tool[WebSearchInput, WebSearchOutput]):
                 )
             )
         except httpx.RequestError as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(
                     f"搜索请求错误: {str(e)}",
                     details={"error_type": "request_error"}
                 )
             )
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(
                     f"搜索执行失败: {str(e)}",
                     details={"exception_type": type(e).__name__}

@@ -119,7 +119,7 @@ When in plan mode:
         """
         session_id = context.get("session_id")
         if not session_id:
-            return ToolResult.error(Exception("No session ID provided"))
+            return ToolResult.fail(Exception("No session ID provided"))
 
         try:
             result = await self.manager.enter_plan_mode(
@@ -127,17 +127,17 @@ When in plan mode:
                 previous_mode=context.get("current_mode", "default")
             )
 
-            return ToolResult.success({
+            return ToolResult.ok({
                 "message": result["message"],
                 "state": result["state"],
                 "plan_file_path": result.get("plan_file_path"),
             })
 
         except AlreadyInPlanModeError as e:
-            return ToolResult.error(e)
+            return ToolResult.fail(e)
         except Exception as e:
             logger.error(f"Error entering plan mode: {e}")
-            return ToolResult.error(e)
+            return ToolResult.fail(e)
 
     def get_tool_result_for_llm(
         self,
@@ -303,7 +303,7 @@ Once approved, you can start implementing the plan."""
         """
         session_id = context.get("session_id")
         if not session_id:
-            return ToolResult.error(Exception("No session ID provided"))
+            return ToolResult.fail(Exception("No session ID provided"))
 
         try:
             # 1. 提交计划等待审批
@@ -321,7 +321,7 @@ Once approved, you can start implementing the plan."""
             # 注意：实际的审批流程由前端/用户处理
             # 这里返回等待审批的状态
 
-            return ToolResult.success({
+            return ToolResult.ok({
                 "plan": plan_content,
                 "is_agent": False,  # 可以扩展支持Agent
                 "file_path": file_path,
@@ -335,7 +335,7 @@ Once approved, you can start implementing the plan."""
 
         except Exception as e:
             logger.error(f"Error exiting plan mode: {e}")
-            return ToolResult.error(e)
+            return ToolResult.fail(e)
 
     def get_tool_result_for_llm(
         self,

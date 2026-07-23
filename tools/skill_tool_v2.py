@@ -102,12 +102,12 @@ Example usage:
                     }
                 )
             else:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolExecutionError(result.error or "Unknown error")
                 )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"Failed to execute skill: {str(e)}")
             )
 
@@ -186,7 +186,7 @@ class SkillListToolV2(Tool[SkillListInput, List[Dict[str, Any]]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"Failed to list skills: {str(e)}")
             )
 
@@ -288,7 +288,7 @@ the agentskills.io standard protocol.
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"Failed to install skill: {str(e)}")
             )
 
@@ -358,12 +358,12 @@ class SkillUninstallToolV2(Tool[SkillUninstallInput, bool]):
                     metadata={"skill": skill_name}
                 )
             else:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolExecutionError(f"Failed to uninstall skill: {skill_name}")
                 )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"Failed to uninstall skill: {str(e)}")
             )
 

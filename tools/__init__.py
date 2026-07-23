@@ -23,13 +23,6 @@ __all__ = [
     # Bash工具
     "BashTool",
     "BashInput",
-    # Agent工具
-    "AgentTool",
-    "AgentListTool",
-    "AgentDestroyTool",
-    "AgentToolInput",
-    "AgentListInput",
-    "AgentDestroyInput",
     # 任务工具
     "TaskGetTool",
     "TaskCreateTool",
@@ -216,12 +209,6 @@ from .search_tools import GlobTool, GrepTool
 
 # Bash工具
 from .bash_tool import BashTool, BashInput
-
-# Agent工具
-from .agent_tool import (
-    AgentTool, AgentListTool, AgentDestroyTool,
-    AgentToolInput, AgentListInput, AgentDestroyInput,
-)
 
 # 任务工具
 from .task_tools import (

@@ -10,22 +10,21 @@ from typing import List, Dict, Any, Optional, AsyncIterator, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
+from pathlib import Path
 
 from services import LLMService, LLMProvider, Message, ChatCompletionRequest
 from services.error_recovery import (
     RecoveryManager,
     RecoveryConfig,
-    RecoveryResult,
     classify_for_user,
-    classify_error,
-    TokenLimitError,
     PromptTooLongError,
     RetryConfig,
 )
 from tools import ToolRegistry
-from tools.base import ToolResult
-from plan import get_plan_mode_manager, PlanModeState, NotInPlanModeError
+from tools.base import ToolResult, tool_flag
+from plan import get_plan_mode_manager, PlanModeState
 from agents import get_agent_manager, AgentExecutionConfig
+from harness import CancellationToken, PermissionMode, RuntimeContext, ToolRuntime
 
 # 启动时加载所有已安装的 skills
 from services.skill_manager import skill_manager
@@ -300,6 +299,9 @@ class QueryEngine:
         provider: Optional[LLMProvider] = None,
         model: Optional[str] = None,
         enable_error_recovery: bool = True,
+        workspace_root: Optional[Path] = None,
+        approval_callback: Optional[Callable[[Any], Any]] = None,
+        tool_timeout: Optional[float] = 60.0,
     ):
         self.llm_service = llm_service or LLMService()
         self.max_iterations = max_iterations
@@ -310,6 +312,11 @@ class QueryEngine:
         self._state_callbacks: List[Callable[[str, ConversationState, ConversationState], None]] = []
         self._plan_mode_manager = get_plan_mode_manager()
         self._agent_manager = get_agent_manager()
+        self.workspace_root = (workspace_root or Path.cwd()).resolve()
+        self.approval_callback = approval_callback
+        self.tool_timeout = tool_timeout
+        self._tool_runtime = ToolRuntime(ToolRegistry, default_timeout=tool_timeout)
+        self._cancellations: Dict[str, CancellationToken] = {}
 
         # 初始化错误恢复管理器
         self._recovery_manager: Optional[RecoveryManager] = None
@@ -379,6 +386,7 @@ class QueryEngine:
         import uuid
         cid = conversation_id or f"conv-{uuid.uuid4().hex[:8]}"
         self._conversations[cid] = ConversationContext(conversation_id=cid)
+        self._cancellations[cid] = CancellationToken()
         logger.info(f"Created conversation: {cid}")
         return cid
 
@@ -390,6 +398,9 @@ class QueryEngine:
         """删除对话"""
         if conversation_id in self._conversations:
             del self._conversations[conversation_id]
+            token = self._cancellations.pop(conversation_id, None)
+            if token:
+                token.cancel()
             # 清理计划模式相关数据
             self._plan_mode_manager.clear_session(conversation_id)
             logger.info(f"Deleted conversation: {conversation_id}")
@@ -407,7 +418,15 @@ class QueryEngine:
         在计划模式下过滤工具
         只允许只读工具：Read, Glob, Grep, Bash(只读命令)
         """
-        allowed_tools = {"Read", "Glob", "Grep", "Bash", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion"}
+        allowed_tools = {
+            "read_file",
+            "glob",
+            "grep",
+            "bash",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "ask_user_question",
+        }
 
         filtered = []
         for tool in tools:
@@ -419,19 +438,7 @@ class QueryEngine:
 
     def _build_tools_schema(self, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """构建工具 schema 列表"""
-        tools = []
-        for name in ToolRegistry.list_tools():
-            tool = ToolRegistry.get(name)
-            if tool:
-                schema = tool.get_schema()
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": schema["name"],
-                        "description": schema["description"],
-                        "parameters": schema.get("parameters", {"type": "object", "properties": {}})
-                    }
-                })
+        tools = [spec.to_openai() for spec in ToolRegistry.list_specs()]
 
         # 如果在计划模式下，过滤工具
         if conversation_id and self.is_in_plan_mode(conversation_id):
@@ -491,6 +498,7 @@ class QueryEngine:
                         self._call_llm_with_recovery,
                         llm_messages,
                         tools,
+                        temperature,
                     )
                     if result.success:
                         response = result.response
@@ -504,6 +512,7 @@ class QueryEngine:
                             tools=tools if tools else None,
                             tool_choice="auto" if tools else None,
                             provider=self.provider,
+                            temperature=temperature,
                         )
                     )
             except Exception as e:
@@ -589,7 +598,7 @@ class QueryEngine:
 
             # 检查是否是 ExitPlanMode 工具调用
             exit_plan_mode_called = any(
-                tc.name == "ExitPlanMode" for tc in tool_calls
+                ToolRegistry.resolve_name(tc.name) == "exit_plan_mode" for tc in tool_calls
             )
 
             # 添加工具观察消息
@@ -657,80 +666,60 @@ class QueryEngine:
         """
         async def execute_single(tool_call: ToolCall) -> ToolObservation:
             start_time = asyncio.get_event_loop().time()
-
-            tool = ToolRegistry.get(tool_call.name)
-            if not tool:
-                return ToolObservation(
-                    tool_call_id=tool_call.id,
-                    name=tool_call.name,
-                    result=ToolResult.error(
-                        Exception(f"Tool '{tool_call.name}' not found")
-                    ),
-                    execution_time=0
-                )
-
-            # 检查计划模式权限
-            if conversation_id and self.is_in_plan_mode(conversation_id):
-                # 在计划模式下，只允许只读工具
-                allowed_tools = {"Read", "Glob", "Grep", "Bash", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion"}
-                if tool_call.name not in allowed_tools:
-                    return ToolObservation(
-                        tool_call_id=tool_call.id,
-                        name=tool_call.name,
-                        result=ToolResult.error(
-                            Exception(
-                                f"Tool '{tool_call.name}' is not allowed in plan mode. "
-                                "Only read-only tools are permitted during planning."
-                            )
-                        ),
-                        execution_time=0
-                    )
-
-                # 对于 Bash 工具，需要额外检查命令
-                if tool_call.name == "Bash":
-                    args = tool_call.arguments
-                    command = args.get("command", "")
-                    # 检查是否是只读命令
-                    write_commands = ["touch", "mkdir", "rm", "cp", "mv", ">", ">>", "|", "git add", "git commit"]
-                    if any(cmd in command for cmd in write_commands):
-                        return ToolObservation(
-                            tool_call_id=tool_call.id,
-                            name=tool_call.name,
-                            result=ToolResult.error(
-                                Exception(
-                                    "Write operations are not allowed in plan mode. "
-                                    f"Command '{command}' contains write operations."
-                                )
-                            ),
-                            execution_time=0
-                        )
-
-            try:
-                # 构建工具上下文
-                tool_context = {
-                    "session_id": conversation_id,
-                    "current_mode": "plan" if (conversation_id and self.is_in_plan_mode(conversation_id)) else "default",
-                }
-                result = await tool.run(tool_call.arguments, tool_context)
-            except Exception as e:
-                result = ToolResult.error(
-                    Exception(f"Tool execution error: {str(e)}")
-                )
+            token = self._cancellations.setdefault(
+                conversation_id or "default",
+                CancellationToken(),
+            )
+            mode = (
+                PermissionMode.PLAN
+                if conversation_id and self.is_in_plan_mode(conversation_id)
+                else PermissionMode.DEFAULT
+            )
+            runtime_context = RuntimeContext(
+                session_id=conversation_id,
+                workspace_root=self.workspace_root,
+                permission_mode=mode,
+                approval_callback=self.approval_callback,
+                cancellation=token,
+                tool_timeout=self.tool_timeout,
+            )
+            execution = await self._tool_runtime.execute(
+                tool_call.name,
+                tool_call.arguments,
+                runtime_context,
+            )
 
             execution_time = asyncio.get_event_loop().time() - start_time
 
             return ToolObservation(
                 tool_call_id=tool_call.id,
-                name=tool_call.name,
-                result=result,
+                name=execution.tool_name,
+                result=execution.result,
                 execution_time=execution_time
             )
 
-        # 并行执行所有工具
-        tasks = [execute_single(tc) for tc in tool_calls]
-        observations = await asyncio.gather(*tasks)
+        observations: List[Optional[ToolObservation]] = [None] * len(tool_calls)
+        read_batch: List[tuple[int, ToolCall]] = []
 
-        return list(observations)
+        async def flush_read_batch() -> None:
+            if not read_batch:
+                return
+            results = await asyncio.gather(*(execute_single(call) for _, call in read_batch))
+            for (index, _), observation in zip(read_batch, results):
+                observations[index] = observation
+            read_batch.clear()
+
+        for index, tool_call in enumerate(tool_calls):
+            tool = ToolRegistry.get(tool_call.name)
+            read_only = bool(tool and tool_flag(tool, "is_read_only"))
+            if read_only:
+                read_batch.append((index, tool_call))
+                continue
+            await flush_read_batch()
+            observations[index] = await execute_single(tool_call)
+        await flush_read_batch()
+
+        return [observation for observation in observations if observation is not None]
 
     async def chat_stream(
         self,
@@ -874,7 +863,8 @@ class QueryEngine:
 
                     # 检查是否是 ExitPlanMode 工具调用
                     exit_plan_mode_called = any(
-                        tc.name == "ExitPlanMode" for tc in tool_calls
+                        ToolRegistry.resolve_name(tc.name) == "exit_plan_mode"
+                        for tc in tool_calls
                     )
 
                     # 添加工具观察消息
@@ -960,6 +950,7 @@ class QueryEngine:
         self,
         llm_messages: List[Message],
         tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: Optional[float] = None,
     ) -> Any:
         """LLM调用包装器 - 用于错误恢复机制"""
         request = ChatCompletionRequest(
@@ -968,6 +959,7 @@ class QueryEngine:
             tools=tools if tools else None,
             tool_choice="auto" if tools else None,
             provider=self.provider,
+            temperature=temperature,
         )
         return await self.llm_service.chat_completion(request)
 
@@ -1067,6 +1059,10 @@ class QueryEngine:
         if context:
             context.messages.clear()
             context.state = ConversationState.IDLE
+            token = self._cancellations.get(conversation_id)
+            if token:
+                token.cancel()
+            self._cancellations[conversation_id] = CancellationToken()
 
 
 # 全局 QueryEngine 实例

@@ -104,12 +104,12 @@ class NotebookEditTool(Tool[NotebookEditInput, Dict[str, Any]]):
             elif edit_mode == "delete":
                 result = await self._delete_cell(cells, input_data)
             else:
-                return ToolResult.error(
+                return ToolResult.fail(
                     ToolValidationError(f"不支持的编辑模式: {edit_mode}")
                 )
 
             if isinstance(result, ToolError):
-                return ToolResult.error(result)
+                return ToolResult.fail(result)
 
             # 更新 notebook
             notebook["cells"] = cells
@@ -139,7 +139,7 @@ class NotebookEditTool(Tool[NotebookEditInput, Dict[str, Any]]):
             )
 
         except Exception as e:
-            return ToolResult.error(
+            return ToolResult.fail(
                 ToolExecutionError(f"编辑 Notebook 失败: {str(e)}")
             )
 
