@@ -58,20 +58,24 @@ def _optional_json_object(value: Mapping[str, Any] | None, path: str) -> dict[st
 _SENSITIVE_TRACE_ERROR_KEYS = frozenset(
     {
         "authorization",
-        "proxy-authorization",
+        "proxyauthorization",
         "cookie",
-        "set-cookie",
-        "api_key",
-        "api-key",
-        "access_token",
-        "access-token",
-        "refresh_token",
-        "refresh-token",
+        "cookies",
+        "setcookie",
+        "apikey",
+        "xapikey",
+        "accesstoken",
+        "refreshtoken",
         "password",
         "secret",
         "token",
     }
 )
+_TRACE_HEADER_CONTAINER_KEYS = frozenset({"headers", "requestheaders", "responseheaders"})
+
+
+def _normalize_trace_error_key(key: str) -> str:
+    return "".join(character for character in key.casefold() if character.isalnum())
 
 
 def _sanitize_trace_error(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -84,7 +88,12 @@ def _sanitize_trace_error(value: Mapping[str, Any] | None) -> dict[str, Any] | N
     def sanitize(item: Any) -> Any:
         if isinstance(item, dict):
             return {
-                key: "[REDACTED]" if key.lower() in _SENSITIVE_TRACE_ERROR_KEYS else sanitize(value)
+                key: (
+                    "[REDACTED]"
+                    if _normalize_trace_error_key(key)
+                    in _SENSITIVE_TRACE_ERROR_KEYS | _TRACE_HEADER_CONTAINER_KEYS
+                    else sanitize(value)
+                )
                 for key, value in item.items()
             }
         if isinstance(item, list):

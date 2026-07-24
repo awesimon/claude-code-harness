@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, inspect, select, text, update
+from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, and_, inspect, or_, select, text, update
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from models import Base
@@ -376,7 +376,7 @@ class SQLAlchemyTraceSpanRepository:
         self._ensure_duration_column()
 
     def _ensure_duration_column(self) -> None:
-        """Add the duration field to trace tables created before this record existed."""
+        """Upgrade legacy trace rows with persisted duration and sanitized errors."""
 
         with self._session_factory() as db:
             bind = db.get_bind()
@@ -384,10 +384,38 @@ class SQLAlchemyTraceSpanRepository:
             if not inspector.has_table(RuntimeTraceSpan.__tablename__):
                 return
             columns = {column["name"] for column in inspector.get_columns(RuntimeTraceSpan.__tablename__)}
-            if "duration_ms" in columns:
-                return
             with db.begin():
-                db.execute(text("ALTER TABLE runtime_trace_spans ADD COLUMN duration_ms INTEGER"))
+                if "duration_ms" not in columns:
+                    db.execute(text("ALTER TABLE runtime_trace_spans ADD COLUMN duration_ms INTEGER"))
+                rows = db.scalars(
+                    select(RuntimeTraceSpan).where(
+                        or_(
+                            and_(
+                                RuntimeTraceSpan.status.in_(
+                                    [status.value for status in TRACE_TERMINAL_STATUSES]
+                                ),
+                                RuntimeTraceSpan.started_at.is_not(None),
+                                RuntimeTraceSpan.finished_at.is_not(None),
+                                RuntimeTraceSpan.duration_ms.is_(None),
+                            ),
+                            RuntimeTraceSpan.error_json.is_not(None),
+                        )
+                    )
+                ).all()
+                for row in rows:
+                    if (
+                        TraceSpanStatus(row.status) in TRACE_TERMINAL_STATUSES
+                        and row.started_at is not None
+                        and row.finished_at is not None
+                        and row.duration_ms is None
+                    ):
+                        row.duration_ms = int(
+                            (_as_utc(row.finished_at) - _as_utc(row.started_at)).total_seconds() * 1000
+                        )
+                    if row.error_json is not None:
+                        sanitized_error = _sanitize_trace_error(row.error_json)
+                        if sanitized_error != row.error_json:
+                            row.error_json = sanitized_error
 
     @staticmethod
     def _record(row: RuntimeTraceSpan) -> TraceSpanRecord:

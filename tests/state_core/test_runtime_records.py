@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -180,14 +181,28 @@ def test_trace_errors_are_sanitized_before_persistence(store: SQLAlchemyStateSto
         started.revision,
         error={
             "Authorization": "Bearer secret",
-            "context": {"api_key": "nested secret", "safe": "kept"},
+            "X-API-Key": "prefixed secret",
+            "context": {
+                "api_key": "nested secret",
+                "apiKey": "camel secret",
+                "cookies": "cookie secret",
+                "safe": "kept",
+            },
+            "requestHeaders": {"Authorization": "raw header secret"},
         },
     )
     persisted = store.traces.get(started.span_id)
 
     expected = {
         "Authorization": "[REDACTED]",
-        "context": {"api_key": "[REDACTED]", "safe": "kept"},
+        "X-API-Key": "[REDACTED]",
+        "context": {
+            "api_key": "[REDACTED]",
+            "apiKey": "[REDACTED]",
+            "cookies": "[REDACTED]",
+            "safe": "kept",
+        },
+        "requestHeaders": "[REDACTED]",
     }
     assert finished.error == expected
     assert persisted is not None
@@ -207,9 +222,53 @@ def test_trace_repository_adds_duration_column_to_existing_sqlite_table(tmp_path
                 "error_json JSON, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
             )
         )
+        connection.execute(
+            text(
+                "INSERT INTO runtime_trace_spans "
+                "(span_id, root_session_id, agent_id, parent_span_id, kind, name, status, revision, "
+                "started_at, finished_at, usage, error_json, created_at, updated_at) "
+                "VALUES (:span_id, :root_session_id, :agent_id, :parent_span_id, :kind, :name, "
+                ":status, :revision, :started_at, :finished_at, :usage, :error_json, :created_at, "
+                ":updated_at)"
+            ),
+            {
+                "span_id": "legacy-completed",
+                "root_session_id": "root-1",
+                "agent_id": None,
+                "parent_span_id": None,
+                "kind": "tool",
+                "name": "legacy request",
+                "status": "completed",
+                "revision": 1,
+                "started_at": "2026-07-24 00:00:00.100000",
+                "finished_at": "2026-07-24 00:00:02.600000",
+                "usage": "{}",
+                "error_json": json.dumps(
+                    {
+                        "Authorization": "Bearer legacy-secret",
+                        "X-API-Key": "legacy-api-key",
+                        "context": {"apiKey": "legacy-camel-key"},
+                        "responseHeaders": {"Set-Cookie": "legacy-cookie"},
+                    }
+                ),
+                "created_at": "2026-07-24 00:00:00.100000",
+                "updated_at": "2026-07-24 00:00:02.600000",
+            },
+        )
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
 
     store = SQLAlchemyStateStore(session_factory)
+    with engine.connect() as connection:
+        migrated = connection.execute(
+            text("SELECT duration_ms, error_json FROM runtime_trace_spans WHERE span_id = 'legacy-completed'")
+        ).one()
+    assert migrated.duration_ms == 2500
+    physical_error = str(migrated.error_json)
+    assert "legacy-secret" not in physical_error
+    assert "legacy-api-key" not in physical_error
+    assert "legacy-camel-key" not in physical_error
+    assert "legacy-cookie" not in physical_error
+
     started = store.traces.start(
         TraceSpanRecord(span_id="legacy-span", root_session_id="root-1", kind="tool", name="request")
     )
