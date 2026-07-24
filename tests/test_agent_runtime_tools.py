@@ -10,6 +10,7 @@ from harness import AgentScheduler, SessionHarnessFactory
 from models import Base
 from state_core import SQLAlchemyStateStore, SessionRuntimeFactory
 from tools.agent_runtime_tools import AgentTool, TaskOutputTool, TaskStopTool
+from tools.agent_runtime_tools import AgentDestroyTool, AgentListTool
 from tools.base import ToolRegistry
 
 
@@ -226,6 +227,18 @@ def test_agent_runtime_tool_aliases_resolve_to_canonical_tools() -> None:
 
     for alias, canonical in expected.items():
         assert ToolRegistry.resolve_name(alias) == canonical
+
+
+def test_legacy_agent_tool_module_reexports_canonical_tools() -> None:
+    from tools.agent_tool import (
+        AgentDestroyTool as LegacyAgentDestroyTool,
+        AgentListTool as LegacyAgentListTool,
+        AgentTool as LegacyAgentTool,
+    )
+
+    assert LegacyAgentTool is AgentTool
+    assert LegacyAgentListTool is AgentListTool
+    assert LegacyAgentDestroyTool is AgentDestroyTool
 
 
 @pytest.mark.asyncio

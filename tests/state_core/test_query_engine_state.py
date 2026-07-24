@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 from agents import AgentExecutionResult
 from harness import AgentScheduler
 from models import Base
-from query_engine import QueryEngine, ToolObservation
+from query_engine import QueryEngine, ToolCall, ToolObservation
 from services.llm_service import ChatCompletionResponse
 from state_core import EventType, SessionRuntimeFactory, SQLAlchemyStateStore, TaskMode
 from tools.base import ToolResult
@@ -168,6 +168,8 @@ def test_query_engine_exposes_exactly_one_task_mode(
     assert "todo_write" in todo_names
     assert "task_create" not in todo_names
 
+    assert {"agent", "task_output", "task_stop"}.issubset(todo_names)
+
 
 def test_query_engine_uses_session_harness_as_only_runtime_lookup(
     runtime_factory: SessionRuntimeFactory, tmp_path: Path
@@ -267,6 +269,45 @@ async def test_query_engine_abort_delegates_to_session_scheduler(
 
     assert engine.get_agent_status(agent_id)["status"] == "cancelled"
     runner.release.set()
+    await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_query_engine_agent_tool_executes_with_active_harness(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    class CompletingRunner:
+        async def run(self, record, child_harness):
+            return AgentExecutionResult(content="done", output="done")
+
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("agent-tool-root")
+    scheduler = AgentScheduler(
+        engine._session_harness("agent-tool-root"), runner=CompletingRunner()
+    )
+
+    observations = await engine._execute_tools(
+        [
+            ToolCall(
+                id="agent-call",
+                name="agent",
+                arguments={
+                    "prompt": "inspect",
+                    "description": "Inspect",
+                    "subagent_type": "Explore",
+                },
+            )
+        ],
+        "agent-tool-root",
+    )
+
+    assert observations[0].result.success
+    assert observations[0].result.data["status"] == "completed"
     await scheduler.shutdown()
 
 
