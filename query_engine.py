@@ -35,7 +35,7 @@ from state_core import (
     PlanState as PlanModeState,
 )
 from tools import ToolRegistry
-from tools.base import ToolResult, tool_flag
+from tools.base import ToolResult, to_json_value, tool_flag
 
 skill_manager.load_all_skills()
 
@@ -705,21 +705,10 @@ class QueryEngine:
             self._update_state(context, ConversationState.TOOL_CALLING)
             yield {"type": "state_change", "state": "tool_calling"}
 
-            observations = await self._execute_tools(tool_calls, conversation_id)
-            for observation in observations:
-                session_runtime.append_event(
-                    EventType.TOOL_RESULT,
-                    {
-                        "toolCallId": observation.tool_call_id,
-                        "name": observation.name,
-                        "success": observation.result.success,
-                        "result": (
-                            observation.result.data
-                            if observation.result.success
-                            else str(observation.result.error)
-                        ),
-                    },
-                )
+            observations = self._record_tool_observations(
+                session_runtime,
+                await self._execute_tools(tool_calls, conversation_id),
+            )
 
             # 检查是否是 ExitPlanMode 工具调用
             exit_plan_mode_called = any(
@@ -735,24 +724,12 @@ class QueryEngine:
 
             # 发送工具结果
             for obs in observations:
-                # 将工具结果转换为可序列化的格式
-                result_data = obs.result.data
-                if hasattr(result_data, '__dataclass_fields__'):
-                    # 如果是 dataclass，转换为字典
-                    result_data = {
-                        k: getattr(result_data, k)
-                        for k in result_data.__dataclass_fields__.keys()
-                    }
-                elif not isinstance(result_data, (str, int, float, bool, list, dict, type(None))):
-                    # 其他非基本类型，转为字符串
-                    result_data = str(result_data)
-
                 yield {
                     "type": "tool_result",
                     "tool_call_id": obs.tool_call_id,
                     "name": obs.name,
                     "success": obs.result.success,
-                    "result": result_data if obs.result.success else str(obs.result.error),
+                    "result": obs.result.data if obs.result.success else str(obs.result.error),
                     "execution_time": obs.execution_time
                 }
 
@@ -851,6 +828,47 @@ class QueryEngine:
         await flush_read_batch()
 
         return [observation for observation in observations if observation is not None]
+
+    @staticmethod
+    def _record_tool_observations(
+        session_runtime: SessionRuntime,
+        observations: List[ToolObservation],
+    ) -> List[ToolObservation]:
+        """Normalize tool output before it enters transcript or transport state."""
+
+        normalized: List[ToolObservation] = []
+        for observation in observations:
+            result = observation.result
+            if result.success:
+                result = ToolResult.ok(
+                    to_json_value(result.data, "tool result"),
+                    message=result.message,
+                    metadata=result.metadata,
+                )
+            normalized.append(
+                ToolObservation(
+                    tool_call_id=observation.tool_call_id,
+                    name=observation.name,
+                    result=result,
+                    execution_time=observation.execution_time,
+                )
+            )
+
+        for observation in normalized:
+            session_runtime.append_event(
+                EventType.TOOL_RESULT,
+                {
+                    "toolCallId": observation.tool_call_id,
+                    "name": observation.name,
+                    "success": observation.result.success,
+                    "result": (
+                        observation.result.data
+                        if observation.result.success
+                        else str(observation.result.error)
+                    ),
+                },
+            )
+        return normalized
 
     async def chat_stream(
         self,
@@ -1005,21 +1023,10 @@ class QueryEngine:
                     self._update_state(context, ConversationState.TOOL_CALLING)
                     yield {"type": "state_change", "state": "tool_calling"}
 
-                    observations = await self._execute_tools(tool_calls, conversation_id)
-                    for observation in observations:
-                        session_runtime.append_event(
-                            EventType.TOOL_RESULT,
-                            {
-                                "toolCallId": observation.tool_call_id,
-                                "name": observation.name,
-                                "success": observation.result.success,
-                                "result": (
-                                    observation.result.data
-                                    if observation.result.success
-                                    else str(observation.result.error)
-                                ),
-                            },
-                        )
+                    observations = self._record_tool_observations(
+                        session_runtime,
+                        await self._execute_tools(tool_calls, conversation_id),
+                    )
 
                     # 检查是否是 ExitPlanMode 工具调用
                     exit_plan_mode_called = any(
@@ -1036,24 +1043,16 @@ class QueryEngine:
 
                     # 发送工具结果
                     for obs in observations:
-                        # 将工具结果转换为可序列化的格式
-                        result_data = obs.result.data
-                        if hasattr(result_data, '__dataclass_fields__'):
-                            # 如果是 dataclass，转换为字典
-                            result_data = {
-                                k: getattr(result_data, k)
-                                for k in result_data.__dataclass_fields__.keys()
-                            }
-                        elif not isinstance(result_data, (str, int, float, bool, list, dict, type(None))):
-                            # 其他非基本类型，转为字符串
-                            result_data = str(result_data)
-
                         yield {
                             "type": "tool_result",
                             "tool_call_id": obs.tool_call_id,
                             "name": obs.name,
                             "success": obs.result.success,
-                            "result": result_data if obs.result.success else str(obs.result.error),
+                            "result": (
+                                obs.result.data
+                                if obs.result.success
+                                else str(obs.result.error)
+                            ),
                             "execution_time": obs.execution_time
                         }
 
