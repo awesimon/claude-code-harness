@@ -21,8 +21,14 @@ class CancellationToken:
         self._event = asyncio.Event()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._callbacks: set[Callable[[], None]] = set()
+        self._parent = parent
         if parent is not None:
             parent.add_callback(self.cancel)
+
+    @property
+    def parent(self) -> Optional["CancellationToken"]:
+        """The token whose cancellation propagates to this token."""
+        return self._parent
 
     @property
     def cancelled(self) -> bool:
@@ -71,13 +77,18 @@ class RuntimeContext:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def child(self, **overrides: Any) -> "RuntimeContext":
+        metadata_overrides = overrides.pop("metadata", {})
+        if not isinstance(metadata_overrides, dict):
+            raise TypeError("RuntimeContext.child metadata must be a dictionary")
+        if "cancellation" in overrides:
+            raise TypeError("RuntimeContext.child always derives its cancellation token")
         values = {
             "session_id": self.session_id,
             "workspace_root": self.workspace_root,
             "permission_mode": self.permission_mode,
             "approval_callback": self.approval_callback,
             "tool_timeout": self.tool_timeout,
-            "metadata": dict(self.metadata),
+            "metadata": {**self.metadata, **metadata_overrides},
         }
         values.update(overrides)
         values["cancellation"] = CancellationToken(parent=self.cancellation)
