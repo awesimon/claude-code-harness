@@ -9,12 +9,12 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from agents import AgentExecutionResult
-from harness import AgentScheduler
+from harness import AgentScheduler, ToolRuntime
 from models import Base
 from query_engine import QueryEngine, ToolCall, ToolObservation
 from services.llm_service import ChatCompletionResponse
 from state_core import EventType, SessionRuntimeFactory, SQLAlchemyStateStore, TaskMode
-from tools.base import ToolResult
+from tools.base import Tool, ToolResult
 from tools.web_search_tool import WebSearchOutput
 
 
@@ -90,17 +90,45 @@ class MalformedStreamingToolCallingLLM:
 
 class WebSearchResultEngine(QueryEngine):
     async def _execute_tools(self, tool_calls, conversation_id=None):
-        return [
-            ToolObservation(
-                tool_call_id=tool_calls[0].id,
-                name="web_search",
-                result=ToolResult.ok(
+        class OutputTool(Tool[dict, dict]):
+            name = "web_search"
+            input_type = dict
+
+            async def execute(self, input_data):
+                return ToolResult.ok(
                     WebSearchOutput(
                         query="python",
                         results=[{"title": "Python", "url": "https://python.org"}],
                         duration_seconds=0.25,
                     )
-                ),
+                )
+
+            def is_read_only(self):
+                return True
+
+        class Registry:
+            tool = OutputTool()
+
+            @classmethod
+            def resolve_name(cls, name):
+                return "web_search" if name == "web_search" else None
+
+            @classmethod
+            def get(cls, name):
+                return cls.tool if name == "web_search" else None
+
+        harness = self._session_harness(conversation_id)
+        execution = await ToolRuntime(Registry).execute(
+            "web_search",
+            tool_calls[0].arguments,
+            harness.runtime_context,
+            tool_call_id=tool_calls[0].id,
+        )
+        return [
+            ToolObservation(
+                tool_call_id=tool_calls[0].id,
+                name="web_search",
+                result=execution.result,
                 execution_time=0.25,
             )
         ]

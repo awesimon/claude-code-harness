@@ -241,7 +241,7 @@ async def test_explicit_child_timeout_none_disables_shared_default(
         "slow_harness", {}, disabled.runtime_context
     )
 
-    assert timed_out.termination_reason.value == "timeout"
+    assert timed_out.termination_reason.value == "timed_out"
     assert completed.result.success
 
 

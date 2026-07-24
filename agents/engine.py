@@ -277,7 +277,10 @@ class AgentExecutor:
                         }
                     else:
                         execution = await child_harness.tool_runtime.execute(
-                            tool_name, arguments, child_harness.runtime_context
+                            tool_name,
+                            arguments,
+                            child_harness.runtime_context,
+                            tool_call_id=tool_call_id or None,
                         )
                         if execution.termination_reason.value == "cancelled":
                             raise asyncio.CancelledError

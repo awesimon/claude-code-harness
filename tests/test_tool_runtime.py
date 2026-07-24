@@ -97,7 +97,7 @@ class ContextProbeTool(Tool[ValueInput, dict]):
                 "session_id": context["session_id"],
                 "current_mode": context["current_mode"],
                 "workspace_root": context["workspace_root"],
-                "runtime_context": context["runtime_context"],
+                "runtime_context_id": id(context["runtime_context"]),
             }
         )
 
@@ -200,24 +200,22 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(denied.termination_reason, TerminationReason.PERMISSION_DENIED)
 
     async def test_workspace_boundary_covers_working_directory(self):
-        runtime = ToolRuntime(registry=LocalRegistry(WriteTool()))
+        runtime = ToolRuntime(registry=LocalRegistry(BashTool()))
         context = RuntimeContext(
             workspace_root=self.workspace,
             permission_mode=PermissionMode.BYPASS,
         )
 
         execution = await runtime.execute(
-            "write_test",
-            {"working_dir": str(self.workspace.parent)},
+            "bash",
+            {"command": "pwd", "working_dir": str(self.workspace.parent)},
             context,
         )
 
         self.assertEqual(execution.termination_reason, TerminationReason.PERMISSION_DENIED)
 
     async def test_workspace_boundary_rejects_explicit_external_bash_path(self):
-        bash = WriteTool()
-        bash.name = "bash"
-        runtime = ToolRuntime(registry=LocalRegistry(bash))
+        runtime = ToolRuntime(registry=LocalRegistry(BashTool()))
         context = RuntimeContext(
             workspace_root=self.workspace,
             permission_mode=PermissionMode.BYPASS,
@@ -307,7 +305,7 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(execution.result.data["session_id"], "actual-session")
         self.assertEqual(execution.result.data["current_mode"], "bypass")
         self.assertEqual(execution.result.data["workspace_root"], str(self.workspace))
-        self.assertIs(execution.result.data["runtime_context"], context)
+        self.assertEqual(execution.result.data["runtime_context_id"], id(context))
 
     async def test_relative_tool_paths_are_resolved_from_workspace(self):
         runtime = ToolRuntime(registry=LocalRegistry(PathEchoTool()))

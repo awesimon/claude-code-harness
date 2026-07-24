@@ -36,7 +36,7 @@ from state_core import (
     PlanState as PlanModeState,
 )
 from tools import ToolRegistry
-from tools.base import ToolResult, to_json_value, tool_flag
+from tools.base import ToolResult, tool_flag
 
 skill_manager.load_all_skills()
 
@@ -719,15 +719,6 @@ class QueryEngine:
                 EventType.ASSISTANT_MESSAGE,
                 {"content": response.content or "", "thinking": response.reasoning_content},
             )
-            for tool_call in tool_calls:
-                session_runtime.append_event(
-                    EventType.TOOL_CALL,
-                    {
-                        "toolCallId": tool_call.id,
-                        "name": tool_call.name,
-                        "input": tool_call.arguments,
-                    },
-                )
 
             # 发送助手消息（带工具调用意图）
             yield {
@@ -827,6 +818,7 @@ class QueryEngine:
                 tool_call.name,
                 tool_call.arguments,
                 runtime_context,
+                tool_call_id=tool_call.id,
             )
 
             execution_time = asyncio.get_event_loop().time() - start_time
@@ -866,41 +858,10 @@ class QueryEngine:
         session_runtime: SessionRuntime,
         observations: List[ToolObservation],
     ) -> List[ToolObservation]:
-        """Normalize tool output before it enters transcript or transport state."""
+        """Compatibility boundary; ToolRuntime already normalized and persisted."""
 
-        normalized: List[ToolObservation] = []
-        for observation in observations:
-            result = observation.result
-            if result.success:
-                result = ToolResult.ok(
-                    to_json_value(result.data, "tool result"),
-                    message=result.message,
-                    metadata=result.metadata,
-                )
-            normalized.append(
-                ToolObservation(
-                    tool_call_id=observation.tool_call_id,
-                    name=observation.name,
-                    result=result,
-                    execution_time=observation.execution_time,
-                )
-            )
-
-        for observation in normalized:
-            session_runtime.append_event(
-                EventType.TOOL_RESULT,
-                {
-                    "toolCallId": observation.tool_call_id,
-                    "name": observation.name,
-                    "success": observation.result.success,
-                    "result": (
-                        observation.result.data
-                        if observation.result.success
-                        else str(observation.result.error)
-                    ),
-                },
-            )
-        return normalized
+        del session_runtime
+        return observations
 
     async def chat_stream(
         self,
@@ -1032,15 +993,6 @@ class QueryEngine:
                         EventType.ASSISTANT_MESSAGE,
                         {"content": full_content or "", "thinking": full_thinking or None},
                     )
-                    for tool_call in tool_calls:
-                        session_runtime.append_event(
-                            EventType.TOOL_CALL,
-                            {
-                                "toolCallId": tool_call.id,
-                                "name": tool_call.name,
-                                "input": tool_call.arguments,
-                            },
-                        )
 
                     # 发送工具调用事件
                     yield {
