@@ -26,6 +26,13 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from models import Base
 
+from .sqlalchemy_runtime import (
+    SQLAlchemyAgentRepository,
+    SQLAlchemyRuntimeMetadataRepository,
+    SQLAlchemyTraceSpanRepository,
+    SQLAlchemyWorktreeRepository,
+)
+
 from .types import (
     ClaimResult,
     CommitResult,
@@ -592,3 +599,7 @@ class SQLAlchemyStateStore:
     def __init__(self, session_factory: SessionFactory) -> None:
         self.states = SQLAlchemyStateRepository(session_factory)
         self.tasks = SQLAlchemyTaskRepository(session_factory)
+        self.agents = SQLAlchemyAgentRepository(session_factory)
+        self.metadata = SQLAlchemyRuntimeMetadataRepository(session_factory)
+        self.traces = SQLAlchemyTraceSpanRepository(session_factory)
+        self.worktrees = SQLAlchemyWorktreeRepository(session_factory)

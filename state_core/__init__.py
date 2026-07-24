@@ -2,6 +2,23 @@
 
 from .migration import migrate_legacy_session
 from .repository import StateRepository, TaskRepository
+from .runtime_records import (
+    AgentRecord,
+    AgentRepository,
+    AgentStatus,
+    AgentTerminationReason,
+    InvalidAgentTransition,
+    InvalidWorktreeTransition,
+    RuntimeMetadataRecord,
+    RuntimeMetadataRepository,
+    RuntimeRecordRevisionConflict,
+    TraceSpanRecord,
+    TraceSpanRepository,
+    TraceSpanStatus,
+    WorktreeRecord,
+    WorktreeRepository,
+    WorktreeStatus,
+)
 from .runtime import SessionRuntime, SessionRuntimeFactory
 from .sqlalchemy_store import (
     SQLAlchemyStateRepository,
@@ -34,8 +51,14 @@ from .types import (
 __all__ = [
     "ClaimResult",
     "CommitResult",
+    "AgentRecord",
+    "AgentRepository",
+    "AgentStatus",
+    "AgentTerminationReason",
     "EventType",
     "InvalidTaskDependency",
+    "InvalidAgentTransition",
+    "InvalidWorktreeTransition",
     "InvalidTransition",
     "migrate_legacy_session",
     "NewTask",
@@ -44,6 +67,9 @@ __all__ = [
     "Plan",
     "PlanState",
     "RevisionConflict",
+    "RuntimeMetadataRecord",
+    "RuntimeMetadataRepository",
+    "RuntimeRecordRevisionConflict",
     "SessionEvent",
     "SessionRuntime",
     "SessionRuntimeFactory",
@@ -60,4 +86,10 @@ __all__ = [
     "TaskMutation",
     "TaskRepository",
     "TaskStatus",
+    "TraceSpanRecord",
+    "TraceSpanRepository",
+    "TraceSpanStatus",
+    "WorktreeRecord",
+    "WorktreeRepository",
+    "WorktreeStatus",
 ]
