@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from typing import Any
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+import harness.agents as scheduler_module
 from agents.built_in import EXPLORE_AGENT
 from agents.engine import AgentExecutor
 from agents.types import (
+    AgentDefinitionError,
     AgentExecutionResult,
+    AgentHooks,
     AgentRequest,
     CustomAgentDefinition,
 )
@@ -20,6 +26,8 @@ from harness.agents import (
     AgentNotFound,
     AgentOwnershipError,
     AgentScheduler,
+    AgentSchedulerAlreadyActive,
+    AgentSchedulerDegraded,
     AgentWaitTimeout,
 )
 from models import Base
@@ -73,9 +81,29 @@ def make_harness(tmp_path: Path, session_id: str = "root"):
 
 
 async def wait_until(predicate, timeout: float = 1.0) -> None:
-    async with asyncio.timeout(timeout):
+    async def poll() -> None:
         while not predicate():
             await asyncio.sleep(0)
+
+    await asyncio.wait_for(poll(), timeout)
+
+
+def create_running_parent(harness, agent_id: str, *, root: str | None = None):
+    record = harness.store.agents.create(
+        AgentRecord(
+            agent_id,
+            root or harness.root_session_id,
+            "Explore",
+            "parent",
+            "parent",
+            True,
+            str(harness.effective_cwd),
+            {},
+        )
+    )
+    return harness.store.agents.transition(
+        record.agent_id, AgentStatus.RUNNING, record.revision
+    )
 
 
 @pytest.mark.asyncio
@@ -127,6 +155,7 @@ async def test_fresh_scheduler_reads_completed_history(tmp_path: Path) -> None:
     runner.release.set()
     first = AgentScheduler(harness, harness.store.agents, runner=runner)
     completed = await first.spawn(AgentRequest("inspect", "Explore", "find files"))
+    await first.shutdown()
 
     fresh_store = SQLAlchemyStateStore(session_factory)
     resumed = AgentScheduler(harness, fresh_store.agents, runner=ControlledRunner())
@@ -143,7 +172,10 @@ async def test_fresh_scheduler_waits_for_other_live_scheduler(tmp_path: Path) ->
     record = await owner.spawn(AgentRequest("live", "Explore", "d", background=True))
     await runner.started.wait()
     fresh_repository = SQLAlchemyStateStore(session_factory).agents
-    observer = AgentScheduler(harness, fresh_repository, runner=ControlledRunner())
+    observer = AgentScheduler.for_harness(
+        harness, fresh_repository, runner=ControlledRunner()
+    )
+    assert observer is owner
 
     waiter = asyncio.create_task(observer.wait(record.agent_id, timeout=1))
     await asyncio.sleep(0)
@@ -151,6 +183,127 @@ async def test_fresh_scheduler_waits_for_other_live_scheduler(tmp_path: Path) ->
     runner.release.set()
 
     assert (await waiter).status is AgentStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_single_scheduler_owner_rejects_direct_duplicate_and_routes_factory(
+    tmp_path: Path,
+) -> None:
+    harness, session_factory = make_harness(tmp_path)
+    owner_runner = ControlledRunner()
+    owner = AgentScheduler(
+        harness,
+        harness.store.agents,
+        runner=owner_runner,
+        root_concurrency=1,
+    )
+    duplicate_runner = ControlledRunner()
+    repository = SQLAlchemyStateStore(session_factory).agents
+
+    with pytest.raises(AgentSchedulerAlreadyActive):
+        AgentScheduler(harness, repository, runner=duplicate_runner)
+    routed = AgentScheduler.for_harness(
+        harness, repository, runner=duplicate_runner, root_concurrency=99
+    )
+    assert routed is owner
+
+    first = await routed.spawn(
+        AgentRequest("first", "Explore", "d", background=True)
+    )
+    await owner_runner.started.wait()
+    second = await routed.spawn(
+        AgentRequest("second", "Explore", "d", background=True)
+    )
+    await asyncio.sleep(0)
+    assert [record.prompt for record, _ in owner_runner.calls] == ["first"]
+    assert duplicate_runner.calls == []
+
+    await routed.stop(first.agent_id)
+    owner_runner.release.set()
+    await routed.wait(second.agent_id)
+    await owner.shutdown()
+
+
+def test_concurrent_direct_construction_registers_exactly_one_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness, _ = make_harness(tmp_path)
+    ready = Barrier(2)
+    original_owner_key = scheduler_module._owner_key
+    original_semaphore = asyncio.BoundedSemaphore
+
+    def synchronized_owner_key(harness, repository):
+        key = original_owner_key(harness, repository)
+        ready.wait(timeout=1)
+        return key
+
+    def slow_semaphore(value):
+        time.sleep(0.05)
+        return original_semaphore(value)
+
+    monkeypatch.setattr(scheduler_module, "_owner_key", synchronized_owner_key)
+    monkeypatch.setattr(asyncio, "BoundedSemaphore", slow_semaphore)
+
+    def construct():
+        try:
+            return AgentScheduler(
+                harness, harness.store.agents, runner=ControlledRunner()
+            )
+        except BaseException as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = [future.result() for future in [executor.submit(construct) for _ in range(2)]]
+
+    owners = [result for result in results if isinstance(result, AgentScheduler)]
+    errors = [result for result in results if isinstance(result, BaseException)]
+    assert len(owners) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], AgentSchedulerAlreadyActive)
+    asyncio.run(owners[0].shutdown())
+
+
+def test_repository_adapters_over_one_harness_store_fail_closed(
+    tmp_path: Path,
+) -> None:
+    harness, _ = make_harness(tmp_path)
+
+    class RepositoryAdapter:
+        def __init__(self, repository) -> None:
+            self.repository = repository
+
+        def create(self, record):
+            return self.repository.create(record)
+
+        def get(self, agent_id):
+            return self.repository.get(agent_id)
+
+        def list(self, root_session_id, **filters):
+            return self.repository.list(root_session_id, **filters)
+
+        def transition(self, agent_id, status, expected_revision, **fields):
+            return self.repository.transition(
+                agent_id, status, expected_revision, **fields
+            )
+
+        def reconcile(self, root_session_id, live_agent_ids):
+            return self.repository.reconcile(root_session_id, live_agent_ids)
+
+    owner = AgentScheduler(
+        harness, RepositoryAdapter(harness.store.agents), runner=ControlledRunner()
+    )
+    duplicate = None
+    try:
+        with pytest.raises(AgentSchedulerAlreadyActive):
+            duplicate = AgentScheduler(
+                harness,
+                RepositoryAdapter(harness.store.agents),
+                runner=ControlledRunner(),
+            )
+    finally:
+        if duplicate is not None:
+            asyncio.run(duplicate.shutdown())
+        asyncio.run(owner.shutdown())
 
 
 @pytest.mark.asyncio
@@ -182,8 +335,7 @@ async def test_reconcile_scopes_root_and_preserves_live_and_terminal(tmp_path: P
     )
     await live_runner.started.wait()
 
-    scheduler = AgentScheduler(harness, repository, runner=ControlledRunner())
-    changed = scheduler.reconcile()
+    changed = other_scheduler.reconcile()
     assert {item.agent_id for item in changed} == {
         stale_pending.agent_id,
         stale_running.agent_id,
@@ -227,6 +379,8 @@ async def test_nested_parent_root_and_child_todo_scope(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_root_and_per_parent_concurrency_limits(tmp_path: Path) -> None:
     root, _ = make_harness(tmp_path)
+    for parent in ("a", "b", "c"):
+        create_running_parent(root, parent)
     runner = ControlledRunner()
     scheduler = AgentScheduler(
         root,
@@ -286,6 +440,7 @@ async def test_running_stop_cooperative_force_and_idempotent(tmp_path: Path) -> 
     cancelled = await cooperative.stop(first.agent_id)
     assert cancelled.status is AgentStatus.CANCELLED
     assert await cooperative.stop(first.agent_id) == cancelled
+    await cooperative.shutdown()
 
     blocker = ControlledRunner()
     forced = AgentScheduler(root, root.store.agents, runner=blocker, stop_grace=0.01)
@@ -326,6 +481,53 @@ async def test_runner_terminal_mappings(
     if status is AgentStatus.FAILED:
         assert result.error["type"] == "RuntimeError"  # type: ignore[index]
         assert "secret" not in result.error["message"]  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_unknown_runner_termination_reason_fails_closed(tmp_path: Path) -> None:
+    root, _ = make_harness(tmp_path)
+
+    class UnknownReasonRunner:
+        async def run(self, record, child):
+            return AgentExecutionResult(
+                content="unexpected", termination_reason="made_up_reason"
+            )
+
+    scheduler = AgentScheduler(
+        root, root.store.agents, runner=UnknownReasonRunner()
+    )
+
+    result = await scheduler.spawn(AgentRequest("unknown", "Explore", "d"))
+
+    assert result.status is AgentStatus.FAILED
+    assert result.termination_reason is AgentTerminationReason.FAILED
+
+
+@pytest.mark.asyncio
+async def test_scheduler_error_credentials_are_absent_from_record_and_raw_sql(
+    tmp_path: Path,
+) -> None:
+    root, session_factory = make_harness(tmp_path)
+
+    class CredentialErrorRunner:
+        async def run(self, record, child):
+            raise RuntimeError("Authorization: Bearer topsecret")
+
+    scheduler = AgentScheduler(
+        root, root.store.agents, runner=CredentialErrorRunner()
+    )
+
+    result = await scheduler.spawn(AgentRequest("fail", "Explore", "d"))
+
+    assert "topsecret" not in str(result.error)
+    with session_factory() as db:
+        physical = db.execute(
+            text(
+                "SELECT error_json FROM runtime_agents WHERE agent_id = :agent_id"
+            ),
+            {"agent_id": result.agent_id},
+        ).scalar_one()
+    assert "topsecret" not in str(physical)
 
 
 @pytest.mark.asyncio
@@ -428,6 +630,57 @@ async def test_invalid_type_and_cwd_fail_before_durable_mutation(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["missing", "foreign", "terminal"])
+async def test_invalid_parent_rejected_before_durable_mutation(
+    tmp_path: Path, kind: str
+) -> None:
+    root, _ = make_harness(tmp_path)
+    parent_id = f"{kind}-parent"
+    if kind == "foreign":
+        create_running_parent(root, parent_id, root="other-root")
+    elif kind == "terminal":
+        parent = create_running_parent(root, parent_id)
+        root.store.agents.transition(
+            parent.agent_id, AgentStatus.COMPLETED, parent.revision
+        )
+    scheduler = AgentScheduler(root, root.store.agents, runner=ControlledRunner())
+    before = scheduler.list()
+
+    with pytest.raises(AgentOwnershipError):
+        await scheduler.spawn(
+            AgentRequest(
+                "invalid parent",
+                "Explore",
+                "d",
+                background=True,
+                parent_agent_id=parent_id,
+            )
+        )
+
+    assert scheduler.list() == before
+
+
+@pytest.mark.asyncio
+async def test_current_harness_agent_is_allowed_as_parent(tmp_path: Path) -> None:
+    root, _ = make_harness(tmp_path)
+    parent = root.child("current-parent")
+    runner = ControlledRunner()
+    runner.release.set()
+    scheduler = AgentScheduler(parent, root.store.agents, runner=runner)
+
+    result = await scheduler.spawn(
+        AgentRequest(
+            "valid parent",
+            "Explore",
+            "d",
+            parent_agent_id=parent.agent_id,
+        )
+    )
+
+    assert result.parent_agent_id == parent.agent_id
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["stop", "shutdown"])
 async def test_force_stop_is_bounded_and_quarantines_cancel_suppressing_runner(
     tmp_path: Path, operation: str
@@ -462,26 +715,46 @@ async def test_force_stop_is_bounded_and_quarantines_cancel_suppressing_runner(
     )
     await runner.started.wait()
 
-    async with asyncio.timeout(0.2):
+    async def perform_stop():
         if operation == "stop":
-            cancelled = await scheduler.stop(record.agent_id)
-        else:
-            await scheduler.shutdown()
-            cancelled = scheduler.status(record.agent_id)
+            return await scheduler.stop(record.agent_id)
+        report = await scheduler.shutdown()
+        assert report.unresolved_quarantines == 1
+        return scheduler.status(record.agent_id)
+
+    cancelled = await asyncio.wait_for(perform_stop(), 0.2)
 
     assert runner.cancel_seen.is_set()
     assert cancelled.status is AgentStatus.CANCELLED
     assert await scheduler.stop(record.agent_id) == cancelled
     assert record.agent_id not in scheduler.live_agent_ids
     assert scheduler.quarantined_task_count == 1
-    assert scheduler.parent_limiter_count == 0
+    assert scheduler.is_degraded
+    assert scheduler.root_available_capacity == 3
+    assert scheduler.managed_concurrency_count == 1
+    assert scheduler.parent_limiter_count == 1
+    with pytest.raises(AgentSchedulerDegraded):
+        await scheduler.spawn(AgentRequest("blocked", "Explore", "d"))
     cancelled_revision = cancelled.revision
+
+    if operation == "shutdown":
+        with pytest.raises(AgentSchedulerAlreadyActive):
+            AgentScheduler(root, root.store.agents, runner=ControlledRunner())
 
     runner.release.set()
     await wait_until(lambda: scheduler.quarantined_task_count == 0)
     reaped = scheduler.status(record.agent_id)
     assert reaped.status is AgentStatus.CANCELLED
     assert reaped.revision == cancelled_revision
+    assert not scheduler.is_degraded
+    assert scheduler.managed_concurrency_count == 0
+    if operation == "stop":
+        assert (
+            await scheduler.spawn(AgentRequest("recovered", "Explore", "d"))
+        ).status is AgentStatus.COMPLETED
+    else:
+        replacement = AgentScheduler(root, root.store.agents, runner=ControlledRunner())
+        await replacement.shutdown()
 
 
 @pytest.mark.asyncio
@@ -568,14 +841,41 @@ async def test_queued_definition_uses_detached_snapshot_not_mutated_globals(
 
 
 @pytest.mark.asyncio
-async def test_invalid_custom_definition_rejected_before_persistence(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        CustomAgentDefinition(agent_type="invalid", when_to_use=""),
+        CustomAgentDefinition(
+            agent_type="invalid", when_to_use="use", background=1  # type: ignore[arg-type]
+        ),
+        CustomAgentDefinition(
+            agent_type="invalid",
+            when_to_use="use",
+            max_turns=True,  # type: ignore[arg-type]
+        ),
+        CustomAgentDefinition(
+            agent_type="invalid",
+            when_to_use="use",
+            hooks=AgentHooks(pre_start="bad"),  # type: ignore[arg-type]
+        ),
+        CustomAgentDefinition(
+            agent_type="invalid",
+            when_to_use="use",
+            source="userSettings",  # type: ignore[arg-type]
+        ),
+    ],
+)
+async def test_invalid_custom_definition_rejected_before_persistence(
+    tmp_path: Path, invalid: CustomAgentDefinition
+) -> None:
     root, _ = make_harness(tmp_path)
     scheduler = AgentScheduler(root, root.store.agents, runner=ControlledRunner())
-    invalid = CustomAgentDefinition(agent_type="invalid", when_to_use="")
 
-    with pytest.raises(ValueError, match="when_to_use"):
+    with pytest.raises(AgentDefinitionError):
         await scheduler.spawn(
-            AgentRequest("invalid", "invalid", "d", definition=invalid)
+            AgentRequest(
+                "invalid", "invalid", "d", background=True, definition=invalid
+            )
         )
 
     assert scheduler.list() == []
@@ -595,6 +895,7 @@ async def test_parent_limiters_are_refcounted_and_removed(tmp_path: Path) -> Non
     )
 
     for index in range(30):
+        create_running_parent(root, f"parent-{index}")
         await scheduler.spawn(
             AgentRequest(
                 str(index), "Explore", "d", parent_agent_id=f"parent-{index}"
@@ -602,6 +903,7 @@ async def test_parent_limiters_are_refcounted_and_removed(tmp_path: Path) -> Non
         )
     assert scheduler.parent_limiter_count == 0
 
+    create_running_parent(root, "shared")
     runner.release.clear()
     siblings = [
         await scheduler.spawn(
@@ -650,7 +952,7 @@ class QuarantineCapacityRunner:
 
 
 @pytest.mark.asyncio
-async def test_force_quarantine_releases_root_capacity_before_runner_exits(
+async def test_force_quarantine_retains_root_capacity_until_runner_exits(
     tmp_path: Path,
 ) -> None:
     root, _ = make_harness(tmp_path)
@@ -664,30 +966,25 @@ async def test_force_quarantine_releases_root_capacity_before_runner_exits(
         stop_grace=0.01,
         force_grace=0.01,
     )
+    create_running_parent(root, "one")
     first = await scheduler.spawn(
         AgentRequest("first", "Explore", "d", background=True, parent_agent_id="one")
     )
     await runner.first_started.wait()
     assert (await scheduler.stop(first.agent_id)).status is AgentStatus.CANCELLED
-    second = await scheduler.spawn(
-        AgentRequest("second", "Explore", "d", background=True, parent_agent_id="two")
-    )
+    assert scheduler.root_available_capacity == 0
+    assert scheduler.managed_concurrency_count == 1
+    with pytest.raises(AgentSchedulerDegraded):
+        await scheduler.spawn(AgentRequest("second", "Explore", "d"))
 
-    try:
-        await asyncio.wait_for(runner.second_started.wait(), 0.5)
-        completed = await scheduler.wait(second.agent_id, timeout=0.5)
-        assert completed.status is AgentStatus.COMPLETED
-        assert scheduler.root_available_capacity == 1
-        assert scheduler.quarantined_task_count == 1
-    finally:
-        runner.release_first.set()
-        await wait_until(lambda: scheduler.quarantined_task_count == 0)
-        if scheduler.status(second.agent_id).status not in {
-            AgentStatus.COMPLETED,
-            AgentStatus.FAILED,
-            AgentStatus.CANCELLED,
-        }:
-            await scheduler.wait(second.agent_id, timeout=1)
+    runner.release_first.set()
+    await wait_until(lambda: scheduler.quarantined_task_count == 0)
+    second = await scheduler.spawn(
+        AgentRequest("second", "Explore", "d", background=True)
+    )
+    await asyncio.wait_for(runner.second_started.wait(), 0.5)
+    completed = await scheduler.wait(second.agent_id, timeout=0.5)
+    assert completed.status is AgentStatus.COMPLETED
 
     assert scheduler.root_available_capacity == 1
     assert scheduler.managed_concurrency_count == 0
@@ -696,7 +993,7 @@ async def test_force_quarantine_releases_root_capacity_before_runner_exits(
 
 
 @pytest.mark.asyncio
-async def test_force_quarantine_releases_same_parent_capacity_idempotently(
+async def test_force_quarantine_retains_same_parent_capacity_idempotently(
     tmp_path: Path,
 ) -> None:
     root, _ = make_harness(tmp_path)
@@ -710,6 +1007,7 @@ async def test_force_quarantine_releases_same_parent_capacity_idempotently(
         stop_grace=0.01,
         force_grace=0.01,
     )
+    create_running_parent(root, "shared")
     first = await scheduler.spawn(
         AgentRequest(
             "first", "Explore", "d", background=True, parent_agent_id="shared"
@@ -717,26 +1015,19 @@ async def test_force_quarantine_releases_same_parent_capacity_idempotently(
     )
     await runner.first_started.wait()
     await scheduler.stop(first.agent_id)
-    second = await scheduler.spawn(
-        AgentRequest(
-            "second", "Explore", "d", background=True, parent_agent_id="shared"
+    assert scheduler.parent_limiter_refcounts == {"shared": 1}
+    assert scheduler.parent_limiter_count == 1
+    assert scheduler.root_available_capacity == 1
+    assert scheduler.managed_concurrency_count == 1
+    with pytest.raises(AgentSchedulerDegraded):
+        await scheduler.spawn(
+            AgentRequest(
+                "second", "Explore", "d", background=True, parent_agent_id="shared"
+            )
         )
-    )
 
-    try:
-        await asyncio.wait_for(runner.second_started.wait(), 0.5)
-        assert scheduler.parent_limiter_refcounts == {"shared": 1}
-        assert scheduler.parent_limiter_count == 1
-        runner.release_second.set()
-        assert (await scheduler.wait(second.agent_id)).status is AgentStatus.COMPLETED
-        assert scheduler.parent_limiter_refcounts == {}
-        assert scheduler.parent_limiter_count == 0
-        assert scheduler.root_available_capacity == 2
-        assert scheduler.managed_concurrency_count == 0
-    finally:
-        runner.release_second.set()
-        runner.release_first.set()
-        await wait_until(lambda: scheduler.quarantined_task_count == 0)
+    runner.release_first.set()
+    await wait_until(lambda: scheduler.quarantined_task_count == 0)
 
     assert scheduler.root_available_capacity == 2
     assert scheduler.managed_concurrency_count == 0

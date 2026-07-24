@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping, Protocol, cast, runtime_checkable
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from .types import StateCoreError
 
@@ -64,7 +64,14 @@ def _optional_json_object(value: Mapping[str, Any] | None, path: str) -> dict[st
     return _json_object(value, path) if value is not None else None
 
 
-_EXACT_SENSITIVE_TRACE_ERROR_KEYS = frozenset(
+_MAX_RUNTIME_ERROR_DEPTH = 16
+_MAX_RUNTIME_ERROR_ITEMS = 64
+_MAX_RUNTIME_ERROR_NODES = 256
+_MAX_RUNTIME_ERROR_SCAN = 4096
+_MAX_RUNTIME_ERROR_STRING = 2000
+_MAX_RUNTIME_ERROR_TEXT = 16000
+_TRUNCATED_RUNTIME_ERROR = "[TRUNCATED]"
+_EXACT_SENSITIVE_RUNTIME_ERROR_KEYS = frozenset(
     {
         "authorization",
         "proxyauthorization",
@@ -88,18 +95,34 @@ _EXACT_SENSITIVE_TRACE_ERROR_KEYS = frozenset(
         "sessiontoken",
     }
 )
-_TRACE_HEADER_CONTAINER_KEYS = frozenset({"headers", "requestheaders", "responseheaders"})
+_RUNTIME_HEADER_CONTAINER_KEYS = frozenset(
+    {"headers", "requestheaders", "responseheaders"}
+)
+_AUTHORIZATION_VALUE = re.compile(
+    r"(?i)\b(authorization|proxy[-_ ]authorization)\s*[:=]\s*"
+    r'''(?:"(?:\\[\s\S]?|[^"\\])*(?:"|$)|'(?:\\[\s\S]?|[^'\\])*(?:'|$)|'''
+    r"(?:(?:bearer|basic)\s+)?[^\s,;&]+)"
+)
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[_-]?key|x[-_]?api[-_]?key|password|passwd|secret|"
+    r"client[_-]?secret|access[_-]?token|refresh[_-]?token|session[_-]?token|"
+    r'''id[_-]?token|auth[_-]?token|token|credentials?)\s*[:=]\s*'''
+    r'''(?:"(?:\\[\s\S]?|[^"\\])*(?:"|$)|'(?:\\[\s\S]?|[^'\\])*(?:'|$)|[^\s,;&]+)'''
+)
+_BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[^\s,;&]+")
 
 
-def _normalize_trace_error_key(key: str) -> str:
+def _normalize_runtime_error_key(key: str) -> str:
     return "".join(character for character in key.casefold() if character.isalnum())
 
 
-def _is_sensitive_trace_error_key(key: str) -> bool:
+def _is_sensitive_runtime_error_key(key: str) -> bool:
     tokenized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", key).casefold()
     tokens = tuple(token for token in re.split(r"[^a-z0-9]+", tokenized) if token)
     normalized = "".join(tokens)
-    if normalized in _EXACT_SENSITIVE_TRACE_ERROR_KEYS | _TRACE_HEADER_CONTAINER_KEYS:
+    if normalized in (
+        _EXACT_SENSITIVE_RUNTIME_ERROR_KEYS | _RUNTIME_HEADER_CONTAINER_KEYS
+    ):
         return True
     if {"password", "passwd", "secret", "credential", "authorization", "cookie"}.intersection(tokens):
         return True
@@ -110,28 +133,149 @@ def _is_sensitive_trace_error_key(key: str) -> bool:
     )
 
 
-def _sanitize_trace_error(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
-    """Detach a trace error while redacting sensitive fields at every depth."""
+def _sanitize_runtime_error_string(value: str) -> str:
+    sanitized = _AUTHORIZATION_VALUE.sub(
+        r"\1=[REDACTED]", value[:_MAX_RUNTIME_ERROR_SCAN]
+    )
+    sanitized = _CREDENTIAL_ASSIGNMENT.sub(r"\1=[REDACTED]", sanitized)
+    sanitized = _BEARER_VALUE.sub("Bearer [REDACTED]", sanitized)
+    return sanitized[:_MAX_RUNTIME_ERROR_STRING]
 
-    copied = _optional_json_object(value, "error")
-    if copied is None:
+
+def _json_encoded_character_size(character: str) -> int:
+    codepoint = ord(character)
+    if character in {'"', "\\"}:
+        return 2
+    if codepoint < 0x20:
+        return 6
+    if codepoint <= 0x7F:
+        return 1
+    if codepoint <= 0xFFFF:
+        return 6
+    return 12
+
+
+def sanitize_runtime_error(
+    value: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Detach, redact, and bound a durable agent or trace error tree."""
+
+    if value is None:
         return None
+    if not isinstance(value, Mapping):
+        raise TypeError("error must be a JSON object")
 
-    def sanitize(item: Any) -> Any:
-        if isinstance(item, dict):
-            return {
-                key: (
-                    "[REDACTED]"
-                    if _is_sensitive_trace_error_key(key)
-                    else sanitize(value)
+    nodes_remaining = _MAX_RUNTIME_ERROR_NODES
+    text_remaining = _MAX_RUNTIME_ERROR_TEXT
+
+    def bounded_text(text: str) -> tuple[str, bool]:
+        nonlocal text_remaining
+        if not text:
+            return "", False
+        if text_remaining <= 0:
+            return _TRUNCATED_RUNTIME_ERROR, True
+        bounded_characters: list[str] = []
+        for character in text[:_MAX_RUNTIME_ERROR_STRING]:
+            encoded_size = _json_encoded_character_size(character)
+            if encoded_size > text_remaining:
+                break
+            bounded_characters.append(character)
+            text_remaining -= encoded_size
+        if not bounded_characters:
+            return _TRUNCATED_RUNTIME_ERROR, True
+        bounded = "".join(bounded_characters)
+        return bounded, len(bounded) < len(text)
+
+    def consume_literal(text: str) -> bool:
+        nonlocal text_remaining
+        if len(text) > text_remaining:
+            return False
+        text_remaining -= len(text)
+        return True
+
+    def add_mapping_truncation(target: dict[str, Any]) -> None:
+        key = "__truncated__"
+        while key in target:
+            key = f"_{key}"
+        target[key] = _TRUNCATED_RUNTIME_ERROR
+
+    def sanitize(item: Any, path: str, depth: int) -> Any:
+        nonlocal nodes_remaining
+        if nodes_remaining <= 0:
+            return _TRUNCATED_RUNTIME_ERROR
+        nodes_remaining -= 1
+
+        if item is None:
+            return item if consume_literal("null") else _TRUNCATED_RUNTIME_ERROR
+        if type(item) is bool:
+            literal = "true" if item else "false"
+            return item if consume_literal(literal) else _TRUNCATED_RUNTIME_ERROR
+        if type(item) is int:
+            if item.bit_length() > 4096:
+                return _TRUNCATED_RUNTIME_ERROR
+            literal = str(item)
+            return item if consume_literal(literal) else _TRUNCATED_RUNTIME_ERROR
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError(f"{path} must contain only finite JSON numbers")
+            return item if consume_literal(repr(item)) else _TRUNCATED_RUNTIME_ERROR
+        if type(item) is str:
+            sanitized, _ = bounded_text(_sanitize_runtime_error_string(item))
+            return sanitized
+        if isinstance(item, Mapping):
+            if depth >= _MAX_RUNTIME_ERROR_DEPTH:
+                return _TRUNCATED_RUNTIME_ERROR
+            sanitized: dict[str, Any] = {}
+            for index, (key, nested) in enumerate(item.items()):
+                if type(key) is not str:
+                    raise TypeError(f"{path} mapping keys must be strings")
+                if (
+                    index >= _MAX_RUNTIME_ERROR_ITEMS
+                    or nodes_remaining <= 0
+                    or text_remaining <= 0
+                ):
+                    add_mapping_truncation(sanitized)
+                    break
+                bounded_key, key_was_truncated = bounded_text(key)
+                nested_path = f"{path}.{key[:80]}"
+                key_for_scan = key[:_MAX_RUNTIME_ERROR_SCAN]
+                if len(key) > _MAX_RUNTIME_ERROR_SCAN or _is_sensitive_runtime_error_key(
+                    key_for_scan
+                ):
+                    redacted, _ = bounded_text("[REDACTED]")
+                    sanitized[bounded_key] = redacted
+                else:
+                    sanitized[bounded_key] = sanitize(
+                        nested, nested_path, depth + 1
+                    )
+                if key_was_truncated and text_remaining <= 0:
+                    add_mapping_truncation(sanitized)
+                    break
+            return sanitized
+        if isinstance(item, (list, tuple)):
+            if depth >= _MAX_RUNTIME_ERROR_DEPTH:
+                return _TRUNCATED_RUNTIME_ERROR
+            sanitized_list: list[Any] = []
+            for index, nested in enumerate(item):
+                if (
+                    index >= _MAX_RUNTIME_ERROR_ITEMS
+                    or nodes_remaining <= 0
+                    or text_remaining <= 0
+                ):
+                    sanitized_list.append(_TRUNCATED_RUNTIME_ERROR)
+                    break
+                sanitized_list.append(
+                    sanitize(nested, f"{path}[{index}]", depth + 1)
                 )
-                for key, value in item.items()
-            }
-        if isinstance(item, list):
-            return [sanitize(value) for value in item]
-        return item
+            return sanitized_list
+        raise TypeError(
+            f"{path} contains unsupported JSON value {type(item).__name__}"
+        )
 
-    return cast(dict[str, Any], sanitize(copied))
+    sanitized = sanitize(value, "error", 0)
+    if not isinstance(sanitized, dict):
+        raise TypeError("error must be a JSON object")
+    return sanitized
 
 
 class AgentStatus(str, Enum):
@@ -300,7 +444,7 @@ class AgentRecord:
             raise ValueError("revision must be non-negative")
         object.__setattr__(self, "definition_snapshot", _json_object(self.definition_snapshot, "definition"))
         object.__setattr__(self, "usage", _json_object(self.usage, "usage"))
-        object.__setattr__(self, "error", _optional_json_object(self.error, "error"))
+        object.__setattr__(self, "error", sanitize_runtime_error(self.error))
         object.__setattr__(self, "output", _json_copy(self.output, "output"))
         object.__setattr__(self, "created_at", _as_utc(self.created_at))
         object.__setattr__(self, "updated_at", _as_utc(self.updated_at))
@@ -359,7 +503,7 @@ class TraceSpanRecord:
         if self.revision < 0:
             raise ValueError("revision must be non-negative")
         object.__setattr__(self, "usage", _json_object(self.usage, "usage"))
-        object.__setattr__(self, "error", _sanitize_trace_error(self.error))
+        object.__setattr__(self, "error", sanitize_runtime_error(self.error))
         object.__setattr__(self, "started_at", _as_utc(self.started_at))
         object.__setattr__(self, "created_at", _as_utc(self.created_at))
         object.__setattr__(self, "updated_at", _as_utc(self.updated_at))

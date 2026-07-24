@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import pytest
@@ -9,8 +11,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from agents.built_in import EXPLORE_AGENT, GENERAL_PURPOSE_AGENT
-from agents.engine import AgentExecutor
-from agents.types import CustomAgentDefinition
+from agents.engine import AgentExecutor, SpawnAgentManager
+from agents.types import AgentDefinitionError, CustomAgentDefinition
 from harness import SessionHarnessFactory
 from models import Base
 from services.llm_service import ChatCompletionResponse
@@ -42,6 +44,52 @@ def record(tmp_path: Path) -> AgentRecord:
     return AgentRecord(
         "agent-1", "root", "Explore", "inspect", "inspect files", False, str(tmp_path), {}
     )
+
+
+@pytest.mark.parametrize(
+    ("update", "record_type"),
+    [
+        ({"background": "false"}, "snapshot"),
+        ({"omit_claude_md": 0}, "snapshot"),
+        ({"max_turns": True}, "snapshot"),
+        ({"tools": ["read_file", 1]}, "snapshot"),
+        ({"hooks": {"pre_start": "bad"}}, "snapshot"),
+        ({"mcp_servers": [{"name": 7}]}, "snapshot"),
+        ({"permission_mode": "unsafe"}, "snapshot"),
+        ({"memory": "forever"}, "snapshot"),
+        ({"isolation": "container"}, "snapshot"),
+        ({"source": "unknown"}, "snapshot"),
+        ({"source": "plugin"}, "snapshot"),
+        ({"system_prompt": 42}, "snapshot"),
+        ({"metadata": []}, "snapshot"),
+        ({"execution_timeout": True}, "snapshot"),
+        ({"unexpected": "field"}, "snapshot"),
+        ({}, "other-type"),
+    ],
+)
+def test_corrupt_definition_snapshots_fail_closed(
+    tmp_path: Path, update: dict, record_type: str
+) -> None:
+    snapshot = {
+        "agent_type": "snapshot",
+        "when_to_use": "validate a snapshot",
+        "source": "userSettings",
+        "system_prompt": "strict system prompt",
+    }
+    snapshot.update(update)
+    corrupt = AgentRecord(
+        "agent-1",
+        "root",
+        record_type,
+        "inspect",
+        "inspect files",
+        False,
+        str(tmp_path),
+        snapshot,
+    )
+
+    with pytest.raises(AgentDefinitionError):
+        AgentExecutor.from_record(corrupt)
 
 
 @pytest.mark.asyncio
@@ -134,8 +182,9 @@ class ContextTool(Tool[dict, dict]):
 
 
 class IsolatedRegistry:
-    def __init__(self, *tools: Tool) -> None:
+    def __init__(self, *tools: Tool, schema_less: tuple[str, ...] = ()) -> None:
         self.tools = {canonical_tool_name(tool.name): tool for tool in tools}
+        self.schema_less = {canonical_tool_name(name) for name in schema_less}
 
     def list_tools(self):
         return list(self.tools)
@@ -151,7 +200,7 @@ class IsolatedRegistry:
     def get_spec(self, name: str):
         canonical = self.resolve_name(name)
         tool = self.get(name)
-        if canonical is None or tool is None:
+        if canonical is None or tool is None or canonical in self.schema_less:
             return None
         return ToolSpec.from_tool(tool, name=canonical)
 
@@ -215,6 +264,236 @@ async def test_executor_uses_child_registry_and_context_enabled_filter(
     assert enabled.calls == 1
     assert disabled.calls == 0
     assert result.tool_count == 2
+
+
+@pytest.mark.asyncio
+async def test_executor_rechecks_tool_enablement_before_execution(
+    tmp_path: Path,
+) -> None:
+    tool = ContextTool("Toggle", True)
+    registry = IsolatedRegistry(tool)
+    child = child_harness(tmp_path, registry)
+    definition = CustomAgentDefinition(
+        agent_type="dynamic", when_to_use="dynamic", tools=["Toggle"]
+    )
+
+    class DisableDuringResponse(SequenceLLMService):
+        async def chat_completion(self, request):
+            response = await super().chat_completion(request)
+            if len(self.requests) == 1:
+                tool.enabled = False
+            return response
+
+    llm = DisableDuringResponse(
+        [
+            ChatCompletionResponse(
+                id="one",
+                model="test",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-toggle",
+                        "type": "function",
+                        "function": {"name": "toggle", "arguments": "{}"},
+                    }
+                ],
+            ),
+            ChatCompletionResponse(
+                id="two", model="test", content="done", finish_reason="stop"
+            ),
+        ]
+    )
+
+    await AgentExecutor(definition, llm_service=llm).run(
+        AgentRecord(
+            "agent-1", "root", "dynamic", "run", "d", False, str(tmp_path), {}
+        ),
+        child,
+    )
+
+    assert {item["function"]["name"] for item in llm.requests[0].tools} == {
+        "toggle"
+    }
+    assert llm.requests[1].tools is None
+    assert tool.calls == 0
+    observation = next(
+        message for message in llm.requests[1].messages if message.role == "tool"
+    )
+    assert "not available" in observation.content
+
+
+@pytest.mark.asyncio
+async def test_schema_less_tool_is_neither_exposed_nor_executable(
+    tmp_path: Path,
+) -> None:
+    tool = ContextTool("NoSchema", True)
+    registry = IsolatedRegistry(tool, schema_less=("NoSchema",))
+    child = child_harness(tmp_path, registry)
+    definition = CustomAgentDefinition(
+        agent_type="schema-less", when_to_use="schema-less", tools=["NoSchema"]
+    )
+    llm = SequenceLLMService(
+        [
+            ChatCompletionResponse(
+                id="one",
+                model="test",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-schema-less",
+                        "type": "function",
+                        "function": {"name": "no_schema", "arguments": "{}"},
+                    }
+                ],
+            ),
+            ChatCompletionResponse(
+                id="two", model="test", content="done", finish_reason="stop"
+            ),
+        ]
+    )
+
+    await AgentExecutor(definition, llm_service=llm).run(
+        AgentRecord(
+            "agent-1",
+            "root",
+            "schema-less",
+            "run",
+            "d",
+            False,
+            str(tmp_path),
+            {},
+        ),
+        child,
+    )
+
+    assert llm.requests[0].tools is None
+    assert tool.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_malformed_tool_calls_become_failed_observations(
+    tmp_path: Path,
+) -> None:
+    tool = ContextTool("Valid", True)
+    registry = IsolatedRegistry(tool)
+    child = child_harness(tmp_path, registry)
+    definition = CustomAgentDefinition(
+        agent_type="malformed", when_to_use="malformed", tools=["Valid"]
+    )
+    llm = SequenceLLMService(
+        [
+            ChatCompletionResponse(
+                id="one",
+                model="test",
+                content="",
+                tool_calls=[
+                    "not-a-mapping",
+                    {"id": "bad-function", "function": "not-a-mapping"},
+                    {"id": "bad-name", "function": {"arguments": "{}"}},
+                    {
+                        "id": "bad-json",
+                        "function": {"name": "valid", "arguments": "{"},
+                    },
+                    {
+                        "id": "bad-shape",
+                        "function": {"name": "valid", "arguments": "[]"},
+                    },
+                ],
+            ),
+            ChatCompletionResponse(
+                id="two", model="test", content="done", finish_reason="stop"
+            ),
+        ]
+    )
+
+    result = await AgentExecutor(definition, llm_service=llm).run(
+        AgentRecord(
+            "agent-1", "root", "malformed", "run", "d", False, str(tmp_path), {}
+        ),
+        child,
+    )
+
+    observations = [
+        message for message in llm.requests[1].messages if message.role == "tool"
+    ]
+    assert len(observations) == 5
+    assert all("error" in json.loads(message.content) for message in observations)
+    assert tool.calls == 0
+    assert result.tool_count == 5
+
+
+class OutputKind(str, Enum):
+    VALUE = "value"
+
+
+@dataclass
+class StructuredOutput:
+    kind: OutputKind
+    coordinates: tuple[int, int]
+
+
+class StructuredTool(ContextTool):
+    async def execute(self, input_data: dict) -> ToolResult:
+        self.calls += 1
+        return ToolResult.ok(StructuredOutput(OutputKind.VALUE, (1, 2)))
+
+
+@pytest.mark.asyncio
+async def test_tool_observation_uses_structured_json_conversion(tmp_path: Path) -> None:
+    tool = StructuredTool("Structured", True)
+    registry = IsolatedRegistry(tool)
+    child = child_harness(tmp_path, registry)
+    definition = CustomAgentDefinition(
+        agent_type="structured", when_to_use="structured", tools=["Structured"]
+    )
+    llm = SequenceLLMService(
+        [
+            ChatCompletionResponse(
+                id="one",
+                model="test",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "structured",
+                        "function": {"name": "structured", "arguments": "{}"},
+                    }
+                ],
+            ),
+            ChatCompletionResponse(
+                id="two", model="test", content="done", finish_reason="stop"
+            ),
+        ]
+    )
+
+    await AgentExecutor(definition, llm_service=llm).run(
+        AgentRecord(
+            "agent-1", "root", "structured", "run", "d", False, str(tmp_path), {}
+        ),
+        child,
+    )
+
+    observation = next(
+        message for message in llm.requests[1].messages if message.role == "tool"
+    )
+    assert json.loads(observation.content) == {
+        "kind": "value",
+        "coordinates": [1, 2],
+    }
+
+
+@pytest.mark.asyncio
+async def test_abort_agent_returns_awaitable_task() -> None:
+    marker = object()
+
+    class Scheduler:
+        async def stop(self, agent_id):
+            assert agent_id == "agent-1"
+            return marker
+
+    task = SpawnAgentManager(Scheduler()).abort_agent("agent-1")
+
+    assert isinstance(task, asyncio.Task)
+    assert await task is marker
 
 
 def test_executor_tool_visibility_tracks_todo_task_mode(tmp_path: Path) -> None:

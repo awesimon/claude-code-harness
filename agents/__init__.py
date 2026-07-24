@@ -47,6 +47,7 @@ from .types import (
     VERIFICATION_AGENT_TYPE,
     AgentContext,
     AgentDefinition,
+    AgentDefinitionError,
     AgentError,
     AgentExecutionConfig,
     AgentExecutionError,
@@ -67,10 +68,12 @@ from .types import (
     is_custom_agent,
     is_one_shot_agent,
     is_plugin_agent,
+    parse_agent_definition,
 )
 
 __all__ = [
     "AgentDefinition",
+    "AgentDefinitionError",
     "BuiltInAgentDefinition",
     "CustomAgentDefinition",
     "PluginAgentDefinition",
@@ -119,4 +122,5 @@ __all__ = [
     "is_custom_agent",
     "is_plugin_agent",
     "is_one_shot_agent",
+    "parse_agent_definition",
 ]

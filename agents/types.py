@@ -2,6 +2,7 @@
 Agent 系统核心类型定义
 全面对齐 Claude Code 源码架构
 """
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -146,6 +147,327 @@ AgentDefinition = Union[
     CustomAgentDefinition,
     PluginAgentDefinition
 ]
+
+
+class AgentDefinitionError(ValueError):
+    """Raised when an agent definition or durable snapshot is malformed."""
+
+
+_CUSTOM_SOURCES = {
+    AgentSource.USER_SETTINGS,
+    AgentSource.PROJECT_SETTINGS,
+    AgentSource.POLICY_SETTINGS,
+    AgentSource.FLAG_SETTINGS,
+}
+_STRING_LIST_FIELDS = (
+    "tools",
+    "disallowed_tools",
+    "skills",
+    "required_mcp_servers",
+)
+_NULLABLE_STRING_FIELDS = (
+    "color",
+    "model",
+    "filename",
+    "base_dir",
+    "critical_system_reminder",
+    "initial_prompt",
+)
+_SNAPSHOT_FIELDS = {
+    "agent_type",
+    "when_to_use",
+    *_STRING_LIST_FIELDS,
+    *_NULLABLE_STRING_FIELDS,
+    "mcp_servers",
+    "hooks",
+    "effort",
+    "permission_mode",
+    "max_turns",
+    "background",
+    "memory",
+    "isolation",
+    "omit_claude_md",
+    "source",
+    "plugin",
+    "system_prompt",
+    "metadata",
+    "execution_timeout",
+}
+
+
+def _definition_error(field_name: str, expected: str) -> AgentDefinitionError:
+    return AgentDefinitionError(f"Agent definition {field_name} must be {expected}")
+
+
+def _validate_string(value: Any, field_name: str, *, required: bool = False) -> None:
+    if not isinstance(value, str) or (required and not value):
+        qualifier = "a non-empty string" if required else "a string or None"
+        raise _definition_error(field_name, qualifier)
+
+
+def _validate_string_list(value: Any, field_name: str) -> None:
+    if value is not None and (
+        type(value) is not list
+        or any(not isinstance(item, str) or not item for item in value)
+    ):
+        raise _definition_error(field_name, "a list of non-empty strings or None")
+
+
+def _validate_hooks(value: Any) -> None:
+    if value is None:
+        return
+    if not isinstance(value, AgentHooks):
+        raise _definition_error("hooks", "an AgentHooks value or None")
+    for field_name in ("pre_start", "post_complete", "on_error"):
+        _validate_string_list(getattr(value, field_name), f"hooks.{field_name}")
+
+
+def _validate_mcp_servers(value: Any) -> None:
+    if value is None:
+        return
+    if type(value) is not list or any(
+        not isinstance(server, AgentMcpServerSpec) for server in value
+    ):
+        raise _definition_error(
+            "mcp_servers", "a list of AgentMcpServerSpec values or None"
+        )
+    for server in value:
+        if server.name is not None:
+            _validate_string(server.name, "mcp_servers.name")
+        if server.config is not None and not isinstance(server.config, Mapping):
+            raise _definition_error("mcp_servers.config", "a mapping or None")
+
+
+def _definition_source(definition: BaseAgentDefinition) -> AgentSource:
+    if not isinstance(definition.source, AgentSource):
+        raise _definition_error("source", "an AgentSource value")
+    source = definition.source
+    if isinstance(definition, BuiltInAgentDefinition):
+        valid = source is AgentSource.BUILT_IN
+    elif isinstance(definition, PluginAgentDefinition):
+        valid = source is AgentSource.PLUGIN
+    elif isinstance(definition, CustomAgentDefinition):
+        valid = source in _CUSTOM_SOURCES
+    else:
+        raise AgentDefinitionError(
+            "Agent definition must be built-in, custom, or plugin"
+        )
+    if not valid:
+        raise AgentDefinitionError(
+            "Agent definition class does not match its source"
+        )
+    return source
+
+
+def _validate_definition(
+    definition: BaseAgentDefinition, *, expected_agent_type: str | None
+) -> AgentDefinition:
+    _validate_string(definition.agent_type, "agent_type", required=True)
+    _validate_string(definition.when_to_use, "when_to_use", required=True)
+    if expected_agent_type is not None and definition.agent_type != expected_agent_type:
+        raise AgentDefinitionError("Agent definition type does not match record or request")
+    source = _definition_source(definition)
+    for field_name in _STRING_LIST_FIELDS:
+        _validate_string_list(getattr(definition, field_name), field_name)
+    for field_name in _NULLABLE_STRING_FIELDS:
+        value = getattr(definition, field_name)
+        if value is not None:
+            _validate_string(value, field_name)
+    if definition.effort is not None and type(definition.effort) not in (str, int):
+        raise _definition_error("effort", "a string, integer, or None")
+    if definition.permission_mode is not None and not isinstance(
+        definition.permission_mode, AgentPermissionMode
+    ):
+        raise _definition_error(
+            "permission_mode", "an AgentPermissionMode value or None"
+        )
+    if definition.max_turns is not None and (
+        type(definition.max_turns) is not int or definition.max_turns < 1
+    ):
+        raise _definition_error("max_turns", "a positive integer or None")
+    if type(definition.background) is not bool:
+        raise _definition_error("background", "a boolean")
+    if type(definition.omit_claude_md) is not bool:
+        raise _definition_error("omit_claude_md", "a boolean")
+    if definition.memory is not None and not isinstance(
+        definition.memory, AgentMemoryScope
+    ):
+        raise _definition_error("memory", "an AgentMemoryScope value or None")
+    if definition.isolation is not None and not isinstance(
+        definition.isolation, AgentIsolationMode
+    ):
+        raise _definition_error("isolation", "an AgentIsolationMode value or None")
+    if definition.get_system_prompt is not None and not callable(
+        definition.get_system_prompt
+    ):
+        raise _definition_error("get_system_prompt", "callable or None")
+    _validate_hooks(definition.hooks)
+    _validate_mcp_servers(definition.mcp_servers)
+    if source is AgentSource.PLUGIN:
+        plugin = getattr(definition, "plugin", None)
+        _validate_string(plugin, "plugin", required=True)
+    return definition
+
+
+def _snapshot_hooks(value: Any) -> AgentHooks | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) - {
+        "pre_start",
+        "post_complete",
+        "on_error",
+    }:
+        raise _definition_error("hooks", "a hooks mapping or None")
+    hooks = AgentHooks(
+        pre_start=value.get("pre_start"),
+        post_complete=value.get("post_complete"),
+        on_error=value.get("on_error"),
+    )
+    _validate_hooks(hooks)
+    return hooks
+
+
+def _snapshot_mcp_servers(value: Any) -> List[AgentMcpServerSpec] | None:
+    if value is None:
+        return None
+    if type(value) is not list:
+        raise _definition_error("mcp_servers", "a list of server mappings or None")
+    servers: List[AgentMcpServerSpec] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) - {"name", "config"}:
+            raise _definition_error("mcp_servers", "a list of server mappings")
+        name = item.get("name")
+        config = item.get("config")
+        if name is not None:
+            _validate_string(name, "mcp_servers.name")
+        if config is not None and not isinstance(config, Mapping):
+            raise _definition_error("mcp_servers.config", "a mapping or None")
+        servers.append(
+            AgentMcpServerSpec(
+                name=name,
+                config=dict(config) if config is not None else None,
+            )
+        )
+    return servers
+
+
+def _snapshot_enum(
+    snapshot: Mapping[str, Any], field_name: str, enum_type: type[Enum]
+) -> Enum | None:
+    value = snapshot.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _definition_error(field_name, "a supported string or None")
+    try:
+        return enum_type(value)
+    except ValueError as exc:
+        raise _definition_error(field_name, "a supported string or None") from exc
+
+
+def _definition_from_mapping(
+    snapshot: Mapping[str, Any], *, expected_agent_type: str | None
+) -> AgentDefinition:
+    unknown = set(snapshot) - _SNAPSHOT_FIELDS
+    if unknown:
+        raise AgentDefinitionError(
+            f"Agent definition snapshot has unknown fields: {sorted(unknown)!r}"
+        )
+    for required in ("agent_type", "when_to_use", "source", "system_prompt"):
+        if required not in snapshot:
+            raise AgentDefinitionError(
+                f"Agent definition snapshot is missing {required}"
+            )
+    system_prompt = snapshot["system_prompt"]
+    _validate_string(system_prompt, "system_prompt", required=True)
+    source_value = snapshot["source"]
+    if not isinstance(source_value, str):
+        raise _definition_error("source", "a supported source string")
+    try:
+        source = AgentSource(source_value)
+    except ValueError as exc:
+        raise _definition_error("source", "a supported source string") from exc
+    if "metadata" in snapshot and not isinstance(snapshot["metadata"], Mapping):
+        raise _definition_error("metadata", "a mapping")
+    timeout = snapshot.get("execution_timeout")
+    if timeout is not None and (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or timeout <= 0
+        or not math.isfinite(float(timeout))
+    ):
+        raise _definition_error("execution_timeout", "a positive finite number or None")
+
+    common: Dict[str, Any] = {
+        "agent_type": snapshot["agent_type"],
+        "when_to_use": snapshot["when_to_use"],
+        "tools": snapshot.get("tools"),
+        "disallowed_tools": snapshot.get("disallowed_tools"),
+        "skills": snapshot.get("skills"),
+        "mcp_servers": _snapshot_mcp_servers(snapshot.get("mcp_servers")),
+        "hooks": _snapshot_hooks(snapshot.get("hooks")),
+        "color": snapshot.get("color"),
+        "model": snapshot.get("model"),
+        "effort": snapshot.get("effort"),
+        "permission_mode": _snapshot_enum(
+            snapshot, "permission_mode", AgentPermissionMode
+        ),
+        "max_turns": snapshot.get("max_turns"),
+        "filename": snapshot.get("filename"),
+        "base_dir": snapshot.get("base_dir"),
+        "critical_system_reminder": snapshot.get("critical_system_reminder"),
+        "required_mcp_servers": snapshot.get("required_mcp_servers"),
+        "background": snapshot.get("background", False),
+        "initial_prompt": snapshot.get("initial_prompt"),
+        "memory": _snapshot_enum(snapshot, "memory", AgentMemoryScope),
+        "isolation": _snapshot_enum(snapshot, "isolation", AgentIsolationMode),
+        "omit_claude_md": snapshot.get("omit_claude_md", False),
+    }
+
+    def get_system_prompt() -> str:
+        return system_prompt
+
+    try:
+        if source is AgentSource.BUILT_IN:
+            definition: BaseAgentDefinition = BuiltInAgentDefinition(
+                **common,
+                source=AgentSource.BUILT_IN,
+                get_system_prompt=get_system_prompt,
+            )
+        elif source is AgentSource.PLUGIN:
+            definition = PluginAgentDefinition(
+                **common,
+                source=AgentSource.PLUGIN,
+                plugin=snapshot.get("plugin"),
+                get_system_prompt=get_system_prompt,
+            )
+        else:
+            definition = CustomAgentDefinition(
+                **common, source=source, get_system_prompt=get_system_prompt
+            )
+    except (TypeError, ValueError) as exc:
+        raise AgentDefinitionError("Agent definition snapshot has invalid enum fields") from exc
+    return _validate_definition(
+        definition, expected_agent_type=expected_agent_type
+    )
+
+
+def parse_agent_definition(
+    value: AgentDefinition | Mapping[str, Any],
+    *,
+    expected_agent_type: str | None = None,
+) -> AgentDefinition:
+    """Strictly validate a live definition or reconstruct a durable snapshot."""
+
+    if isinstance(value, Mapping):
+        return _definition_from_mapping(
+            value, expected_agent_type=expected_agent_type
+        )
+    if not isinstance(value, BaseAgentDefinition):
+        raise AgentDefinitionError(
+            "Agent definition must be a complete definition or snapshot mapping"
+        )
+    return _validate_definition(value, expected_agent_type=expected_agent_type)
 
 
 @dataclass(frozen=True)

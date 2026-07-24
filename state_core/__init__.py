@@ -20,6 +20,7 @@ from .runtime_records import (
     WorktreeRecord,
     WorktreeRepository,
     WorktreeStatus,
+    sanitize_runtime_error,
 )
 from .sqlalchemy_store import (
     SQLAlchemyStateRepository,
@@ -94,4 +95,5 @@ __all__ = [
     "WorktreeRecord",
     "WorktreeRepository",
     "WorktreeStatus",
+    "sanitize_runtime_error",
 ]

@@ -9,29 +9,21 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from agents.types import (
     AgentDefinition,
     AgentExecutionConfig,
     AgentExecutionResult,
-    AgentHooks,
-    AgentIsolationMode,
-    AgentMcpServerSpec,
-    AgentMemoryScope,
-    AgentPermissionMode,
-    AgentSource,
     AgentToolResult,
-    BuiltInAgentDefinition,
-    CustomAgentDefinition,
-    PluginAgentDefinition,
+    parse_agent_definition,
 )
 from harness import SessionHarness, TerminationReason
 from services import ChatCompletionRequest, LLMService, Message
 from state_core import AgentRecord
 from tools import ToolRegistry
-from tools.base import Tool, canonical_tool_name
+from tools.base import Tool, canonical_tool_name, to_json_value
 
 
 class AgentExecutor:
@@ -57,7 +49,10 @@ class AgentExecutor:
         llm_service: LLMService | None = None,
     ) -> "AgentExecutor":
         return cls(
-            _definition_from_snapshot(record.definition_snapshot),
+            parse_agent_definition(
+                record.definition_snapshot,
+                expected_agent_type=record.agent_type,
+            ),
             config=config,
             llm_service=llm_service,
         )
@@ -107,6 +102,21 @@ class AgentExecutor:
             "Complete the task and return a concise factual report."
         )
 
+    def _available_tools(
+        self, child_harness: SessionHarness
+    ) -> tuple[dict[str, Tool], list[dict[str, Any]]]:
+        registry = child_harness.tool_runtime.registry
+        available: dict[str, Tool] = {}
+        schemas: list[dict[str, Any]] = []
+        for tool in self._resolve_tools(child_harness):
+            name = self.tool_name(tool, registry)
+            spec = registry.get_spec(name)
+            if spec is None:
+                continue
+            available[name] = tool
+            schemas.append(spec.to_openai())
+        return available, schemas
+
     async def run(
         self,
         record: AgentRecord,
@@ -120,8 +130,6 @@ class AgentExecutor:
             raise asyncio.CancelledError
 
         registry = child_harness.tool_runtime.registry
-        tools = self._resolve_tools(child_harness)
-        exposed_tool_names = {self.tool_name(tool, registry) for tool in tools}
         llm_messages = [Message(role="system", content=self._build_system_prompt())]
         if self.agent_definition.initial_prompt:
             llm_messages.append(
@@ -137,11 +145,7 @@ class AgentExecutor:
         for _turn in range(max_turns):
             if cancellation.cancelled:
                 raise asyncio.CancelledError
-            schemas = []
-            for tool in tools:
-                spec = registry.get_spec(self.tool_name(tool, registry))
-                if spec is not None:
-                    schemas.append(spec.to_openai())
+            _, schemas = self._available_tools(child_harness)
             model = record.definition_snapshot.get("model") or self.config.model
             if model == "inherit":
                 model = self.config.model
@@ -192,44 +196,75 @@ class AgentExecutor:
             for tool_call in response.tool_calls:
                 if cancellation.cancelled:
                     raise asyncio.CancelledError
-                function = tool_call.get("function", {})
-                tool_name = function.get("name", "")
-                raw_arguments = function.get("arguments", "{}")
+                tool_call_id = ""
+                tool_name = ""
+                execution_name = "invalid_tool_call"
+                result_success = False
                 try:
-                    arguments = (
-                        json.loads(raw_arguments)
-                        if isinstance(raw_arguments, str)
-                        else raw_arguments
+                    if not isinstance(tool_call, Mapping):
+                        raise ValueError("Tool call must be an object")
+                    raw_id = tool_call.get("id", "")
+                    if isinstance(raw_id, str):
+                        tool_call_id = raw_id
+                    function = tool_call.get("function")
+                    if not isinstance(function, Mapping):
+                        raise ValueError("Tool call function must be an object")
+                    tool_name = function.get("name")
+                    if not isinstance(tool_name, str) or not tool_name:
+                        raise ValueError("Tool call name must be a non-empty string")
+                    execution_name = (
+                        registry.resolve_name(tool_name)
+                        or canonical_tool_name(tool_name)
                     )
-                except json.JSONDecodeError:
-                    arguments = {}
-                canonical = registry.resolve_name(tool_name) or canonical_tool_name(
-                    tool_name
-                )
-                if canonical not in exposed_tool_names:
-                    execution_name = canonical
+                    raw_arguments = function.get("arguments", "{}")
+                    if isinstance(raw_arguments, str):
+                        try:
+                            arguments = json.loads(raw_arguments)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                "Tool call arguments must be valid JSON"
+                            ) from exc
+                    elif isinstance(raw_arguments, Mapping):
+                        arguments = dict(raw_arguments)
+                    else:
+                        raise ValueError(
+                            "Tool call arguments must be a JSON object"
+                        )
+                    if not isinstance(arguments, dict):
+                        raise ValueError(
+                            "Tool call arguments must decode to a JSON object"
+                        )
+
+                    available, _ = self._available_tools(child_harness)
+                    if execution_name not in available:
+                        result_data: Any = {
+                            "error": f"Tool {tool_name!r} is not available"
+                        }
+                    else:
+                        execution = await child_harness.tool_runtime.execute(
+                            tool_name, arguments, child_harness.runtime_context
+                        )
+                        if execution.termination_reason is TerminationReason.CANCELLED:
+                            raise asyncio.CancelledError
+                        execution_name = execution.tool_name
+                        result = execution.result
+                        result_success = result.success
+                        result_data = (
+                            result.data
+                            if result.success
+                            else {"error": str(result.error)}
+                        )
+                except (TypeError, ValueError) as exc:
+                    result_data = {"error": str(exc)}
+                try:
+                    json_result = to_json_value(result_data)
+                except (TypeError, ValueError):
                     result_success = False
-                    result_data = {"error": f"Tool {tool_name!r} is not available"}
-                else:
-                    execution = await child_harness.tool_runtime.execute(
-                        tool_name, arguments, child_harness.runtime_context
-                    )
-                    if execution.termination_reason is TerminationReason.CANCELLED:
-                        raise asyncio.CancelledError
-                    execution_name = execution.tool_name
-                    result = execution.result
-                    result_success = result.success
-                    result_data = (
-                        result.data if result.success else {"error": str(result.error)}
-                    )
-                content = (
-                    json.dumps(result_data, ensure_ascii=False)
-                    if isinstance(result_data, dict)
-                    else str(result_data)
-                )
+                    json_result = {"error": "Tool result is not valid JSON data"}
+                content = json.dumps(json_result, ensure_ascii=False)
                 tool_message = {
                     "role": "tool",
-                    "tool_call_id": tool_call.get("id", ""),
+                    "tool_call_id": tool_call_id,
                     "name": execution_name,
                     "content": content,
                 }
@@ -273,72 +308,6 @@ def _tool_is_enabled(tool: Tool, context: dict[str, Any]) -> bool:
         return bool(predicate)
     parameters = inspect.signature(predicate).parameters
     return bool(predicate() if not parameters else predicate(context))
-
-
-def _definition_from_snapshot(snapshot: Any) -> AgentDefinition:
-    if not isinstance(snapshot, dict):
-        snapshot = dict(snapshot)
-    hooks = snapshot.get("hooks")
-    mcp_servers = snapshot.get("mcp_servers")
-    common: dict[str, Any] = {
-        "agent_type": snapshot["agent_type"],
-        "when_to_use": snapshot["when_to_use"],
-        "tools": snapshot.get("tools"),
-        "disallowed_tools": snapshot.get("disallowed_tools"),
-        "skills": snapshot.get("skills"),
-        "mcp_servers": (
-            [AgentMcpServerSpec(**item) for item in mcp_servers]
-            if mcp_servers is not None
-            else None
-        ),
-        "hooks": AgentHooks(**hooks) if hooks is not None else None,
-        "color": snapshot.get("color"),
-        "model": snapshot.get("model"),
-        "effort": snapshot.get("effort"),
-        "permission_mode": (
-            AgentPermissionMode(snapshot["permission_mode"])
-            if snapshot.get("permission_mode") is not None
-            else None
-        ),
-        "max_turns": snapshot.get("max_turns"),
-        "filename": snapshot.get("filename"),
-        "base_dir": snapshot.get("base_dir"),
-        "critical_system_reminder": snapshot.get("critical_system_reminder"),
-        "required_mcp_servers": snapshot.get("required_mcp_servers"),
-        "background": bool(snapshot.get("background", False)),
-        "initial_prompt": snapshot.get("initial_prompt"),
-        "memory": (
-            AgentMemoryScope(snapshot["memory"])
-            if snapshot.get("memory") is not None
-            else None
-        ),
-        "isolation": (
-            AgentIsolationMode(snapshot["isolation"])
-            if snapshot.get("isolation") is not None
-            else None
-        ),
-        "omit_claude_md": bool(snapshot.get("omit_claude_md", False)),
-    }
-    system_prompt = str(snapshot["system_prompt"])
-
-    def get_system_prompt() -> str:
-        return system_prompt
-
-    source = AgentSource(snapshot["source"])
-    if source is AgentSource.BUILT_IN:
-        return BuiltInAgentDefinition(
-            **common, source=AgentSource.BUILT_IN, get_system_prompt=get_system_prompt
-        )
-    if source is AgentSource.PLUGIN:
-        return PluginAgentDefinition(
-            **common,
-            source=AgentSource.PLUGIN,
-            plugin=str(snapshot.get("plugin", "")),
-            get_system_prompt=get_system_prompt,
-        )
-    return CustomAgentDefinition(
-        **common, source=source, get_system_prompt=get_system_prompt
-    )
 
 
 class SpawnAgentManager:
@@ -417,8 +386,8 @@ class SpawnAgentManager:
             "completed_at": record.finished_at.isoformat() if record.finished_at else None,
         }
 
-    def abort_agent(self, agent_id: str) -> None:
-        asyncio.create_task(self._require_scheduler().stop(agent_id))
+    def abort_agent(self, agent_id: str) -> asyncio.Task[Any]:
+        return asyncio.create_task(self._require_scheduler().stop(agent_id))
 
 
 def get_spawn_agent_manager(scheduler=None) -> SpawnAgentManager:

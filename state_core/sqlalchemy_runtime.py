@@ -38,11 +38,11 @@ from .runtime_records import (
     WorktreeRecord,
     WorktreeStatus,
     _json_copy,
-    _sanitize_trace_error,
     _trace_duration_ms,
     ensure_agent_transition,
     ensure_trace_span_transition,
     ensure_worktree_transition,
+    sanitize_runtime_error,
 )
 
 SessionFactory = Callable[[], Session]
@@ -267,7 +267,7 @@ class SQLAlchemyAgentRepository:
             if usage is not None:
                 values["usage"] = _json_copy(usage)
             if error is not None:
-                values["error_json"] = _json_copy(error)
+                values["error_json"] = sanitize_runtime_error(error)
             if output is not None:
                 values["output_json"] = _json_copy(output)
             if self._before_compare_and_swap is not None:
@@ -525,7 +525,7 @@ class SQLAlchemyTraceSpanRepository:
         ).all()
         for row in rows:
             error = json.loads(row.error_json) if isinstance(row.error_json, str) else row.error_json
-            sanitized = _sanitize_trace_error(error)
+            sanitized = sanitize_runtime_error(error)
             if sanitized != error:
                 connection.execute(
                     text("UPDATE runtime_trace_spans SET error_json = :error WHERE span_id = :span_id"),
@@ -616,7 +616,7 @@ class SQLAlchemyTraceSpanRepository:
             if usage is not None:
                 values["usage"] = _json_copy(usage)
             if error is not None:
-                values["error_json"] = _sanitize_trace_error(error)
+                values["error_json"] = sanitize_runtime_error(error)
             if self._before_compare_and_swap is not None:
                 self._before_compare_and_swap()
             result = db.execute(

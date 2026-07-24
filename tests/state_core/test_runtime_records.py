@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # ruff: noqa: E501
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
+import state_core.runtime_records as runtime_records
 from models import Base
 from state_core import (
     AgentRecord,
@@ -25,6 +27,7 @@ from state_core import (
     TraceSpanStatus,
     WorktreeRecord,
     WorktreeStatus,
+    sanitize_runtime_error,
 )
 
 
@@ -241,6 +244,169 @@ def test_trace_errors_are_sanitized_before_persistence(store: SQLAlchemyStateSto
     assert finished.error == expected
     assert persisted is not None
     assert persisted.error == expected
+
+
+def test_runtime_error_sanitizer_redacts_embedded_credentials_and_bounds_strings() -> None:
+    sanitized = sanitize_runtime_error(
+        {
+            "type": "RuntimeError",
+            "message": (
+                "Bearer standalone-secret; Authorization: Bearer header-secret; "
+                "api_key=key-secret&password=password-secret; "
+                'Authorization: "Bearer quoted-header-secret"; '
+                'api_key="quoted key secret"; '
+                'password="escaped-\\"quote-secret"; '
+                'token="prefix scan-truncated-secret ' + "x" * 5000 + '"'
+            ),
+            "details": "x" * 5000,
+            "nested": {"safe": "kept", "access_token": "field-secret"},
+        }
+    )
+
+    assert sanitized is not None
+    serialized = json.dumps(sanitized)
+    for secret in (
+        "standalone-secret",
+        "header-secret",
+        "key-secret",
+        "password-secret",
+        "quoted-header-secret",
+        "quoted key secret",
+        "quote-secret",
+        "scan-truncated-secret",
+        "field-secret",
+    ):
+        assert secret not in serialized
+    assert sanitized["nested"]["safe"] == "kept"
+    assert len(sanitized["details"]) <= 2000
+
+
+def test_runtime_error_sanitizer_bounds_depth_width_and_total_size() -> None:
+    deep: dict[str, object] = {"message": "bottom"}
+    for _ in range(2000):
+        deep = {"nested": deep}
+    value = {
+        "deep": deep,
+        "wide": list(range(1000)),
+        "large": {f"field-{index}": "x" * 5000 for index in range(1000)},
+    }
+
+    sanitized = sanitize_runtime_error(value)
+
+    assert sanitized is not None
+    serialized = json.dumps(sanitized)
+    assert "[TRUNCATED]" in serialized
+    assert len(sanitized["wide"]) <= 65
+    assert len(serialized) <= 50000
+
+
+def test_runtime_error_sanitizer_bounds_json_escaped_text_and_large_integers() -> None:
+    escaped = sanitize_runtime_error(
+        {"values": ["\x00" * 5000 for _ in range(64)]}
+    )
+    large_integer = sanitize_runtime_error({"value": 1 << 200_000})
+
+    assert escaped is not None
+    assert large_integer is not None
+    assert len(json.dumps(escaped)) <= 50000
+    assert large_integer["value"] == "[TRUNCATED]"
+    assert len(json.dumps(large_integer)) <= 50000
+
+
+def test_runtime_error_sanitizer_fails_closed_for_boundary_quote_escapes() -> None:
+    prefix = 'token="prefix dangling-backslash-secret '
+    dangling_at_scan_boundary = (
+        prefix
+        + "x" * (4095 - len(prefix))
+        + "\\"
+        + 'closing-text"'
+    )
+
+    sanitized = sanitize_runtime_error(
+        {
+            "boundary": dangling_at_scan_boundary,
+            "newline": 'password="prefix escaped-newline-secret\\\nremainder"',
+        }
+    )
+
+    assert sanitized is not None
+    serialized = json.dumps(sanitized)
+    assert "dangling-backslash-secret" not in serialized
+    assert "escaped-newline-secret" not in serialized
+
+
+def test_runtime_error_sanitizer_bounds_inputs_before_regex_and_key_scans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scanned_lengths: list[int] = []
+    original_sensitive_key = runtime_records._is_sensitive_runtime_error_key
+
+    class PatternSpy:
+        def __init__(self, pattern: re.Pattern[str]) -> None:
+            self._pattern = pattern
+
+        def sub(self, replacement: str, value: str) -> str:
+            scanned_lengths.append(len(value))
+            return self._pattern.sub(replacement, value)
+
+    def sensitive_key_spy(key: str) -> bool:
+        scanned_lengths.append(len(key))
+        return original_sensitive_key(key)
+
+    monkeypatch.setattr(
+        runtime_records,
+        "_AUTHORIZATION_VALUE",
+        PatternSpy(runtime_records._AUTHORIZATION_VALUE),
+    )
+    monkeypatch.setattr(
+        runtime_records,
+        "_CREDENTIAL_ASSIGNMENT",
+        PatternSpy(runtime_records._CREDENTIAL_ASSIGNMENT),
+    )
+    monkeypatch.setattr(
+        runtime_records,
+        "_BEARER_VALUE",
+        PatternSpy(runtime_records._BEARER_VALUE),
+    )
+    monkeypatch.setattr(
+        runtime_records, "_is_sensitive_runtime_error_key", sensitive_key_spy
+    )
+
+    sanitized = sanitize_runtime_error(
+        {"x" * 100_000: "y" * 100_000, "message": "z" * 100_000}
+    )
+
+    assert sanitized is not None
+    assert scanned_lengths
+    assert max(scanned_lengths) <= 4096
+
+
+def test_agent_error_is_sanitized_before_physical_persistence(
+    store: SQLAlchemyStateStore, session_factory: sessionmaker[Session]
+) -> None:
+    created = store.agents.create(agent("agent-error"))
+    running = store.agents.transition(
+        created.agent_id, AgentStatus.RUNNING, created.revision
+    )
+
+    failed = store.agents.transition(
+        running.agent_id,
+        AgentStatus.FAILED,
+        running.revision,
+        error={
+            "type": "RuntimeError",
+            "message": "Authorization: Bearer database-secret",
+        },
+    )
+
+    assert "database-secret" not in str(failed.error)
+    with session_factory() as db:
+        physical = db.execute(
+            text(
+                "SELECT error_json FROM runtime_agents WHERE agent_id = 'agent-error'"
+            )
+        ).scalar_one()
+    assert "database-secret" not in str(physical)
 
 
 def test_trace_rejects_terminal_lifecycle_transition(store: SQLAlchemyStateStore) -> None:
