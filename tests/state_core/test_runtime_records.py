@@ -201,6 +201,10 @@ def test_trace_errors_are_sanitized_before_persistence(store: SQLAlchemyStateSto
                 "credentials": "credential secret",
                 "token_count": 7,
                 "secretariat": "safe word",
+                "database_password": "db secret",
+                "authToken": "auth secret",
+                "oauth_client_secret": "oauth secret",
+                "input_tokens": 3,
             },
             "requestHeaders": {"Authorization": "raw header secret"},
         },
@@ -225,6 +229,10 @@ def test_trace_errors_are_sanitized_before_persistence(store: SQLAlchemyStateSto
             "credentials": "[REDACTED]",
             "token_count": 7,
             "secretariat": "safe word",
+            "database_password": "[REDACTED]",
+            "authToken": "[REDACTED]",
+            "oauth_client_secret": "[REDACTED]",
+            "input_tokens": 3,
         },
         "requestHeaders": "[REDACTED]",
     }
@@ -408,6 +416,18 @@ def test_concurrent_legacy_trace_schema_initialization_is_versioned(tmp_path: Pa
         assert "duration_ms" in {
             row.name for row in connection.execute(text("PRAGMA table_info(runtime_trace_spans)"))
         }
+
+
+def test_connection_bound_session_factory_runs_runtime_migration(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'connection-bound.db'}")
+    Base.metadata.create_all(engine)
+    with engine.connect() as connection:
+        factory = sessionmaker(bind=connection, expire_on_commit=False)
+        store = SQLAlchemyStateStore(factory)
+        created = store.traces.start(
+            TraceSpanRecord(span_id="connection-span", root_session_id="root-1", kind="tool", name="request")
+        )
+        assert store.traces.get(created.span_id) == created
 
 
 def test_worktree_create_update_get_and_stale_revision(store: SQLAlchemyStateStore) -> None:

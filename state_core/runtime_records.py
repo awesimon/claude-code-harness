@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import builtins
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -89,10 +90,18 @@ def _normalize_trace_error_key(key: str) -> str:
 
 
 def _is_sensitive_trace_error_key(key: str) -> bool:
-    normalized = _normalize_trace_error_key(key)
+    tokenized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", key).casefold()
+    tokens = tuple(token for token in re.split(r"[^a-z0-9]+", tokenized) if token)
+    normalized = "".join(tokens)
     if normalized in _EXACT_SENSITIVE_TRACE_ERROR_KEYS | _TRACE_HEADER_CONTAINER_KEYS:
         return True
-    return normalized.endswith(("secretaccesskey", "privatekey", "signingkey", "bearertoken"))
+    if {"password", "passwd", "secret", "credential", "authorization", "cookie"}.intersection(tokens):
+        return True
+    if ("private" in tokens or "signing" in tokens) and "key" in tokens:
+        return True
+    return "token" in tokens and bool(
+        {"auth", "access", "refresh", "bearer", "id", "session", "oauth"}.intersection(tokens)
+    )
 
 
 def _sanitize_trace_error(value: Mapping[str, Any] | None) -> dict[str, Any] | None:

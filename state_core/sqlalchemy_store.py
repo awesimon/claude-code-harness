@@ -32,7 +32,6 @@ from .sqlalchemy_runtime import (
     SQLAlchemyTraceSpanRepository,
     SQLAlchemyWorktreeRepository,
 )
-
 from .types import (
     ClaimResult,
     CommitResult,

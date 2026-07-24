@@ -2,6 +2,7 @@
 
 from .migration import migrate_legacy_session
 from .repository import StateRepository, TaskRepository
+from .runtime import SessionRuntime, SessionRuntimeFactory
 from .runtime_records import (
     AgentRecord,
     AgentRepository,
@@ -20,7 +21,6 @@ from .runtime_records import (
     WorktreeRepository,
     WorktreeStatus,
 )
-from .runtime import SessionRuntime, SessionRuntimeFactory
 from .sqlalchemy_store import (
     SQLAlchemyStateRepository,
     SQLAlchemyStateStore,

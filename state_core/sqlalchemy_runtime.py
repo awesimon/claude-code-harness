@@ -410,54 +410,74 @@ class SQLAlchemyTraceSpanRepository:
             bind = db.get_bind()
             if bind.dialect.name != "sqlite":
                 return
+            if not hasattr(bind, "connect"):
+                with bind.begin_nested():
+                    self._apply_sqlite_runtime_migration(bind)
+                return
             with bind.connect() as connection:
                 connection.exec_driver_sql("BEGIN IMMEDIATE")
                 try:
-                    connection.execute(
-                        text(
-                            "CREATE TABLE IF NOT EXISTS runtime_schema_migrations "
-                            "(name TEXT PRIMARY KEY, version INTEGER NOT NULL)"
-                        )
-                    )
-                    version = connection.execute(
-                        text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
-                    ).scalar_one_or_none()
-                    columns = connection.execute(text("PRAGMA table_info(runtime_trace_spans)")).all()
-                    if not columns or version is not None and version >= 1:
-                        connection.commit()
-                        return
-                    names = {column.name for column in columns}
-                    if "duration_ms" not in names:
-                        connection.execute(text("ALTER TABLE runtime_trace_spans ADD COLUMN duration_ms INTEGER"))
-                    connection.execute(
-                        text(
-                            "UPDATE runtime_trace_spans SET duration_ms = "
-                            "CAST(ROUND((julianday(finished_at) - julianday(started_at)) * 86400000) AS INTEGER) "
-                            "WHERE status != 'running' AND started_at IS NOT NULL "
-                            "AND finished_at IS NOT NULL AND duration_ms IS NULL"
-                        )
-                    )
-                    rows = connection.execute(
-                        text("SELECT span_id, error_json FROM runtime_trace_spans WHERE error_json IS NOT NULL")
-                    ).all()
-                    for row in rows:
-                        error = json.loads(row.error_json) if isinstance(row.error_json, str) else row.error_json
-                        sanitized = _sanitize_trace_error(error)
-                        if sanitized != error:
-                            connection.execute(
-                                text("UPDATE runtime_trace_spans SET error_json = :error WHERE span_id = :span_id"),
-                                {"span_id": row.span_id, "error": json.dumps(sanitized)},
-                            )
-                    connection.execute(
-                        text(
-                            "INSERT INTO runtime_schema_migrations (name, version) "
-                            "VALUES ('runtime_trace_spans', 1)"
-                        )
-                    )
+                    self._apply_sqlite_runtime_migration(connection)
                     connection.commit()
                 except BaseException:
                     connection.rollback()
                     raise
+
+    @staticmethod
+    def _apply_sqlite_runtime_migration(connection: Any) -> None:
+        connection.execute(
+            text(
+                "CREATE TABLE IF NOT EXISTS runtime_schema_migrations "
+                "(name TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+            )
+        )
+        version = connection.execute(
+            text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
+        ).scalar_one_or_none()
+        columns = connection.execute(text("PRAGMA table_info(runtime_trace_spans)")).all()
+        if not columns or version is not None and version >= 1:
+            return
+        names = {column.name for column in columns}
+        if "duration_ms" not in names:
+            connection.execute(text("ALTER TABLE runtime_trace_spans ADD COLUMN duration_ms INTEGER"))
+        if connection.execute(text("PRAGMA table_info(runtime_agents)")).first() is not None:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_runtime_agents_root_status_created "
+                    "ON runtime_agents (root_session_id, status, created_at)"
+                )
+            )
+        rows = connection.execute(
+            text(
+                "SELECT span_id, started_at, finished_at FROM runtime_trace_spans "
+                "WHERE status != 'running' AND started_at IS NOT NULL "
+                "AND finished_at IS NOT NULL AND duration_ms IS NULL"
+            )
+        ).all()
+        for row in rows:
+            started_at = datetime.fromisoformat(str(row.started_at)).replace(tzinfo=timezone.utc)
+            finished_at = datetime.fromisoformat(str(row.finished_at)).replace(tzinfo=timezone.utc)
+            if finished_at < started_at:
+                raise ValueError("finished_at must not precede started_at")
+            duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+            connection.execute(
+                text("UPDATE runtime_trace_spans SET duration_ms = :duration_ms WHERE span_id = :span_id"),
+                {"span_id": row.span_id, "duration_ms": duration_ms},
+            )
+        rows = connection.execute(
+            text("SELECT span_id, error_json FROM runtime_trace_spans WHERE error_json IS NOT NULL")
+        ).all()
+        for row in rows:
+            error = json.loads(row.error_json) if isinstance(row.error_json, str) else row.error_json
+            sanitized = _sanitize_trace_error(error)
+            if sanitized != error:
+                connection.execute(
+                    text("UPDATE runtime_trace_spans SET error_json = :error WHERE span_id = :span_id"),
+                    {"span_id": row.span_id, "error": json.dumps(sanitized)},
+                )
+        connection.execute(
+            text("INSERT INTO runtime_schema_migrations (name, version) VALUES ('runtime_trace_spans', 1)")
+        )
 
     @staticmethod
     def _record(row: RuntimeTraceSpan) -> TraceSpanRecord:
