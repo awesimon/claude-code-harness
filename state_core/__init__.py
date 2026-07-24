@@ -1,6 +1,11 @@
 """Public domain contract for durable session state."""
 
 from .repository import StateRepository, TaskRepository
+from .sqlalchemy_store import (
+    SQLAlchemyStateRepository,
+    SQLAlchemyStateStore,
+    SQLAlchemyTaskRepository,
+)
 from .types import (
     ClaimResult,
     CommitResult,
@@ -40,6 +45,9 @@ __all__ = [
     "SessionHealth",
     "SessionSnapshot",
     "SessionState",
+    "SQLAlchemyStateRepository",
+    "SQLAlchemyStateStore",
+    "SQLAlchemyTaskRepository",
     "StateCoreError",
     "StateRepository",
     "TaskItem",
