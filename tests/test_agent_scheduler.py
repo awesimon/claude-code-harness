@@ -8,7 +8,13 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from agents.types import AgentExecutionResult, AgentRequest
+from agents.built_in import EXPLORE_AGENT
+from agents.engine import AgentExecutor
+from agents.types import (
+    AgentExecutionResult,
+    AgentRequest,
+    CustomAgentDefinition,
+)
 from harness import SessionHarnessFactory
 from harness.agents import (
     AgentNotFound,
@@ -17,6 +23,7 @@ from harness.agents import (
     AgentWaitTimeout,
 )
 from models import Base
+from services.llm_service import ChatCompletionResponse
 from state_core import (
     AgentRecord,
     AgentStatus,
@@ -414,3 +421,201 @@ async def test_invalid_type_and_cwd_fail_before_durable_mutation(tmp_path: Path)
             AgentRequest("bad", "Explore", "d", cwd=tmp_path.parent / "outside")
         )
     assert scheduler.list() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["stop", "shutdown"])
+async def test_force_stop_is_bounded_and_quarantines_cancel_suppressing_runner(
+    tmp_path: Path, operation: str
+) -> None:
+    root, _ = make_harness(tmp_path)
+
+    class StubbornRunner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancel_seen = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run(self, record, child):
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancel_seen.set()
+                await self.release.wait()
+            return AgentExecutionResult(content="late", termination_reason="completed")
+
+    runner = StubbornRunner()
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner=runner,
+        stop_grace=0.01,
+        force_grace=0.01,
+    )
+    record = await scheduler.spawn(
+        AgentRequest("stubborn", "Explore", "d", background=True)
+    )
+    await runner.started.wait()
+
+    async with asyncio.timeout(0.2):
+        if operation == "stop":
+            cancelled = await scheduler.stop(record.agent_id)
+        else:
+            await scheduler.shutdown()
+            cancelled = scheduler.status(record.agent_id)
+
+    assert runner.cancel_seen.is_set()
+    assert cancelled.status is AgentStatus.CANCELLED
+    assert await scheduler.stop(record.agent_id) == cancelled
+    assert record.agent_id not in scheduler.live_agent_ids
+    assert scheduler.quarantined_task_count == 1
+    assert scheduler.parent_limiter_count == 0
+    cancelled_revision = cancelled.revision
+
+    runner.release.set()
+    await wait_until(lambda: scheduler.quarantined_task_count == 0)
+    reaped = scheduler.status(record.agent_id)
+    assert reaped.status is AgentStatus.CANCELLED
+    assert reaped.revision == cancelled_revision
+
+
+@pytest.mark.asyncio
+async def test_custom_definition_is_validated_snapshotted_and_run(tmp_path: Path) -> None:
+    root, _ = make_harness(tmp_path)
+    runner = ControlledRunner()
+    runner.release.set()
+    scheduler = AgentScheduler(root, root.store.agents, runner=runner)
+    definition = CustomAgentDefinition(
+        agent_type="custom-review",
+        when_to_use="Review custom input",
+        tools=["read_file"],
+        disallowed_tools=["bash"],
+        model="custom-model",
+        skills=["review"],
+        get_system_prompt=lambda: "custom system prompt",
+    )
+
+    result = await scheduler.spawn(
+        AgentRequest(
+            "review",
+            "custom-review",
+            "custom",
+            definition=definition,
+        )
+    )
+
+    snapshot = result.definition_snapshot
+    assert result.status is AgentStatus.COMPLETED
+    assert snapshot["agent_type"] == "custom-review"
+    assert snapshot["system_prompt"] == "custom system prompt"
+    assert snapshot["tools"] == ["read_file"]
+    assert snapshot["disallowed_tools"] == ["bash"]
+    reconstructed = AgentExecutor.from_record(result).agent_definition
+    assert isinstance(reconstructed, CustomAgentDefinition)
+    assert reconstructed.get_system_prompt() == "custom system prompt"  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_queued_definition_uses_detached_snapshot_not_mutated_globals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _ = make_harness(tmp_path)
+    scheduler = AgentScheduler(
+        root, root.store.agents, stop_grace=0.01, force_grace=0.01
+    )
+    original_tools = EXPLORE_AGENT.tools
+    assert original_tools is not None
+    original_copy = list(original_tools)
+    original_when = EXPLORE_AGENT.when_to_use
+    original_prompt = EXPLORE_AGENT.get_system_prompt
+    record = await scheduler.spawn(
+        AgentRequest("queued snapshot", "Explore", "d", background=True)
+    )
+
+    class SnapshotLLM:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def chat_completion(self, request):
+            self.requests.append(request)
+            return ChatCompletionResponse(
+                id="snapshot", model="test", content="snapshot used", finish_reason="stop"
+            )
+
+    llm = SnapshotLLM()
+    monkeypatch.setattr("agents.engine.LLMService", lambda: llm)
+    try:
+        original_tools.append("write_file")
+        EXPLORE_AGENT.when_to_use = "mutated after spawn"
+        EXPLORE_AGENT.get_system_prompt = lambda: "mutated prompt"
+
+        completed = await scheduler.wait(record.agent_id)
+
+        assert completed.status is AgentStatus.COMPLETED
+        request = llm.requests[0]
+        schema_names = {item["function"]["name"] for item in request.tools}
+        assert "write_file" not in schema_names
+        assert request.messages[0].content == record.definition_snapshot["system_prompt"]
+    finally:
+        original_tools[:] = original_copy
+        EXPLORE_AGENT.when_to_use = original_when
+        EXPLORE_AGENT.get_system_prompt = original_prompt
+
+
+@pytest.mark.asyncio
+async def test_invalid_custom_definition_rejected_before_persistence(tmp_path: Path) -> None:
+    root, _ = make_harness(tmp_path)
+    scheduler = AgentScheduler(root, root.store.agents, runner=ControlledRunner())
+    invalid = CustomAgentDefinition(agent_type="invalid", when_to_use="")
+
+    with pytest.raises(ValueError, match="when_to_use"):
+        await scheduler.spawn(
+            AgentRequest("invalid", "invalid", "d", definition=invalid)
+        )
+
+    assert scheduler.list() == []
+
+
+@pytest.mark.asyncio
+async def test_parent_limiters_are_refcounted_and_removed(tmp_path: Path) -> None:
+    root, _ = make_harness(tmp_path)
+    runner = ControlledRunner()
+    runner.release.set()
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner=runner,
+        root_concurrency=4,
+        per_parent_concurrency=1,
+    )
+
+    for index in range(30):
+        await scheduler.spawn(
+            AgentRequest(
+                str(index), "Explore", "d", parent_agent_id=f"parent-{index}"
+            )
+        )
+    assert scheduler.parent_limiter_count == 0
+
+    runner.release.clear()
+    siblings = [
+        await scheduler.spawn(
+            AgentRequest(
+                f"sibling-{index}",
+                "Explore",
+                "d",
+                background=True,
+                parent_agent_id="shared",
+            )
+        )
+        for index in range(3)
+    ]
+    await wait_until(lambda: len(runner.calls) == 31)
+    assert scheduler.parent_limiter_count == 1
+    assert scheduler.parent_limiter_refcounts == {"shared": 3}
+
+    runner.release.set()
+    await asyncio.gather(*(scheduler.wait(item.agent_id) for item in siblings))
+    assert scheduler.parent_limiter_count == 0
+    assert scheduler.parent_limiter_refcounts == {}

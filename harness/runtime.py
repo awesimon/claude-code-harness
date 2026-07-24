@@ -75,28 +75,7 @@ class ToolRuntime:
                 TerminationReason.CANCELLED,
             )
 
-        tool_context = dict(context.metadata)
-        tool_context.update(
-            {
-                "session_runtime": context.metadata.get("session_runtime"),
-                "agent_id": context.metadata.get("agent_id"),
-                "session_harness": context.metadata.get("session_harness"),
-                "session_id": context.session_id,
-                "current_mode": context.permission_mode.value,
-                "workspace_root": str(context.workspace_root)
-                if context.workspace_root
-                else None,
-                "runtime_context": context,
-                "effective_cwd": str(context.workspace_root.resolve())
-                if context.workspace_root
-                else None,
-                "cancellation": context.cancellation,
-                "permission_mode": context.permission_mode,
-                "approval_callback": context.approval_callback,
-                "tool_timeout": context.tool_timeout,
-                "tool_timeout_disabled": context.tool_timeout_disabled,
-            }
-        )
+        tool_context = self.tool_context(context)
         task = asyncio.create_task(tool.run(input_data, tool_context))
         context.cancellation.track(task)
         if timeout is not None:
@@ -129,6 +108,34 @@ class ToolRuntime:
         except Exception as exc:
             error = exc if isinstance(exc, ToolExecutionError) else ToolExecutionError(str(exc))
             return ToolExecution(canonical, ToolResult.fail(error), TerminationReason.FAILED)
+
+    @staticmethod
+    def tool_context(context: RuntimeContext) -> dict[str, Any]:
+        """Build the authoritative legacy context passed to tools and predicates."""
+
+        tool_context = dict(context.metadata)
+        tool_context.update(
+            {
+                "session_runtime": context.metadata.get("session_runtime"),
+                "agent_id": context.metadata.get("agent_id"),
+                "session_harness": context.metadata.get("session_harness"),
+                "session_id": context.session_id,
+                "current_mode": context.permission_mode.value,
+                "workspace_root": str(context.workspace_root)
+                if context.workspace_root
+                else None,
+                "runtime_context": context,
+                "effective_cwd": str(context.workspace_root.resolve())
+                if context.workspace_root
+                else None,
+                "cancellation": context.cancellation,
+                "permission_mode": context.permission_mode,
+                "approval_callback": context.approval_callback,
+                "tool_timeout": context.tool_timeout,
+                "tool_timeout_disabled": context.tool_timeout_disabled,
+            }
+        )
+        return tool_context
 
     @staticmethod
     def _prepare_input(

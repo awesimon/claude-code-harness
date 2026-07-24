@@ -18,8 +18,16 @@ from agents.built_in import get_agent_by_type
 from agents.types import (
     AgentDefinition,
     AgentExecutionResult,
+    AgentHooks,
+    AgentMcpServerSpec,
+    AgentPermissionMode,
     AgentRequest,
     AgentRunner,
+    AgentSource,
+    BaseAgentDefinition,
+    BuiltInAgentDefinition,
+    CustomAgentDefinition,
+    PluginAgentDefinition,
 )
 from state_core import (
     AgentRecord,
@@ -56,6 +64,14 @@ _REDACT = re.compile(
 )
 
 
+class _ParentLease:
+    def __init__(self, key: str, semaphore: asyncio.Semaphore) -> None:
+        self.key = key
+        self.semaphore = semaphore
+        self.acquired = False
+        self.released = False
+
+
 def _json_value(value: Any) -> Any:
     if value is None or type(value) in (bool, int, float, str):
         return value
@@ -81,6 +97,18 @@ def _definition_snapshot(
 ) -> dict[str, Any]:
     snapshot = _json_value(definition)
     assert isinstance(snapshot, dict)
+    if definition.get_system_prompt is None:
+        system_prompt = (
+            "You are an agent for Claude Code.\n"
+            f"Agent Type: {definition.agent_type}\n\n"
+            f"{definition.when_to_use}\n\n"
+            "Complete the task and return a concise factual report."
+        )
+    else:
+        system_prompt = definition.get_system_prompt()
+    if not isinstance(system_prompt, str) or not system_prompt:
+        raise ValueError("Agent system prompt must be a non-empty string")
+    snapshot["system_prompt"] = system_prompt
     snapshot["metadata"] = _json_value(copy.deepcopy(request.definition_metadata))
     if request.model is not None:
         snapshot["model"] = request.model
@@ -151,11 +179,17 @@ class AgentScheduler:
         root_concurrency: int = 4,
         per_parent_concurrency: int = 2,
         stop_grace: float = 0.25,
+        force_grace: float = 0.25,
     ) -> None:
         if root_concurrency < 1 or per_parent_concurrency < 1:
             raise ValueError("agent concurrency limits must be positive")
-        if stop_grace < 0 or not math.isfinite(stop_grace):
-            raise ValueError("stop_grace must be a non-negative finite number")
+        if (
+            stop_grace < 0
+            or force_grace < 0
+            or not math.isfinite(stop_grace)
+            or not math.isfinite(force_grace)
+        ):
+            raise ValueError("stop grace periods must be non-negative finite numbers")
         if runner is not None and runner_factory is not None:
             raise ValueError("provide runner or runner_factory, not both")
         self.harness = harness
@@ -165,15 +199,32 @@ class AgentScheduler:
         self._root_semaphore = asyncio.Semaphore(root_concurrency)
         self._per_parent_concurrency = per_parent_concurrency
         self._parent_semaphores: dict[str, asyncio.Semaphore] = {}
+        self._parent_refcounts: dict[str, int] = {}
+        self._parent_leases: dict[str, _ParentLease] = {}
+        self._parent_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[AgentRecord]] = {}
         self._children: dict[str, SessionHarness] = {}
+        self._quarantined_tasks: set[asyncio.Task[AgentRecord]] = set()
         self._stop_grace = stop_grace
+        self._force_grace = force_grace
         self._closed = False
         _LIVE_SCHEDULERS.add(self)
 
     @property
     def live_agent_ids(self) -> frozenset[str]:
         return frozenset(self._tasks)
+
+    @property
+    def quarantined_task_count(self) -> int:
+        return len(self._quarantined_tasks)
+
+    @property
+    def parent_limiter_count(self) -> int:
+        return len(self._parent_semaphores)
+
+    @property
+    def parent_limiter_refcounts(self) -> dict[str, int]:
+        return dict(self._parent_refcounts)
 
     def _owned(self, agent_id: str) -> AgentRecord:
         record = self.repository.get(agent_id)
@@ -186,24 +237,99 @@ class AgentScheduler:
         return record
 
     @staticmethod
-    def _validate_request(request: AgentRequest) -> AgentDefinition:
+    def _validate_request(
+        request: AgentRequest,
+    ) -> tuple[AgentDefinition, dict[str, Any]]:
         if not isinstance(request.prompt, str) or not request.prompt:
             raise ValueError("Agent prompt must be non-empty")
         if not isinstance(request.description, str) or not request.description:
             raise ValueError("Agent description must be non-empty")
         built_in_definition = get_agent_by_type(request.agent_type)
-        if built_in_definition is None:
+        if request.definition is None:
+            if built_in_definition is None:
+                raise ValueError(f"Unknown agent type: {request.agent_type}")
+            definition: AgentDefinition = built_in_definition
+        else:
+            definition = request.definition
+        if not isinstance(definition, BaseAgentDefinition):
+            raise ValueError("Agent definition must be a complete agent definition")
+        if built_in_definition is None and not isinstance(
+            definition, (CustomAgentDefinition, PluginAgentDefinition)
+        ):
             raise ValueError(f"Unknown agent type: {request.agent_type}")
-        definition = request.definition or built_in_definition
         if definition.agent_type != request.agent_type:
             raise ValueError("Agent definition type does not match request")
+        if not definition.agent_type:
+            raise ValueError("Agent definition agent_type must be non-empty")
+        if not isinstance(definition.when_to_use, str) or not definition.when_to_use:
+            raise ValueError("Agent definition when_to_use must be non-empty")
+        try:
+            source = AgentSource(definition.source)
+        except ValueError as exc:
+            raise ValueError("Agent definition source is invalid") from exc
+        if isinstance(definition, CustomAgentDefinition) and source not in {
+            AgentSource.USER_SETTINGS,
+            AgentSource.PROJECT_SETTINGS,
+            AgentSource.POLICY_SETTINGS,
+            AgentSource.FLAG_SETTINGS,
+        }:
+            raise ValueError("Custom agent definition source is invalid")
+        if (
+            isinstance(definition, BuiltInAgentDefinition)
+            and source is not AgentSource.BUILT_IN
+        ):
+            raise ValueError("Built-in agent definition source is invalid")
+        if isinstance(definition, PluginAgentDefinition) and source is not AgentSource.PLUGIN:
+            raise ValueError("Plugin agent definition source is invalid")
+        if request.model is not None and not isinstance(request.model, str):
+            raise ValueError("Agent model must be a string")
+        if definition.model is not None and not isinstance(definition.model, str):
+            raise ValueError("Agent definition model must be a string")
+        if definition.get_system_prompt is not None and not callable(
+            definition.get_system_prompt
+        ):
+            raise ValueError("Agent definition system prompt provider must be callable")
+        if definition.permission_mode is not None and not isinstance(
+            definition.permission_mode, AgentPermissionMode
+        ):
+            raise ValueError("Agent definition permission_mode is invalid")
+        for field_name in (
+            "tools",
+            "disallowed_tools",
+            "skills",
+            "required_mcp_servers",
+        ):
+            value = getattr(definition, field_name)
+            if value is not None and (
+                not isinstance(value, list)
+                or any(not isinstance(item, str) or not item for item in value)
+            ):
+                raise ValueError(f"Agent definition {field_name} must be a list of strings")
+        if definition.max_turns is not None and (
+            isinstance(definition.max_turns, bool)
+            or not isinstance(definition.max_turns, int)
+            or definition.max_turns < 1
+        ):
+            raise ValueError("Agent definition max_turns must be positive")
+        if definition.hooks is not None and not isinstance(definition.hooks, AgentHooks):
+            raise ValueError("Agent definition hooks are invalid")
+        if definition.mcp_servers is not None and (
+            not isinstance(definition.mcp_servers, list)
+            or any(
+                not isinstance(server, AgentMcpServerSpec)
+                for server in definition.mcp_servers
+            )
+        ):
+            raise ValueError("Agent definition mcp_servers are invalid")
+        if isinstance(definition, PluginAgentDefinition) and not definition.plugin:
+            raise ValueError("Plugin agent definition requires plugin")
         _execution_timeout(request)
-        return definition
+        return definition, _definition_snapshot(definition, request)
 
     async def spawn(self, request: AgentRequest) -> AgentRecord:
         if self._closed:
             raise RuntimeError("Agent scheduler is shut down")
-        definition = self._validate_request(request)
+        definition, definition_snapshot = self._validate_request(request)
         agent_id = f"agent-{request.agent_type.lower()}-{uuid.uuid4().hex[:12]}"
         parent_agent_id = request.parent_agent_id or self.harness.agent_id
         child_options: dict[str, Any] = {
@@ -225,7 +351,7 @@ class AgentScheduler:
                 description=request.description,
                 is_background=request.background,
                 effective_cwd=str(child.effective_cwd),
-                definition_snapshot=_definition_snapshot(definition, request),
+                definition_snapshot=definition_snapshot,
                 worktree_id=request.worktree_id,
             )
         )
@@ -244,11 +370,42 @@ class AgentScheduler:
             if child is not None:
                 child.runtime_context.cancellation.dispose()
 
-    def _parent_semaphore(self, record: AgentRecord) -> asyncio.Semaphore:
+    async def _acquire_parent_lease(self, record: AgentRecord) -> "_ParentLease":
         key = record.parent_agent_id or "<root>"
-        return self._parent_semaphores.setdefault(
-            key, asyncio.Semaphore(self._per_parent_concurrency)
-        )
+        async with self._parent_lock:
+            semaphore = self._parent_semaphores.setdefault(
+                key, asyncio.Semaphore(self._per_parent_concurrency)
+            )
+            self._parent_refcounts[key] = self._parent_refcounts.get(key, 0) + 1
+            lease = _ParentLease(key, semaphore)
+            self._parent_leases[record.agent_id] = lease
+        try:
+            await semaphore.acquire()
+            lease.acquired = True
+            return lease
+        except BaseException:
+            await self._release_parent_lease(record.agent_id, lease)
+            raise
+
+    async def _release_parent_lease(
+        self, agent_id: str, lease: "_ParentLease" | None = None
+    ) -> None:
+        lease = lease or self._parent_leases.get(agent_id)
+        if lease is None or lease.released:
+            return
+        lease.released = True
+        if lease.acquired:
+            lease.semaphore.release()
+        async with self._parent_lock:
+            current = self._parent_refcounts.get(lease.key, 0)
+            if current <= 1:
+                self._parent_refcounts.pop(lease.key, None)
+                if self._parent_semaphores.get(lease.key) is lease.semaphore:
+                    self._parent_semaphores.pop(lease.key, None)
+            else:
+                self._parent_refcounts[lease.key] = current - 1
+            if self._parent_leases.get(agent_id) is lease:
+                self._parent_leases.pop(agent_id, None)
 
     def _runner_for(self, record: AgentRecord):
         if self._runner_factory is not None:
@@ -257,33 +414,31 @@ class AgentScheduler:
             return self._runner
         from agents.engine import AgentExecutor
 
-        definition = get_agent_by_type(record.agent_type)
-        if definition is None:
-            raise ValueError(f"Unknown agent type: {record.agent_type}")
-        return AgentExecutor(definition)
+        return AgentExecutor.from_record(record)
 
     async def _execute(self, record: AgentRecord, child: SessionHarness) -> AgentRecord:
+        lease: _ParentLease | None = None
         try:
-            async with self._parent_semaphore(record):
-                async with self._root_semaphore:
-                    if child.runtime_context.cancellation.cancelled:
-                        raise asyncio.CancelledError
-                    current = self._owned(record.agent_id)
-                    current = self.repository.transition(
-                        current.agent_id, AgentStatus.RUNNING, current.revision
-                    )
-                    runner = self._runner_for(current)
-                    invocation = (
-                        runner.run(current, child)
-                        if hasattr(runner, "run")
-                        else runner(current, child)
-                    )
-                    timeout = current.definition_snapshot.get("execution_timeout")
-                    if timeout is None:
-                        result = await invocation
-                    else:
-                        result = await asyncio.wait_for(invocation, float(timeout))
-                    return self._persist_result(current.agent_id, result)
+            lease = await self._acquire_parent_lease(record)
+            async with self._root_semaphore:
+                if child.runtime_context.cancellation.cancelled:
+                    raise asyncio.CancelledError
+                current = self._owned(record.agent_id)
+                current = self.repository.transition(
+                    current.agent_id, AgentStatus.RUNNING, current.revision
+                )
+                runner = self._runner_for(current)
+                invocation = (
+                    runner.run(current, child)
+                    if hasattr(runner, "run")
+                    else runner(current, child)
+                )
+                timeout = current.definition_snapshot.get("execution_timeout")
+                if timeout is None:
+                    result = await invocation
+                else:
+                    result = await asyncio.wait_for(invocation, float(timeout))
+                return self._persist_result(current.agent_id, result)
         except TimeoutError:
             return self._finish(record.agent_id, AgentStatus.TIMED_OUT)
         except asyncio.CancelledError:
@@ -292,6 +447,9 @@ class AgentScheduler:
             return self._finish(
                 record.agent_id, AgentStatus.FAILED, error=_error_payload(exc)
             )
+        finally:
+            if lease is not None:
+                await self._release_parent_lease(record.agent_id, lease)
 
     def _persist_result(
         self, agent_id: str, result: AgentExecutionResult
@@ -417,8 +575,32 @@ class AgentScheduler:
             await asyncio.wait_for(asyncio.shield(task), self._stop_grace)
         except asyncio.TimeoutError:
             task.cancel()
-            await asyncio.shield(task)
+            try:
+                await asyncio.wait_for(asyncio.shield(task), self._force_grace)
+            except asyncio.TimeoutError:
+                cancelled = self._finish(agent_id, AgentStatus.CANCELLED)
+                await self._quarantine(agent_id, task)
+                return cancelled
         return self._owned(agent_id)
+
+    async def _quarantine(
+        self, agent_id: str, task: asyncio.Task[AgentRecord]
+    ) -> None:
+        if self._tasks.get(agent_id) is task:
+            self._tasks.pop(agent_id, None)
+        child = self._children.pop(agent_id, None)
+        if child is not None:
+            child.runtime_context.cancellation.dispose()
+        await self._release_parent_lease(agent_id)
+        self._quarantined_tasks.add(task)
+        task.add_done_callback(self._reap_quarantined)
+
+    def _reap_quarantined(self, task: asyncio.Task[AgentRecord]) -> None:
+        self._quarantined_tasks.discard(task)
+        try:
+            task.result()
+        except BaseException:
+            pass
 
     def reconcile(self) -> list[AgentRecord]:
         live = {

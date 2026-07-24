@@ -7,6 +7,7 @@ executes one already-created agent record against its child harness.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Callable
 from typing import Any
@@ -15,7 +16,16 @@ from agents.types import (
     AgentDefinition,
     AgentExecutionConfig,
     AgentExecutionResult,
+    AgentHooks,
+    AgentIsolationMode,
+    AgentMcpServerSpec,
+    AgentMemoryScope,
+    AgentPermissionMode,
+    AgentSource,
     AgentToolResult,
+    BuiltInAgentDefinition,
+    CustomAgentDefinition,
+    PluginAgentDefinition,
 )
 from harness import SessionHarness, TerminationReason
 from services import ChatCompletionRequest, LLMService, Message
@@ -38,29 +48,54 @@ class AgentExecutor:
         self.config = config or AgentExecutionConfig()
         self.llm_service = llm_service or LLMService()
 
-    def _resolve_tools(self) -> list[Tool]:
+    @classmethod
+    def from_record(
+        cls,
+        record: AgentRecord,
+        *,
+        config: AgentExecutionConfig | None = None,
+        llm_service: LLMService | None = None,
+    ) -> "AgentExecutor":
+        return cls(
+            _definition_from_snapshot(record.definition_snapshot),
+            config=config,
+            llm_service=llm_service,
+        )
+
+    def _resolve_tools(self, child_harness: SessionHarness) -> list[Tool]:
+        registry = child_harness.tool_runtime.registry
         all_tools = [
             tool
-            for name in ToolRegistry.list_tools()
-            if (tool := ToolRegistry.get(name)) is not None
+            for name in registry.list_tools()
+            if (tool := registry.get(name)) is not None
         ]
         allowed_tools = self.agent_definition.tools
         if allowed_tools is None or allowed_tools == ["*"]:
             resolved = all_tools
         else:
-            allowed = {canonical_tool_name(name) for name in allowed_tools}
-            resolved = [tool for tool in all_tools if self.tool_name(tool) in allowed]
+            allowed = {
+                registry.resolve_name(name) or canonical_tool_name(name)
+                for name in allowed_tools
+            }
+            resolved = [
+                tool for tool in all_tools if self.tool_name(tool, registry) in allowed
+            ]
         if self.agent_definition.disallowed_tools:
             denied = {
-                canonical_tool_name(name)
+                registry.resolve_name(name) or canonical_tool_name(name)
                 for name in self.agent_definition.disallowed_tools
             }
-            resolved = [tool for tool in resolved if self.tool_name(tool) not in denied]
-        return resolved
+            resolved = [
+                tool for tool in resolved if self.tool_name(tool, registry) not in denied
+            ]
+        context = child_harness.tool_runtime.tool_context(
+            child_harness.runtime_context
+        )
+        return [tool for tool in resolved if _tool_is_enabled(tool, context)]
 
     @staticmethod
-    def tool_name(tool: Tool) -> str:
-        return ToolRegistry.resolve_name(tool.name) or canonical_tool_name(tool.name)
+    def tool_name(tool: Tool, registry: Any = ToolRegistry) -> str:
+        return registry.resolve_name(tool.name) or canonical_tool_name(tool.name)
 
     def _build_system_prompt(self) -> str:
         if self.agent_definition.get_system_prompt:
@@ -84,7 +119,9 @@ class AgentExecutor:
         if cancellation.cancelled:
             raise asyncio.CancelledError
 
-        tools = self._resolve_tools()
+        registry = child_harness.tool_runtime.registry
+        tools = self._resolve_tools(child_harness)
+        exposed_tool_names = {self.tool_name(tool, registry) for tool in tools}
         llm_messages = [Message(role="system", content=self._build_system_prompt())]
         if self.agent_definition.initial_prompt:
             llm_messages.append(
@@ -102,7 +139,7 @@ class AgentExecutor:
                 raise asyncio.CancelledError
             schemas = []
             for tool in tools:
-                spec = ToolRegistry.get_spec(self.tool_name(tool))
+                spec = registry.get_spec(self.tool_name(tool, registry))
                 if spec is not None:
                     schemas.append(spec.to_openai())
             model = record.definition_snapshot.get("model") or self.config.model
@@ -166,15 +203,25 @@ class AgentExecutor:
                     )
                 except json.JSONDecodeError:
                     arguments = {}
-                execution = await child_harness.tool_runtime.execute(
-                    tool_name, arguments, child_harness.runtime_context
+                canonical = registry.resolve_name(tool_name) or canonical_tool_name(
+                    tool_name
                 )
-                if execution.termination_reason is TerminationReason.CANCELLED:
-                    raise asyncio.CancelledError
-                result = execution.result
-                result_data = (
-                    result.data if result.success else {"error": str(result.error)}
-                )
+                if canonical not in exposed_tool_names:
+                    execution_name = canonical
+                    result_success = False
+                    result_data = {"error": f"Tool {tool_name!r} is not available"}
+                else:
+                    execution = await child_harness.tool_runtime.execute(
+                        tool_name, arguments, child_harness.runtime_context
+                    )
+                    if execution.termination_reason is TerminationReason.CANCELLED:
+                        raise asyncio.CancelledError
+                    execution_name = execution.tool_name
+                    result = execution.result
+                    result_success = result.success
+                    result_data = (
+                        result.data if result.success else {"error": str(result.error)}
+                    )
                 content = (
                     json.dumps(result_data, ensure_ascii=False)
                     if isinstance(result_data, dict)
@@ -183,7 +230,7 @@ class AgentExecutor:
                 tool_message = {
                     "role": "tool",
                     "tool_call_id": tool_call.get("id", ""),
-                    "name": execution.tool_name,
+                    "name": execution_name,
                     "content": content,
                 }
                 messages.append(tool_message)
@@ -192,7 +239,7 @@ class AgentExecutor:
                         role="tool",
                         content=content,
                         tool_call_id=tool_message["tool_call_id"],
-                        name=execution.tool_name,
+                        name=execution_name,
                     )
                 )
                 if on_message is not None:
@@ -200,8 +247,8 @@ class AgentExecutor:
                         {
                             "type": "tool_result",
                             "agent_id": record.agent_id,
-                            "tool_name": execution.tool_name,
-                            "success": result.success,
+                            "tool_name": execution_name,
+                            "success": result_success,
                         }
                     )
 
@@ -216,6 +263,82 @@ class AgentExecutor:
             tool_count=tool_count,
             termination_reason=termination_reason,
         )
+
+
+def _tool_is_enabled(tool: Tool, context: dict[str, Any]) -> bool:
+    predicate = getattr(tool, "is_enabled", None)
+    if predicate is None:
+        return True
+    if not callable(predicate):
+        return bool(predicate)
+    parameters = inspect.signature(predicate).parameters
+    return bool(predicate() if not parameters else predicate(context))
+
+
+def _definition_from_snapshot(snapshot: Any) -> AgentDefinition:
+    if not isinstance(snapshot, dict):
+        snapshot = dict(snapshot)
+    hooks = snapshot.get("hooks")
+    mcp_servers = snapshot.get("mcp_servers")
+    common: dict[str, Any] = {
+        "agent_type": snapshot["agent_type"],
+        "when_to_use": snapshot["when_to_use"],
+        "tools": snapshot.get("tools"),
+        "disallowed_tools": snapshot.get("disallowed_tools"),
+        "skills": snapshot.get("skills"),
+        "mcp_servers": (
+            [AgentMcpServerSpec(**item) for item in mcp_servers]
+            if mcp_servers is not None
+            else None
+        ),
+        "hooks": AgentHooks(**hooks) if hooks is not None else None,
+        "color": snapshot.get("color"),
+        "model": snapshot.get("model"),
+        "effort": snapshot.get("effort"),
+        "permission_mode": (
+            AgentPermissionMode(snapshot["permission_mode"])
+            if snapshot.get("permission_mode") is not None
+            else None
+        ),
+        "max_turns": snapshot.get("max_turns"),
+        "filename": snapshot.get("filename"),
+        "base_dir": snapshot.get("base_dir"),
+        "critical_system_reminder": snapshot.get("critical_system_reminder"),
+        "required_mcp_servers": snapshot.get("required_mcp_servers"),
+        "background": bool(snapshot.get("background", False)),
+        "initial_prompt": snapshot.get("initial_prompt"),
+        "memory": (
+            AgentMemoryScope(snapshot["memory"])
+            if snapshot.get("memory") is not None
+            else None
+        ),
+        "isolation": (
+            AgentIsolationMode(snapshot["isolation"])
+            if snapshot.get("isolation") is not None
+            else None
+        ),
+        "omit_claude_md": bool(snapshot.get("omit_claude_md", False)),
+    }
+    system_prompt = str(snapshot["system_prompt"])
+
+    def get_system_prompt() -> str:
+        return system_prompt
+
+    source = AgentSource(snapshot["source"])
+    if source is AgentSource.BUILT_IN:
+        return BuiltInAgentDefinition(
+            **common, source=AgentSource.BUILT_IN, get_system_prompt=get_system_prompt
+        )
+    if source is AgentSource.PLUGIN:
+        return PluginAgentDefinition(
+            **common,
+            source=AgentSource.PLUGIN,
+            plugin=str(snapshot.get("plugin", "")),
+            get_system_prompt=get_system_prompt,
+        )
+    return CustomAgentDefinition(
+        **common, source=source, get_system_prompt=get_system_prompt
+    )
 
 
 class SpawnAgentManager:
