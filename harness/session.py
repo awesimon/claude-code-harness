@@ -210,6 +210,12 @@ class SessionHarness:
         return self.session_runtime.store
 
     @property
+    def agent_scheduler(self):
+        from .agents import AgentScheduler
+
+        return AgentScheduler.for_harness(self)
+
+    @property
     def effective_cwd(self) -> Path:
         assert self.runtime_context.workspace_root is not None
         return _canonical_path(self.runtime_context.workspace_root)

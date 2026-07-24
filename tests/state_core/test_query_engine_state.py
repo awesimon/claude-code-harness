@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -7,6 +8,8 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from agents import AgentExecutionResult
+from harness import AgentScheduler
 from models import Base
 from query_engine import QueryEngine, ToolObservation
 from services.llm_service import ChatCompletionResponse
@@ -164,6 +167,107 @@ def test_query_engine_exposes_exactly_one_task_mode(
     todo_names = {item["function"]["name"] for item in engine._build_tools_schema("tool-mode")}
     assert "todo_write" in todo_names
     assert "task_create" not in todo_names
+
+
+def test_query_engine_uses_session_harness_as_only_runtime_lookup(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("harness-runtime")
+
+    harness = engine._session_harness("harness-runtime")
+
+    assert engine._session_runtime("harness-runtime") is harness.session_runtime
+    assert not hasattr(engine, "_agent_manager")
+    assert not hasattr(engine, "_session_runtimes")
+    assert not hasattr(engine, "_tool_runtime")
+
+
+def test_clear_conversation_rotates_the_session_harness(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("clear-harness")
+    previous = engine._session_harness("clear-harness")
+
+    engine.clear_conversation("clear-harness")
+    current = engine._session_harness("clear-harness")
+
+    assert previous.runtime_context.cancellation.cancelled
+    assert current is not previous
+    assert not current.runtime_context.cancellation.cancelled
+
+
+@pytest.mark.asyncio
+async def test_query_engine_finds_agent_across_owned_session_roots(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    class CompletingRunner:
+        async def run(self, record, child_harness):
+            return AgentExecutionResult(content="done", output="done")
+
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("first-root")
+    engine.create_conversation("second-root")
+    first = AgentScheduler(engine._session_harness("first-root"), runner=CompletingRunner())
+    second = AgentScheduler(engine._session_harness("second-root"), runner=CompletingRunner())
+
+    agent_id = await engine.spawn_agent(
+        "second-root", "Explore", "inspect", is_async=False
+    )
+
+    assert engine.get_agent_status(agent_id)["status"] == "completed"
+    await first.shutdown()
+    await second.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_query_engine_abort_delegates_to_session_scheduler(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    class BlockingRunner:
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+
+        async def run(self, record, child_harness):
+            await self.release.wait()
+            return AgentExecutionResult(content="done")
+
+    runner = BlockingRunner()
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("abort-root")
+    scheduler = AgentScheduler(engine._session_harness("abort-root"), runner=runner)
+    agent_id = await engine.spawn_agent(
+        "abort-root", "Explore", "inspect", is_async=True
+    )
+
+    abort = engine.abort_agent(agent_id)
+    assert abort is not None
+    await abort
+
+    assert engine.get_agent_status(agent_id)["status"] == "cancelled"
+    runner.release.set()
+    await scheduler.shutdown()
 
 
 def test_resume_rebuilds_assistant_tool_call_and_result_order(

@@ -441,6 +441,9 @@ class ToolRegistry:
         cls._aliases[canonical] = canonical
         cls._aliases[tool.name] = canonical
         cls._aliases[tool.name.lower()] = canonical
+        for alias in getattr(tool, "aliases", ()):
+            cls._aliases[alias] = canonical
+            cls._aliases[alias.lower()] = canonical
         for alias, target in _EXPLICIT_TOOL_ALIASES.items():
             if target == canonical:
                 cls._aliases[alias] = canonical

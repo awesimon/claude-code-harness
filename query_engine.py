@@ -7,13 +7,14 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
-from agents import AgentExecutionConfig, get_agent_manager
-from harness import CancellationToken, PermissionMode, RuntimeContext, ToolRuntime
+from agents import AgentRequest
+from harness import PermissionMode, SessionHarness, SessionHarnessFactory
 from services import ChatCompletionRequest, LLMProvider, LLMService, Message
 from services.error_recovery import (
     PromptTooLongError,
@@ -247,7 +248,7 @@ class ConversationTurn:
     tool_calls: Optional[List[ToolCall]] = None
     tool_observations: Optional[List[ToolObservation]] = None
     thinking: Optional[str] = None  # 推理/思考内容
-    timestamp: float = field(default_factory=lambda: asyncio.get_event_loop().time())
+    timestamp: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -356,14 +357,17 @@ class QueryEngine:
 
             init_db()
             session_runtime_factory = SessionRuntimeFactory(SQLAlchemyStateStore(SessionLocal))
-        self._runtime_factory = session_runtime_factory
-        self._session_runtimes: Dict[str, SessionRuntime] = {}
-        self._agent_manager = get_agent_manager()
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.approval_callback = approval_callback
         self.tool_timeout = tool_timeout
-        self._tool_runtime = ToolRuntime(ToolRegistry, default_timeout=tool_timeout)
-        self._cancellations: Dict[str, CancellationToken] = {}
+        self._harness_factory = SessionHarnessFactory(
+            session_runtime_factory,
+            tool_registry=ToolRegistry,
+            workspace_root=self.workspace_root,
+            approval_callback=approval_callback,
+            tool_timeout=tool_timeout,
+        )
+        self._session_harnesses: Dict[str, SessionHarness] = {}
 
         # 初始化错误恢复管理器
         self._recovery_manager: Optional[RecoveryManager] = None
@@ -433,8 +437,9 @@ class QueryEngine:
         import uuid
         cid = conversation_id or f"conv-{uuid.uuid4().hex[:8]}"
         self._conversations[cid] = ConversationContext(conversation_id=cid)
-        self._session_runtimes[cid] = self._runtime_factory.create(cid)
-        self._cancellations[cid] = CancellationToken()
+        self._session_harnesses[cid] = self._harness_factory.create(
+            cid, tool_timeout=self.tool_timeout
+        )
         logger.info(f"Created conversation: {cid}")
         return cid
 
@@ -446,15 +451,18 @@ class QueryEngine:
         """删除对话"""
         if conversation_id in self._conversations:
             del self._conversations[conversation_id]
-            token = self._cancellations.pop(conversation_id, None)
-            if token:
-                token.cancel()
+            harness = self._session_harnesses.pop(conversation_id, None)
+            if harness is not None:
+                harness.runtime_context.cancellation.cancel()
             logger.info(f"Deleted conversation: {conversation_id}")
 
     def resume_conversation(self, conversation_id: str) -> str:
         """Restore the in-process handle from the durable transcript."""
-        runtime = self._runtime_factory.resume(conversation_id)
-        self._session_runtimes[conversation_id] = runtime
+        harness = self._harness_factory.resume(
+            conversation_id, tool_timeout=self.tool_timeout
+        )
+        self._session_harnesses[conversation_id] = harness
+        runtime = harness.session_runtime
         context = ConversationContext(conversation_id=conversation_id)
         for event in runtime.events():
             if event.event_type in {EventType.USER_MESSAGE, EventType.ASSISTANT_MESSAGE}:
@@ -500,15 +508,19 @@ class QueryEngine:
                         ConversationTurn(role="tool", tool_observations=[observation])
                     )
         self._conversations[conversation_id] = context
-        self._cancellations[conversation_id] = CancellationToken()
         return conversation_id
 
+    def _session_harness(self, conversation_id: str) -> SessionHarness:
+        harness = self._session_harnesses.get(conversation_id)
+        if harness is None:
+            harness = self._harness_factory.resume(
+                conversation_id, tool_timeout=self.tool_timeout
+            )
+            self._session_harnesses[conversation_id] = harness
+        return harness
+
     def _session_runtime(self, conversation_id: str) -> SessionRuntime:
-        runtime = self._session_runtimes.get(conversation_id)
-        if runtime is None:
-            runtime = self._runtime_factory.resume(conversation_id)
-            self._session_runtimes[conversation_id] = runtime
-        return runtime
+        return self._session_harness(conversation_id).session_runtime
 
     def is_in_plan_mode(self, conversation_id: str) -> bool:
         """检查对话是否在计划模式中"""
@@ -799,30 +811,19 @@ class QueryEngine:
         """
         async def execute_single(tool_call: ToolCall) -> ToolObservation:
             start_time = asyncio.get_event_loop().time()
-            token = self._cancellations.setdefault(
-                conversation_id or "default",
-                CancellationToken(),
-            )
             mode = (
                 PermissionMode.PLAN
                 if conversation_id and self.is_in_plan_mode(conversation_id)
                 else PermissionMode.DEFAULT
             )
-            runtime_context = RuntimeContext(
-                session_id=conversation_id,
-                workspace_root=self.workspace_root,
+            if conversation_id is None:
+                raise RuntimeError("conversation_id is required for tool execution")
+            harness = self._session_harness(conversation_id)
+            runtime_context = replace(
+                harness.runtime_context,
                 permission_mode=mode,
-                approval_callback=self.approval_callback,
-                cancellation=token,
-                tool_timeout=self.tool_timeout,
-                metadata={
-                    "session_runtime": (
-                        self._session_runtime(conversation_id) if conversation_id else None
-                    ),
-                    "agent_id": None,
-                },
             )
-            execution = await self._tool_runtime.execute(
+            execution = await harness.tool_runtime.execute(
                 tool_call.name,
                 tool_call.arguments,
                 runtime_context,
@@ -1239,28 +1240,62 @@ class QueryEngine:
         Returns:
             Agent ID
         """
-        agent_id = await self._agent_manager.spawn_agent(
-            agent_type=agent_type,
-            prompt=prompt,
-            parent_session_id=conversation_id,
-            config=AgentExecutionConfig(
-                is_async=is_async,
-                workspace_root=self.workspace_root,
-                approval_callback=self.approval_callback,
-                tool_timeout=self.tool_timeout,
-                session_runtime=self._session_runtime(conversation_id),
+        harness = self._session_harness(conversation_id)
+        record = await harness.agent_scheduler.spawn(
+            AgentRequest(
+                prompt=prompt,
+                agent_type=agent_type,
+                description=prompt,
+                background=is_async,
+                cwd=self.workspace_root,
             ),
-            is_async=is_async,
+            harness=harness,
         )
-        return agent_id
+        return record.agent_id
+
+    def _find_agent_scheduler(self, agent_id: str):
+        from harness.agents import AgentNotFound, AgentOwnershipError
+
+        for harness in self._session_harnesses.values():
+            scheduler = harness.agent_scheduler
+            try:
+                scheduler.status(agent_id)
+            except (AgentNotFound, AgentOwnershipError):
+                continue
+            return scheduler
+        return None
 
     def get_agent_status(self, agent_id: str) -> Optional[Dict]:
         """获取 Agent 状态"""
-        return self._agent_manager.get_agent_status(agent_id)
+        scheduler = self._find_agent_scheduler(agent_id)
+        if scheduler is None:
+            return None
+        record = scheduler.status(agent_id)
+        output = record.output if isinstance(record.output, dict) else {}
+        return {
+            "agent_id": record.agent_id,
+            "agent_type": record.agent_type,
+            "status": record.status.value,
+            "tool_use_count": int(output.get("tool_count", 0)),
+            "started_at": record.started_at.isoformat() if record.started_at else None,
+            "completed_at": record.finished_at.isoformat() if record.finished_at else None,
+        }
 
     def abort_agent(self, agent_id: str):
         """中止 Agent"""
-        self._agent_manager.abort_agent(agent_id)
+        scheduler = self._find_agent_scheduler(agent_id)
+        if scheduler is None:
+            return None
+        task = asyncio.create_task(scheduler.stop(agent_id))
+
+        def consume(completed: asyncio.Task[Any]) -> None:
+            try:
+                completed.result()
+            except BaseException:
+                logger.exception("Agent abort failed", exc_info=True)
+
+        task.add_done_callback(consume)
+        return task
 
     def clear_conversation(self, conversation_id: str):
         """清空对话历史"""
@@ -1268,10 +1303,12 @@ class QueryEngine:
         if context:
             context.messages.clear()
             context.state = ConversationState.IDLE
-            token = self._cancellations.get(conversation_id)
-            if token:
-                token.cancel()
-            self._cancellations[conversation_id] = CancellationToken()
+            harness = self._session_harnesses.get(conversation_id)
+            if harness is not None:
+                harness.runtime_context.cancellation.cancel()
+                self._session_harnesses[conversation_id] = self._harness_factory.resume(
+                    conversation_id, tool_timeout=self.tool_timeout
+                )
 
 
 # 全局 QueryEngine 实例

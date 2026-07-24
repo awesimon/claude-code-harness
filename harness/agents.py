@@ -379,17 +379,27 @@ class AgentScheduler:
         _execution_timeout(request)
         return definition, _definition_snapshot(definition, request)
 
-    async def spawn(self, request: AgentRequest) -> AgentRecord:
+    async def spawn(
+        self,
+        request: AgentRequest,
+        *,
+        harness: SessionHarness | None = None,
+    ) -> AgentRecord:
         if self.is_degraded:
             raise AgentSchedulerDegraded(
                 "Agent scheduler has unresolved quarantined runner work"
             )
         if self._closed:
             raise RuntimeError("Agent scheduler is shut down")
+        scope = self.harness if harness is None else harness
+        if _owner_key(scope, self.repository) != self._owner_key:
+            raise AgentOwnershipError(
+                "Agent spawn harness must belong to the scheduler's durable root"
+            )
         parent_agent_id = (
             request.parent_agent_id
             if request.parent_agent_id is not None
-            else self.harness.agent_id
+            else scope.agent_id
         )
         definition, definition_snapshot = self._validate_request(request)
         agent_id = f"agent-{request.agent_type.lower()}-{uuid.uuid4().hex[:12]}"
@@ -401,7 +411,7 @@ class AgentScheduler:
         permission_mode = _permission_mode(definition)
         if permission_mode is not None:
             child_options["permission_mode"] = permission_mode
-        child = self.harness.child(agent_id, **child_options)
+        child = scope.child(agent_id, **child_options)
         pending_record = AgentRecord(
                 agent_id=agent_id,
                 root_session_id=self.harness.root_session_id,
