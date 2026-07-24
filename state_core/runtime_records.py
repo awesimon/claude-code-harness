@@ -55,6 +55,45 @@ def _optional_json_object(value: Mapping[str, Any] | None, path: str) -> dict[st
     return _json_object(value, path) if value is not None else None
 
 
+_SENSITIVE_TRACE_ERROR_KEYS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "api_key",
+        "api-key",
+        "access_token",
+        "access-token",
+        "refresh_token",
+        "refresh-token",
+        "password",
+        "secret",
+        "token",
+    }
+)
+
+
+def _sanitize_trace_error(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Detach a trace error while redacting sensitive fields at every depth."""
+
+    copied = _optional_json_object(value, "error")
+    if copied is None:
+        return None
+
+    def sanitize(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {
+                key: "[REDACTED]" if key.lower() in _SENSITIVE_TRACE_ERROR_KEYS else sanitize(value)
+                for key, value in item.items()
+            }
+        if isinstance(item, list):
+            return [sanitize(value) for value in item]
+        return item
+
+    return sanitize(copied)
+
+
 class AgentStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
@@ -246,6 +285,7 @@ class TraceSpanRecord:
     revision: int = 0
     started_at: datetime = field(default_factory=_utc_now)
     finished_at: datetime | None = None
+    duration_ms: int | None = None
     usage: Mapping[str, Any] = field(default_factory=dict)
     error: Mapping[str, Any] | None = None
     created_at: datetime = field(default_factory=_utc_now)
@@ -255,12 +295,20 @@ class TraceSpanRecord:
         if self.revision < 0:
             raise ValueError("revision must be non-negative")
         object.__setattr__(self, "usage", _json_object(self.usage, "usage"))
-        object.__setattr__(self, "error", _optional_json_object(self.error, "error"))
+        object.__setattr__(self, "error", _sanitize_trace_error(self.error))
         object.__setattr__(self, "started_at", _as_utc(self.started_at))
         object.__setattr__(self, "created_at", _as_utc(self.created_at))
         object.__setattr__(self, "updated_at", _as_utc(self.updated_at))
         if self.finished_at is not None:
             object.__setattr__(self, "finished_at", _as_utc(self.finished_at))
+            expected_duration = int((self.finished_at - self.started_at).total_seconds() * 1000)
+            if expected_duration < 0:
+                raise ValueError("finished_at must not precede started_at")
+            if self.duration_ms is not None and self.duration_ms != expected_duration:
+                raise ValueError("duration_ms must match started_at and finished_at")
+            object.__setattr__(self, "duration_ms", expected_duration)
+        elif self.duration_ms is not None:
+            raise ValueError("duration_ms is only available after a trace span finishes")
 
 
 @dataclass(frozen=True)

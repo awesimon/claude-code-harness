@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from models import Base
@@ -158,9 +158,66 @@ def test_trace_start_finish_and_interrupt_open_spans(store: SQLAlchemyStateStore
     interrupted = store.traces.interrupt_open("root-1")
 
     assert finished.status is TraceSpanStatus.COMPLETED
+    assert finished.duration_ms == int(
+        (finished.finished_at - finished.started_at).total_seconds() * 1000
+    )
     assert [span.span_id for span in interrupted] == [root.span_id]
     assert interrupted[0].status is TraceSpanStatus.INTERRUPTED
+    assert interrupted[0].duration_ms == int(
+        (interrupted[0].finished_at - interrupted[0].started_at).total_seconds() * 1000
+    )
     assert [span.span_id for span in store.traces.list("root-1")] == ["span-root", "span-child"]
+
+
+def test_trace_errors_are_sanitized_before_persistence(store: SQLAlchemyStateStore) -> None:
+    started = store.traces.start(
+        TraceSpanRecord(span_id="span-error", root_session_id="root-1", kind="tool", name="request")
+    )
+
+    finished = store.traces.finish(
+        started.span_id,
+        TraceSpanStatus.FAILED,
+        started.revision,
+        error={
+            "Authorization": "Bearer secret",
+            "context": {"api_key": "nested secret", "safe": "kept"},
+        },
+    )
+    persisted = store.traces.get(started.span_id)
+
+    expected = {
+        "Authorization": "[REDACTED]",
+        "context": {"api_key": "[REDACTED]", "safe": "kept"},
+    }
+    assert finished.error == expected
+    assert persisted is not None
+    assert persisted.error == expected
+
+
+def test_trace_repository_adds_duration_column_to_existing_sqlite_table(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'pre-duration.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE runtime_trace_spans ("
+                "span_id VARCHAR PRIMARY KEY, root_session_id VARCHAR NOT NULL, "
+                "agent_id VARCHAR, parent_span_id VARCHAR, kind VARCHAR NOT NULL, "
+                "name VARCHAR NOT NULL, status VARCHAR NOT NULL, revision INTEGER NOT NULL, "
+                "started_at DATETIME NOT NULL, finished_at DATETIME, usage JSON NOT NULL, "
+                "error_json JSON, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+    store = SQLAlchemyStateStore(session_factory)
+    started = store.traces.start(
+        TraceSpanRecord(span_id="legacy-span", root_session_id="root-1", kind="tool", name="request")
+    )
+    finished = store.traces.finish(
+        started.span_id, TraceSpanStatus.COMPLETED, started.revision
+    )
+
+    assert finished.duration_ms is not None
 
 
 def test_worktree_create_update_get_and_stale_revision(store: SQLAlchemyStateStore) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, select, update
+from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, inspect, select, text, update
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from models import Base
@@ -24,6 +24,7 @@ from .runtime_records import (
     WorktreeRecord,
     WorktreeStatus,
     _json_copy,
+    _sanitize_trace_error,
     ensure_agent_transition,
     ensure_worktree_transition,
 )
@@ -93,6 +94,7 @@ class RuntimeTraceSpan(Base):
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     usage: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -371,6 +373,21 @@ class SQLAlchemyRuntimeMetadataRepository:
 class SQLAlchemyTraceSpanRepository:
     def __init__(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
+        self._ensure_duration_column()
+
+    def _ensure_duration_column(self) -> None:
+        """Add the duration field to trace tables created before this record existed."""
+
+        with self._session_factory() as db:
+            bind = db.get_bind()
+            inspector = inspect(bind)
+            if not inspector.has_table(RuntimeTraceSpan.__tablename__):
+                return
+            columns = {column["name"] for column in inspector.get_columns(RuntimeTraceSpan.__tablename__)}
+            if "duration_ms" in columns:
+                return
+            with db.begin():
+                db.execute(text("ALTER TABLE runtime_trace_spans ADD COLUMN duration_ms INTEGER"))
 
     @staticmethod
     def _record(row: RuntimeTraceSpan) -> TraceSpanRecord:
@@ -385,6 +402,7 @@ class SQLAlchemyTraceSpanRepository:
             revision=row.revision,
             started_at=_as_utc(row.started_at),
             finished_at=_as_utc(row.finished_at) if row.finished_at is not None else None,
+            duration_ms=row.duration_ms,
             usage=row.usage,
             error=row.error_json,
             created_at=_as_utc(row.created_at),
@@ -408,6 +426,7 @@ class SQLAlchemyTraceSpanRepository:
                     revision=detached.revision,
                     started_at=detached.started_at,
                     finished_at=detached.finished_at,
+                    duration_ms=detached.duration_ms,
                     usage=_json_copy(detached.usage),
                     error_json=_json_copy(detached.error),
                     created_at=detached.created_at,
@@ -440,16 +459,18 @@ class SQLAlchemyTraceSpanRepository:
             if TraceSpanStatus(row.status) is not TraceSpanStatus.RUNNING:
                 raise InvalidAgentTransition(AgentStatus.FAILED, AgentStatus.FAILED)
             now = _utc_now()
+            duration_ms = int((now - _as_utc(row.started_at)).total_seconds() * 1000)
             values: dict[str, Any] = {
                 "status": status.value,
                 "revision": actual + 1,
                 "finished_at": now,
+                "duration_ms": duration_ms,
                 "updated_at": now,
             }
             if usage is not None:
                 values["usage"] = _json_copy(usage)
             if error is not None:
-                values["error_json"] = _json_copy(error)
+                values["error_json"] = _sanitize_trace_error(error)
             result = db.execute(
                 update(RuntimeTraceSpan)
                 .where(RuntimeTraceSpan.span_id == span_id, RuntimeTraceSpan.revision == expected_revision)
@@ -500,6 +521,7 @@ class SQLAlchemyTraceSpanRepository:
                         status=TraceSpanStatus.INTERRUPTED.value,
                         revision=row.revision + 1,
                         finished_at=now,
+                        duration_ms=int((now - _as_utc(row.started_at)).total_seconds() * 1000),
                         updated_at=now,
                     )
                 )
