@@ -363,9 +363,9 @@ class TraceSpanRecord:
             raise ValueError("terminal trace spans require finished_at")
         if self.finished_at is not None:
             object.__setattr__(self, "finished_at", _as_utc(self.finished_at))
-            expected_duration = int((self.finished_at - self.started_at).total_seconds() * 1000)
-            if expected_duration < 0:
+            if self.finished_at < self.started_at:
                 raise ValueError("finished_at must not precede started_at")
+            expected_duration = int((self.finished_at - self.started_at).total_seconds() * 1000)
             if self.duration_ms is not None and self.duration_ms != expected_duration:
                 raise ValueError("duration_ms must match started_at and finished_at")
             object.__setattr__(self, "duration_ms", expected_duration)

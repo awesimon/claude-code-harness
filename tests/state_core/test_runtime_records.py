@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: E501
 import json
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Barrier
 
@@ -459,3 +460,50 @@ def test_worktree_create_update_get_and_stale_revision(store: SQLAlchemyStateSto
     ]
     with pytest.raises(RuntimeRecordRevisionConflict):
         store.worktrees.update(created.worktree_id, created.revision, branch="stale")
+
+
+def test_stale_runtime_updates_report_winner_revision(store: SQLAlchemyStateStore) -> None:
+    agent_record = store.agents.create(agent("cas-agent"))
+    store.agents.transition(agent_record.agent_id, AgentStatus.RUNNING, 0)
+    with pytest.raises(RuntimeRecordRevisionConflict) as agent_error:
+        store.agents.transition(agent_record.agent_id, AgentStatus.FAILED, 0)
+
+    span = store.traces.start(
+        TraceSpanRecord(span_id="cas-span", root_session_id="root-1", kind="tool", name="request")
+    )
+    store.traces.finish(span.span_id, TraceSpanStatus.COMPLETED, 0)
+    with pytest.raises(RuntimeRecordRevisionConflict) as trace_error:
+        store.traces.finish(span.span_id, TraceSpanStatus.FAILED, 0)
+
+    worktree = store.worktrees.create(
+        WorktreeRecord(
+            worktree_id="cas-wt",
+            root_session_id="root-1",
+            repository_root="/repo",
+            canonical_path="/repo/wt",
+            branch="branch",
+            base_commit="abc",
+            status=WorktreeStatus.CREATING,
+        )
+    )
+    store.worktrees.update(worktree.worktree_id, 0, status=WorktreeStatus.READY)
+    with pytest.raises(RuntimeRecordRevisionConflict) as worktree_error:
+        store.worktrees.update(worktree.worktree_id, 0, branch="stale")
+
+    assert agent_error.value.actual_revision == 1
+    assert trace_error.value.actual_revision == 1
+    assert worktree_error.value.actual_revision == 1
+
+
+def test_negative_submillisecond_trace_duration_is_rejected() -> None:
+    started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match="finished_at"):
+        TraceSpanRecord(
+            span_id="negative",
+            root_session_id="root-1",
+            kind="tool",
+            name="request",
+            status=TraceSpanStatus.COMPLETED,
+            started_at=started_at,
+            finished_at=started_at - timedelta(microseconds=500),
+        )
