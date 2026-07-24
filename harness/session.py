@@ -295,6 +295,7 @@ class SessionHarnessFactory:
         self.approval_callback = _validate_approval_callback(approval_callback)
         self.tool_timeout = None if tool_timeout is None else _validate_timeout(tool_timeout)
         self.allowed_workspaces = _canonicalize_paths(allowed_workspaces)
+        self._agent_schedulers: dict[str, Any] = {}
 
     def create(
         self,
@@ -332,7 +333,15 @@ class SessionHarnessFactory:
             workspace_root, permission_mode, approval_callback, tool_timeout, metadata,
             agent_id, parent_agent_id, allowed_workspaces,
         )
-        return self._compose(self.session_runtime_factory.resume(session_id), config)
+        resumed = self._compose(
+            self.session_runtime_factory.resume(session_id), config
+        )
+        from .agents import AgentScheduler
+
+        scheduler = AgentScheduler.for_harness(resumed)
+        self._agent_schedulers[session_id] = scheduler
+        scheduler.reconcile()
+        return resumed
 
     def _build_config(
         self,

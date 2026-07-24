@@ -71,6 +71,9 @@ _MAX_RUNTIME_ERROR_SCAN = 4096
 _MAX_RUNTIME_ERROR_STRING = 2000
 _MAX_RUNTIME_ERROR_TEXT = 16000
 _TRUNCATED_RUNTIME_ERROR = "[TRUNCATED]"
+_NON_FINITE_RUNTIME_ERROR = "[NON_FINITE]"
+_UNSUPPORTED_RUNTIME_ERROR = "[UNSUPPORTED]"
+_UNSANITIZABLE_RUNTIME_ERROR = "[UNSANITIZABLE]"
 _EXACT_SENSITIVE_RUNTIME_ERROR_KEYS = frozenset(
     {
         "authorization",
@@ -99,15 +102,17 @@ _RUNTIME_HEADER_CONTAINER_KEYS = frozenset(
     {"headers", "requestheaders", "responseheaders"}
 )
 _AUTHORIZATION_VALUE = re.compile(
-    r"(?i)\b(authorization|proxy[-_ ]authorization)\s*[:=]\s*"
-    r'''(?:"(?:\\[\s\S]?|[^"\\])*(?:"|$)|'(?:\\[\s\S]?|[^'\\])*(?:'|$)|'''
+    r'''(?i)\b(authorization|proxy[-_ ]authorization)(?:[\\]?["'])?\s*[:=]\s*'''
+    r'''(?:(?:[\\]?")(?:\\[\s\S]?|[^"\\])*(?:(?:[\\]?")|$)|'''
+    r'''(?:[\\]?')(?:\\[\s\S]?|[^'\\])*(?:(?:[\\]?')|$)|'''
     r"(?:(?:bearer|basic)\s+)?[^\s,;&]+)"
 )
 _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?i)\b(api[_-]?key|x[-_]?api[-_]?key|password|passwd|secret|"
     r"client[_-]?secret|access[_-]?token|refresh[_-]?token|session[_-]?token|"
-    r'''id[_-]?token|auth[_-]?token|token|credentials?)\s*[:=]\s*'''
-    r'''(?:"(?:\\[\s\S]?|[^"\\])*(?:"|$)|'(?:\\[\s\S]?|[^'\\])*(?:'|$)|[^\s,;&]+)'''
+    r'''id[_-]?token|auth[_-]?token|token|credentials?)(?:[\\]?["'])?\s*[:=]\s*'''
+    r'''(?:(?:[\\]?")(?:\\[\s\S]?|[^"\\])*(?:(?:[\\]?")|$)|'''
+    r'''(?:[\\]?')(?:\\[\s\S]?|[^'\\])*(?:(?:[\\]?')|$)|[^\s,;&]+)'''
 )
 _BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[^\s,;&]+")
 
@@ -155,15 +160,12 @@ def _json_encoded_character_size(character: str) -> int:
     return 12
 
 
-def sanitize_runtime_error(
-    value: Mapping[str, Any] | None,
-) -> dict[str, Any] | None:
+def sanitize_runtime_error(value: Any) -> dict[str, Any] | None:
     """Detach, redact, and bound a durable agent or trace error tree."""
 
     if value is None:
         return None
-    if not isinstance(value, Mapping):
-        raise TypeError("error must be a JSON object")
+    root: Mapping[Any, Any] = value if isinstance(value, Mapping) else {"value": value}
 
     nodes_remaining = _MAX_RUNTIME_ERROR_NODES
     text_remaining = _MAX_RUNTIME_ERROR_TEXT
@@ -194,6 +196,8 @@ def sanitize_runtime_error(
         return True
 
     def add_mapping_truncation(target: dict[str, Any]) -> None:
+        if _TRUNCATED_RUNTIME_ERROR in target.values():
+            return
         key = "__truncated__"
         while key in target:
             key = f"_{key}"
@@ -217,7 +221,7 @@ def sanitize_runtime_error(
             return item if consume_literal(literal) else _TRUNCATED_RUNTIME_ERROR
         if type(item) is float:
             if not math.isfinite(item):
-                raise ValueError(f"{path} must contain only finite JSON numbers")
+                return _NON_FINITE_RUNTIME_ERROR
             return item if consume_literal(repr(item)) else _TRUNCATED_RUNTIME_ERROR
         if type(item) is str:
             sanitized, _ = bounded_text(_sanitize_runtime_error_string(item))
@@ -227,8 +231,6 @@ def sanitize_runtime_error(
                 return _TRUNCATED_RUNTIME_ERROR
             sanitized: dict[str, Any] = {}
             for index, (key, nested) in enumerate(item.items()):
-                if type(key) is not str:
-                    raise TypeError(f"{path} mapping keys must be strings")
                 if (
                     index >= _MAX_RUNTIME_ERROR_ITEMS
                     or nodes_remaining <= 0
@@ -236,6 +238,10 @@ def sanitize_runtime_error(
                 ):
                     add_mapping_truncation(sanitized)
                     break
+                if type(key) is not str:
+                    add_mapping_truncation(sanitized)
+                    sanitized["__unsupported_key__"] = _UNSUPPORTED_RUNTIME_ERROR
+                    continue
                 bounded_key, key_was_truncated = bounded_text(key)
                 nested_path = f"{path}.{key[:80]}"
                 key_for_scan = key[:_MAX_RUNTIME_ERROR_SCAN]
@@ -268,14 +274,17 @@ def sanitize_runtime_error(
                     sanitize(nested, f"{path}[{index}]", depth + 1)
                 )
             return sanitized_list
-        raise TypeError(
-            f"{path} contains unsupported JSON value {type(item).__name__}"
-        )
+        return _UNSUPPORTED_RUNTIME_ERROR
 
-    sanitized = sanitize(value, "error", 0)
-    if not isinstance(sanitized, dict):
-        raise TypeError("error must be a JSON object")
-    return sanitized
+    try:
+        sanitized = sanitize(root, "error", 0)
+    except Exception:
+        return {"error": _UNSANITIZABLE_RUNTIME_ERROR}
+    return (
+        sanitized
+        if isinstance(sanitized, dict)
+        else {"error": _UNSANITIZABLE_RUNTIME_ERROR}
+    )
 
 
 class AgentStatus(str, Enum):
@@ -383,6 +392,16 @@ class InvalidAgentTransition(StateCoreError):
         super().__init__(f"invalid agent transition from {current.value!r} to {target.value!r}")
 
 
+class InvalidAgentParent(StateCoreError):
+    """Raised when a child does not reference a running same-root parent."""
+
+    def __init__(self, parent_agent_id: str) -> None:
+        self.parent_agent_id = parent_agent_id
+        super().__init__(
+            f"agent parent {parent_agent_id!r} must be running in the same durable root"
+        )
+
+
 class InvalidWorktreeTransition(StateCoreError):
     """Raised when a worktree lifecycle transition is not allowed."""
 
@@ -431,7 +450,7 @@ class AgentRecord:
     revision: int = 0
     usage: Mapping[str, Any] = field(default_factory=dict)
     termination_reason: AgentTerminationReason | None = None
-    error: Mapping[str, Any] | None = None
+    error: Any = None
     output: Any = None
     worktree_id: str | None = None
     created_at: datetime = field(default_factory=_utc_now)
@@ -495,7 +514,7 @@ class TraceSpanRecord:
     finished_at: datetime | None = None
     duration_ms: int | None = None
     usage: Mapping[str, Any] = field(default_factory=dict)
-    error: Mapping[str, Any] | None = None
+    error: Any = None
     created_at: datetime = field(default_factory=_utc_now)
     updated_at: datetime = field(default_factory=_utc_now)
 
@@ -556,6 +575,7 @@ class WorktreeRecord:
 @runtime_checkable
 class AgentRepository(Protocol):
     def create(self, record: AgentRecord) -> AgentRecord: ...
+    def create_with_parent_guard(self, record: AgentRecord) -> AgentRecord: ...
     def get(self, agent_id: str) -> AgentRecord | None: ...
     def list(
         self,
@@ -574,7 +594,7 @@ class AgentRepository(Protocol):
         termination_reason: AgentTerminationReason | None = None,
         output: Any = None,
         usage: Mapping[str, Any] | None = None,
-        error: Mapping[str, Any] | None = None,
+        error: Any = None,
     ) -> AgentRecord: ...
     def reconcile(self, root_session_id: str, live_agent_ids: set[str]) -> builtins.list[AgentRecord]: ...
 

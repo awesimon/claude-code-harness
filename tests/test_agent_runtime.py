@@ -92,6 +92,56 @@ def test_corrupt_definition_snapshots_fail_closed(
         AgentExecutor.from_record(corrupt)
 
 
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {
+            "agent_type": "snapshot",
+            "when_to_use": "built in",
+            "source": "built-in",
+            "system_prompt": "prompt",
+            "plugin": 42,
+        },
+        {
+            "agent_type": "snapshot",
+            "when_to_use": "custom",
+            "source": "userSettings",
+            "system_prompt": "prompt",
+            "plugin": "wrong-source",
+        },
+        {
+            "agent_type": "snapshot",
+            "when_to_use": "built in",
+            "source": "built-in",
+            "system_prompt": "prompt",
+            "base_dir": "/not-built-in",
+        },
+        {
+            "agent_type": "snapshot",
+            "when_to_use": "built in",
+            "source": "built-in",
+            "system_prompt": "prompt",
+        },
+    ],
+)
+def test_snapshot_rejects_source_inapplicable_fields(
+    tmp_path: Path, snapshot: dict[str, object]
+) -> None:
+    corrupt = AgentRecord(
+        "agent-1",
+        "root",
+        "snapshot",
+        "inspect",
+        "inspect files",
+        False,
+        str(tmp_path),
+        snapshot,
+    )
+
+    with pytest.raises(AgentDefinitionError):
+        AgentExecutor.from_record(corrupt)
+
+
 @pytest.mark.asyncio
 async def test_builtin_agent_resolves_canonical_tools(tmp_path: Path) -> None:
     executor = AgentExecutor(EXPLORE_AGENT)

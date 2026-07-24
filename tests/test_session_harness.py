@@ -11,8 +11,15 @@ from sqlalchemy.orm import sessionmaker
 
 import harness
 from harness import PermissionMode, RuntimeContext, SessionHarness, ToolRuntime
+from harness.agents import AgentScheduler
 from models import Base
-from state_core import EventType, SessionRuntimeFactory, SQLAlchemyStateStore
+from state_core import (
+    AgentRecord,
+    AgentStatus,
+    EventType,
+    SessionRuntimeFactory,
+    SQLAlchemyStateStore,
+)
 from tools.base import Tool, ToolResult
 
 
@@ -371,6 +378,48 @@ def test_resume_reconciles_running_agents_through_runtime_recovery(
         EventType.AGENT_LIFECYCLE,
         EventType.EXECUTION_INTERRUPTED,
     ]
+
+
+@pytest.mark.asyncio
+async def test_resume_reuses_scheduler_and_reconciles_durable_runtime_agents(
+    factory, workspace: Path
+) -> None:
+    created = factory.create("durable-agents")
+    repository = created.store.agents
+    pending = repository.create(
+        AgentRecord(
+            "pending-agent",
+            created.root_session_id,
+            "Explore",
+            "pending",
+            "pending",
+            True,
+            str(workspace),
+            {},
+        )
+    )
+    running = repository.create(
+        AgentRecord(
+            "running-agent",
+            created.root_session_id,
+            "Explore",
+            "running",
+            "running",
+            True,
+            str(workspace),
+            {},
+        )
+    )
+    repository.transition(running.agent_id, AgentStatus.RUNNING, running.revision)
+
+    resumed = factory.resume("durable-agents")
+    owner = AgentScheduler.for_harness(resumed)
+    resumed_again = factory.resume("durable-agents")
+
+    assert repository.get(pending.agent_id).status is AgentStatus.INTERRUPTED  # type: ignore[union-attr]
+    assert repository.get(running.agent_id).status is AgentStatus.INTERRUPTED  # type: ignore[union-attr]
+    assert AgentScheduler.for_harness(resumed_again) is owner
+    await owner.shutdown()
 
 
 def test_factory_inherits_and_allows_scope_overrides(

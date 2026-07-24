@@ -36,6 +36,7 @@ from state_core import (
     AgentRepository,
     AgentStatus,
     AgentTerminationReason,
+    InvalidAgentParent,
     RuntimeRecordRevisionConflict,
     sanitize_runtime_error,
 )
@@ -87,7 +88,15 @@ def _repository_identity(
     bind = getattr(session_factory, "kw", {}).get("bind")
     url = getattr(bind, "url", None)
     if url is not None:
-        return f"sqlalchemy:{url}"
+        drivername = getattr(url, "drivername", "")
+        if drivername.startswith("sqlite"):
+            database = getattr(url, "database", None)
+            if database and database != ":memory:":
+                canonical_database = Path(database).expanduser().resolve()
+                return f"sqlalchemy:sqlite:{canonical_database}"
+            return f"sqlalchemy:sqlite-memory:{id(bind)}"
+        rendered = url.render_as_string(hide_password=False)
+        return f"sqlalchemy:{rendered}"
     if session_factory is not None:
         return f"session-factory:{id(session_factory)}"
     # Generic repository protocols expose no durable identity. Keying their
@@ -275,6 +284,7 @@ class AgentScheduler:
             self._concurrency_lock = asyncio.Lock()
             self._tasks: dict[str, asyncio.Task[AgentRecord]] = {}
             self._children: dict[str, SessionHarness] = {}
+            self._ready_events: dict[str, asyncio.Event] = {}
             self._quarantined_tasks: set[asyncio.Task[AgentRecord]] = set()
             self._stop_grace = stop_grace
             self._force_grace = force_grace
@@ -340,20 +350,6 @@ class AgentScheduler:
             )
         return record
 
-    def _validate_parent(self, parent_agent_id: str | None) -> None:
-        if parent_agent_id is None or parent_agent_id == self.harness.agent_id:
-            return
-        parent = self.repository.get(parent_agent_id)
-        if (
-            parent is None
-            or parent.root_session_id != self.harness.root_session_id
-            or parent.status is not AgentStatus.RUNNING
-        ):
-            raise AgentOwnershipError(
-                "Agent parent must be the current harness or a running agent "
-                "in the same durable root"
-            )
-
     @staticmethod
     def _validate_request(
         request: AgentRequest,
@@ -395,7 +391,6 @@ class AgentScheduler:
             if request.parent_agent_id is not None
             else self.harness.agent_id
         )
-        self._validate_parent(parent_agent_id)
         definition, definition_snapshot = self._validate_request(request)
         agent_id = f"agent-{request.agent_type.lower()}-{uuid.uuid4().hex[:12]}"
         child_options: dict[str, Any] = {
@@ -407,8 +402,7 @@ class AgentScheduler:
         if permission_mode is not None:
             child_options["permission_mode"] = permission_mode
         child = self.harness.child(agent_id, **child_options)
-        record = self.repository.create(
-            AgentRecord(
+        pending_record = AgentRecord(
                 agent_id=agent_id,
                 root_session_id=self.harness.root_session_id,
                 parent_agent_id=parent_agent_id,
@@ -420,21 +414,50 @@ class AgentScheduler:
                 definition_snapshot=definition_snapshot,
                 worktree_id=request.worktree_id,
             )
-        )
+        try:
+            if parent_agent_id is None:
+                record = self.repository.create(pending_record)
+            else:
+                create_guarded = getattr(
+                    self.repository, "create_with_parent_guard", None
+                )
+                if not callable(create_guarded):
+                    raise InvalidAgentParent(parent_agent_id)
+                record = create_guarded(pending_record)
+        except InvalidAgentParent as exc:
+            raise AgentOwnershipError(
+                "Agent parent must be running in the same durable root"
+            ) from exc
         self._children[agent_id] = child
+        ready = asyncio.Event()
+        self._ready_events[agent_id] = ready
         task = asyncio.create_task(self._execute(record, child), name=f"agent:{agent_id}")
         self._tasks[agent_id] = task
         task.add_done_callback(lambda completed, key=agent_id: self._forget(key, completed))
         if request.background:
-            return record
+            await ready.wait()
+            return self._owned(agent_id)
         return await self.wait(agent_id)
 
     def _forget(self, agent_id: str, completed: asyncio.Task[AgentRecord]) -> None:
         if self._tasks.get(agent_id) is completed:
             self._tasks.pop(agent_id, None)
             child = self._children.pop(agent_id, None)
+            ready = self._ready_events.pop(agent_id, None)
+            if ready is not None and not ready.is_set():
+                try:
+                    current = self._owned(agent_id)
+                    if current.status is AgentStatus.PENDING:
+                        self._finish(agent_id, AgentStatus.CANCELLED)
+                finally:
+                    ready.set()
             if child is not None:
                 child.runtime_context.cancellation.dispose()
+
+    def _signal_ready(self, agent_id: str) -> None:
+        ready = self._ready_events.get(agent_id)
+        if ready is not None:
+            ready.set()
 
     async def _acquire_concurrency_lease(
         self, record: AgentRecord
@@ -505,6 +528,7 @@ class AgentScheduler:
             current = self.repository.transition(
                 current.agent_id, AgentStatus.RUNNING, current.revision
             )
+            self._signal_ready(record.agent_id)
             runner = self._runner_for(current)
             invocation = (
                 runner.run(current, child)
@@ -526,6 +550,7 @@ class AgentScheduler:
                 record.agent_id, AgentStatus.FAILED, error=_error_payload(exc)
             )
         finally:
+            self._signal_ready(record.agent_id)
             if lease is not None:
                 await self._release_concurrency_lease(record.agent_id, lease)
 

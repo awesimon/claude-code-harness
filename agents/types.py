@@ -387,6 +387,14 @@ def _definition_from_mapping(
         source = AgentSource(source_value)
     except ValueError as exc:
         raise _definition_error("source", "a supported source string") from exc
+    if source is not AgentSource.PLUGIN and "plugin" in snapshot:
+        raise AgentDefinitionError(
+            "Agent definition snapshot plugin is only valid for plugin sources"
+        )
+    if source is AgentSource.BUILT_IN and snapshot.get("base_dir") != "built-in":
+        raise AgentDefinitionError(
+            "Agent definition snapshot built-in base_dir must be 'built-in'"
+        )
     if "metadata" in snapshot and not isinstance(snapshot["metadata"], Mapping):
         raise _definition_error("metadata", "a mapping")
     timeout = snapshot.get("execution_timeout")

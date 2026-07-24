@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import builtins
 import json
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from sqlalchemy import (
     JSON,
@@ -31,6 +32,7 @@ from .runtime_records import (
     AgentRecord,
     AgentStatus,
     AgentTerminationReason,
+    InvalidAgentParent,
     RuntimeMetadataRecord,
     RuntimeRecordRevisionConflict,
     TraceSpanRecord,
@@ -180,35 +182,78 @@ class SQLAlchemyAgentRepository:
             finished_at=_as_utc(row.finished_at) if row.finished_at is not None else None,
         )
 
+    @contextmanager
+    def _transaction(self, *, immediate: bool = False) -> Iterator[Session]:
+        db = self._session_factory()
+        try:
+            if immediate and db.bind is not None and db.bind.dialect.name == "sqlite":
+                db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            else:
+                db.begin()
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _add(db: Session, detached: AgentRecord) -> None:
+        db.add(
+            RuntimeAgent(
+                agent_id=detached.agent_id,
+                root_session_id=detached.root_session_id,
+                parent_agent_id=detached.parent_agent_id,
+                agent_type=detached.agent_type,
+                prompt=detached.prompt,
+                description=detached.description,
+                is_background=detached.is_background,
+                status=detached.status.value,
+                revision=detached.revision,
+                definition_snapshot=_json_copy(detached.definition_snapshot),
+                usage=_json_copy(detached.usage),
+                termination_reason=(
+                    detached.termination_reason.value
+                    if detached.termination_reason is not None
+                    else None
+                ),
+                error_json=_json_copy(detached.error),
+                output_json=_json_copy(detached.output),
+                effective_cwd=detached.effective_cwd,
+                worktree_id=detached.worktree_id,
+                created_at=detached.created_at,
+                updated_at=detached.updated_at,
+                started_at=detached.started_at,
+                finished_at=detached.finished_at,
+            )
+        )
+
     def create(self, record: AgentRecord) -> AgentRecord:
         detached = AgentRecord(**record.__dict__)
-        with self._session_factory() as db, db.begin():
-            db.add(
-                RuntimeAgent(
-                    agent_id=detached.agent_id,
-                    root_session_id=detached.root_session_id,
-                    parent_agent_id=detached.parent_agent_id,
-                    agent_type=detached.agent_type,
-                    prompt=detached.prompt,
-                    description=detached.description,
-                    is_background=detached.is_background,
-                    status=detached.status.value,
-                    revision=detached.revision,
-                    definition_snapshot=_json_copy(detached.definition_snapshot),
-                    usage=_json_copy(detached.usage),
-                    termination_reason=(
-                        detached.termination_reason.value if detached.termination_reason is not None else None
-                    ),
-                    error_json=_json_copy(detached.error),
-                    output_json=_json_copy(detached.output),
-                    effective_cwd=detached.effective_cwd,
-                    worktree_id=detached.worktree_id,
-                    created_at=detached.created_at,
-                    updated_at=detached.updated_at,
-                    started_at=detached.started_at,
-                    finished_at=detached.finished_at,
-                )
+        with self._transaction() as db:
+            self._add(db, detached)
+        return detached
+
+    def create_with_parent_guard(self, record: AgentRecord) -> AgentRecord:
+        detached = AgentRecord(**record.__dict__)
+        parent_agent_id = detached.parent_agent_id
+        if parent_agent_id is None:
+            raise InvalidAgentParent("<missing>")
+        with self._transaction(immediate=True) as db:
+            statement = (
+                select(RuntimeAgent)
+                .where(RuntimeAgent.agent_id == parent_agent_id)
+                .with_for_update()
             )
+            parent = db.execute(statement).scalar_one_or_none()
+            if (
+                parent is None
+                or parent.root_session_id != detached.root_session_id
+                or parent.status != AgentStatus.RUNNING.value
+            ):
+                raise InvalidAgentParent(parent_agent_id)
+            self._add(db, detached)
         return detached
 
     def get(self, agent_id: str) -> AgentRecord | None:
@@ -247,7 +292,7 @@ class SQLAlchemyAgentRepository:
         error: Mapping[str, Any] | None = None,
     ) -> AgentRecord:
         lost_update = False
-        with self._session_factory() as db, db.begin():
+        with self._transaction(immediate=True) as db:
             row = db.get(RuntimeAgent, agent_id)
             actual = row.revision if row is not None else None
             if row is None or actual != expected_revision:

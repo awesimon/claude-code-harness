@@ -3,6 +3,7 @@ from __future__ import annotations
 # ruff: noqa: E501
 import json
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ from state_core import (
     AgentRecord,
     AgentStatus,
     AgentTerminationReason,
+    InvalidAgentParent,
     InvalidAgentTransition,
     InvalidTraceSpanTransition,
     RuntimeRecordRevisionConflict,
@@ -281,6 +283,66 @@ def test_runtime_error_sanitizer_redacts_embedded_credentials_and_bounds_strings
     assert len(sanitized["details"]) <= 2000
 
 
+def test_runtime_error_sanitizer_redacts_json_and_escaped_json_credentials() -> None:
+    sanitized = sanitize_runtime_error(
+        {
+            "message": (
+                '{"api_key":"json-key-secret","safe":"kept"}; '
+                r'{\"access_token\":\"escaped-json-secret\"}'
+            )
+        }
+    )
+
+    serialized = json.dumps(sanitized)
+    assert "json-key-secret" not in serialized
+    assert "escaped-json-secret" not in serialized
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "plain error",
+        float("nan"),
+        {"value": float("inf")},
+        {"value": object()},
+        {1: "non-string key"},
+    ],
+)
+def test_runtime_error_sanitizer_is_total_and_json_safe(value: object) -> None:
+    sanitized = sanitize_runtime_error(value)  # type: ignore[arg-type]
+
+    assert isinstance(sanitized, dict)
+    assert len(json.dumps(sanitized, allow_nan=False)) <= 50000
+
+
+def test_runtime_error_sanitizer_stops_before_wide_invalid_key_iteration() -> None:
+    class WideInvalidKeyMapping(dict[object, object]):
+        def items(self):
+            for index in range(65):
+                yield index, "value"
+            raise AssertionError("sanitizer traversed beyond its item budget")
+
+    sanitized = sanitize_runtime_error(WideInvalidKeyMapping())
+
+    assert sanitized is not None
+    assert sanitized.get("__truncated__") == "[TRUNCATED]"
+    assert "[UNSANITIZABLE]" not in json.dumps(sanitized)
+
+
+def test_runtime_error_sanitizer_bounds_nested_invalid_key_markers() -> None:
+    value: dict[object, object] = {"message": "bottom"}
+    for _ in range(16):
+        value = {
+            **{index: "invalid" for index in range(63)},
+            "nested": value,
+        }
+
+    sanitized = sanitize_runtime_error(value)
+
+    assert sanitized is not None
+    assert len(json.dumps(sanitized)) <= 50000
+
+
 def test_runtime_error_sanitizer_bounds_depth_width_and_total_size() -> None:
     deep: dict[str, object] = {"message": "bottom"}
     for _ in range(2000):
@@ -475,6 +537,55 @@ def test_metadata_create_race_returns_domain_conflict(
     conflicts = [outcome for outcome in outcomes if isinstance(outcome, RuntimeRecordRevisionConflict)]
     assert len(conflicts) == 1
     assert conflicts[0].actual_revision == 0
+
+
+def test_parent_guard_serializes_against_concurrent_sqlite_transition(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'parent-guard-race.db'}?timeout=0.2"
+    )
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    transition_repository = SQLAlchemyStateStore(session_factory).agents
+    guard_repository = SQLAlchemyStateStore(session_factory).agents
+    parent = transition_repository.create(agent("parent-race"))
+    parent = transition_repository.transition(
+        parent.agent_id, AgentStatus.RUNNING, parent.revision
+    )
+    child = agent("child-race", parent_agent_id=parent.agent_id)
+    transition_entered = Event()
+    release_transition = Event()
+    guard_started = Event()
+
+    def hold_transition() -> None:
+        transition_entered.set()
+        assert release_transition.wait(timeout=1)
+
+    def create_guarded() -> AgentRecord:
+        guard_started.set()
+        return guard_repository.create_with_parent_guard(child)
+
+    transition_repository._before_compare_and_swap = hold_transition
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        transition_future = pool.submit(
+            transition_repository.transition,
+            parent.agent_id,
+            AgentStatus.COMPLETED,
+            parent.revision,
+        )
+        assert transition_entered.wait(timeout=1)
+        guard_future = pool.submit(create_guarded)
+        assert guard_started.wait(timeout=1)
+        time.sleep(0.05)
+        release_transition.set()
+
+        transitioned = transition_future.result(timeout=1)
+        assert transitioned.status is AgentStatus.COMPLETED
+        with pytest.raises(InvalidAgentParent):
+            guard_future.result(timeout=1)
+
+    assert guard_repository.get(child.agent_id) is None
 
 
 def test_trace_repository_adds_duration_column_to_existing_sqlite_table(tmp_path: Path) -> None:
@@ -749,6 +860,41 @@ def test_concurrent_runtime_cas_losers_report_committed_winner_revision(
     )
     thread_state = local()
 
+    agent_winner_locked = Event()
+    release_agent_winner = Event()
+
+    def serialize_agent_winner() -> None:
+        assert getattr(thread_state, "role", None) == "winner"
+        agent_winner_locked.set()
+        assert release_agent_winner.wait(timeout=5)
+
+    monkeypatch.setattr(
+        store.agents, "_before_compare_and_swap", serialize_agent_winner
+    )
+
+    def run_agent(role: str) -> AgentRecord | RuntimeRecordRevisionConflict:
+        thread_state.role = role
+        try:
+            return store.agents.transition(
+                created_agent.agent_id, AgentStatus.RUNNING, 0
+            )
+        except RuntimeRecordRevisionConflict as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winner_future = pool.submit(run_agent, "winner")
+        assert agent_winner_locked.wait(timeout=5)
+        loser_future = pool.submit(run_agent, "loser")
+        time.sleep(0.05)
+        release_agent_winner.set()
+        agent_winner = winner_future.result(timeout=5)
+        agent_loser = loser_future.result(timeout=5)
+
+    assert not isinstance(agent_winner, RuntimeRecordRevisionConflict)
+    assert isinstance(agent_loser, RuntimeRecordRevisionConflict)
+    assert agent_loser.expected_revision == 0
+    assert agent_loser.actual_revision == 1
+
     def assert_race(repository: object, winner: Callable[[], object], loser: Callable[[], object]) -> None:
         both_loaded = Barrier(2)
         winner_committed = Event()
@@ -779,11 +925,6 @@ def test_concurrent_runtime_cas_losers_report_committed_winner_revision(
         assert loser_result.expected_revision == 0
         assert loser_result.actual_revision == 1
 
-    assert_race(
-        store.agents,
-        lambda: store.agents.transition(created_agent.agent_id, AgentStatus.RUNNING, 0),
-        lambda: store.agents.transition(created_agent.agent_id, AgentStatus.RUNNING, 0),
-    )
     assert_race(
         store.traces,
         lambda: store.traces.finish(created_span.span_id, TraceSpanStatus.COMPLETED, 0),

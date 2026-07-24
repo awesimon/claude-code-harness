@@ -133,7 +133,7 @@ async def test_foreground_lifecycle_persists_output_and_usage(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_background_returns_pending_then_status_and_wait(tmp_path: Path) -> None:
+async def test_background_returns_after_running_is_durable(tmp_path: Path) -> None:
     harness, _ = make_harness(tmp_path)
     runner = ControlledRunner()
     scheduler = AgentScheduler(harness, harness.store.agents, runner=runner)
@@ -141,11 +141,34 @@ async def test_background_returns_pending_then_status_and_wait(tmp_path: Path) -
     created = await scheduler.spawn(
         AgentRequest("inspect", "Explore", "find files", background=True)
     )
-    assert created.status is AgentStatus.PENDING
-    await runner.started.wait()
+    assert created.status is AgentStatus.RUNNING
+    assert runner.calls[0][0].status is AgentStatus.RUNNING
     assert scheduler.status(created.agent_id).status is AgentStatus.RUNNING
     runner.release.set()
     assert (await scheduler.wait(created.agent_id)).status is AgentStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_background_fast_terminal_never_returns_pending(tmp_path: Path) -> None:
+    harness, _ = make_harness(tmp_path)
+
+    class ImmediateRunner:
+        async def run(self, record, child):
+            assert record.status is AgentStatus.RUNNING
+            return AgentExecutionResult(
+                content=[], termination_reason="completed"
+            )
+
+    scheduler = AgentScheduler(
+        harness, harness.store.agents, runner=ImmediateRunner()
+    )
+
+    returned = await scheduler.spawn(
+        AgentRequest("immediate", "Explore", "d", background=True)
+    )
+
+    assert returned.status is not AgentStatus.PENDING
+    assert (await scheduler.wait(returned.agent_id)).status is AgentStatus.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -211,17 +234,40 @@ async def test_single_scheduler_owner_rejects_direct_duplicate_and_routes_factor
         AgentRequest("first", "Explore", "d", background=True)
     )
     await owner_runner.started.wait()
-    second = await routed.spawn(
-        AgentRequest("second", "Explore", "d", background=True)
+    second_spawn = asyncio.create_task(
+        routed.spawn(AgentRequest("second", "Explore", "d", background=True))
     )
-    await asyncio.sleep(0)
+    await wait_until(lambda: bool(routed.list(status=AgentStatus.PENDING)))
+    assert not second_spawn.done()
     assert [record.prompt for record, _ in owner_runner.calls] == ["first"]
     assert duplicate_runner.calls == []
 
     await routed.stop(first.agent_id)
+    second = await second_spawn
     owner_runner.release.set()
     await routed.wait(second.agent_id)
     await owner.shutdown()
+
+
+def test_equivalent_sqlite_urls_share_one_scheduler_owner(tmp_path: Path) -> None:
+    workspace = tmp_path / "equivalent-workspace"
+    workspace.mkdir()
+    database = tmp_path / "equivalent.db"
+    first_engine = create_engine(f"sqlite:///{database}?timeout=1")
+    second_engine = create_engine(f"sqlite:///{database}?timeout=2")
+    Base.metadata.create_all(first_engine)
+    first_store = SQLAlchemyStateStore(sessionmaker(bind=first_engine))
+    second_store = SQLAlchemyStateStore(sessionmaker(bind=second_engine))
+    harness = SessionHarnessFactory(
+        SessionRuntimeFactory(first_store), workspace_root=workspace
+    ).create("equivalent-root")
+    owner = AgentScheduler(harness, first_store.agents, runner=ControlledRunner())
+
+    try:
+        with pytest.raises(AgentSchedulerAlreadyActive):
+            AgentScheduler(harness, second_store.agents, runner=ControlledRunner())
+    finally:
+        asyncio.run(owner.shutdown())
 
 
 def test_concurrent_direct_construction_registers_exactly_one_owner(
@@ -351,6 +397,7 @@ async def test_reconcile_scopes_root_and_preserves_live_and_terminal(tmp_path: P
 async def test_nested_parent_root_and_child_todo_scope(tmp_path: Path) -> None:
     root, _ = make_harness(tmp_path)
     root.session_runtime.enable_todo_v1()
+    create_running_parent(root, "parent")
     parent = root.child("parent")
     runner = ControlledRunner()
     runner.release.set()
@@ -393,12 +440,16 @@ async def test_root_and_per_parent_concurrency_limits(tmp_path: Path) -> None:
         AgentRequest(str(index), "Explore", "d", background=True, parent_agent_id=parent)
         for index, parent in enumerate(("a", "a", "b", "b", "c", "c"))
     ]
-    records = [await scheduler.spawn(request) for request in requests]
+    spawn_tasks = [
+        asyncio.create_task(scheduler.spawn(request)) for request in requests
+    ]
     await wait_until(lambda: len(runner.calls) == 3)
     assert runner.peak == 3
     assert len({record.parent_agent_id for record, _ in runner.calls}) == 3
+    assert len(scheduler.list(status=AgentStatus.PENDING)) == 3
 
     runner.release.set()
+    records = await asyncio.gather(*spawn_tasks)
     await asyncio.gather(*(scheduler.wait(record.agent_id) for record in records))
     assert len(runner.calls) == 6
     assert scheduler.root_available_capacity == 3
@@ -416,10 +467,15 @@ async def test_queued_stop_never_enters_runner(tmp_path: Path) -> None:
     )
     first = await scheduler.spawn(AgentRequest("first", "Explore", "d", background=True))
     await runner.started.wait()
-    queued = await scheduler.spawn(AgentRequest("queued", "Explore", "d", background=True))
+    queued_spawn = asyncio.create_task(
+        scheduler.spawn(AgentRequest("queued", "Explore", "d", background=True))
+    )
+    await wait_until(lambda: bool(scheduler.list(status=AgentStatus.PENDING)))
+    queued = scheduler.list(status=AgentStatus.PENDING)[0]
 
     stopped = await scheduler.stop(queued.agent_id)
     assert stopped.status is AgentStatus.CANCELLED
+    assert await queued_spawn == stopped
     assert [record.prompt for record, _ in runner.calls] == ["first"]
     runner.release.set()
     await scheduler.wait(first.agent_id)
@@ -663,6 +719,7 @@ async def test_invalid_parent_rejected_before_durable_mutation(
 @pytest.mark.asyncio
 async def test_current_harness_agent_is_allowed_as_parent(tmp_path: Path) -> None:
     root, _ = make_harness(tmp_path)
+    create_running_parent(root, "current-parent")
     parent = root.child("current-parent")
     runner = ControlledRunner()
     runner.release.set()
@@ -678,6 +735,75 @@ async def test_current_harness_agent_is_allowed_as_parent(tmp_path: Path) -> Non
     )
 
     assert result.parent_agent_id == parent.agent_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["missing", "terminal"])
+async def test_current_harness_parent_requires_durable_running_record(
+    tmp_path: Path, kind: str
+) -> None:
+    root, _ = make_harness(tmp_path)
+    parent_id = f"current-{kind}"
+    if kind == "terminal":
+        parent = create_running_parent(root, parent_id)
+        root.store.agents.transition(
+            parent.agent_id, AgentStatus.COMPLETED, parent.revision
+        )
+    scheduler = AgentScheduler(
+        root.child(parent_id), root.store.agents, runner=ControlledRunner()
+    )
+
+    with pytest.raises(AgentOwnershipError):
+        await scheduler.spawn(
+            AgentRequest("invalid current parent", "Explore", "d", background=True)
+        )
+
+    assert scheduler.list(parent_agent_id=parent_id) == []
+
+
+@pytest.mark.asyncio
+async def test_parent_transition_before_child_create_is_rejected_atomically(
+    tmp_path: Path,
+) -> None:
+    root, _ = make_harness(tmp_path)
+    parent = create_running_parent(root, "racing-parent")
+    delegate = root.store.agents
+
+    class ParentRaceRepository:
+        def __getattr__(self, name):
+            return getattr(delegate, name)
+
+        def _finish_parent(self) -> None:
+            current = delegate.get(parent.agent_id)
+            assert current is not None
+            delegate.transition(
+                current.agent_id, AgentStatus.COMPLETED, current.revision
+            )
+
+        def create(self, record):
+            self._finish_parent()
+            return delegate.create(record)
+
+        def create_with_parent_guard(self, record):
+            self._finish_parent()
+            return delegate.create_with_parent_guard(record)
+
+    scheduler = AgentScheduler(
+        root, ParentRaceRepository(), runner=ControlledRunner()
+    )
+
+    with pytest.raises(AgentOwnershipError):
+        await scheduler.spawn(
+            AgentRequest(
+                "racing child",
+                "Explore",
+                "d",
+                background=True,
+                parent_agent_id=parent.agent_id,
+            )
+        )
+
+    assert [record.agent_id for record in scheduler.list()] == [parent.agent_id]
 
 
 @pytest.mark.asyncio
@@ -798,18 +924,26 @@ async def test_queued_definition_uses_detached_snapshot_not_mutated_globals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root, _ = make_harness(tmp_path)
+    blocker = ControlledRunner()
+
+    def runner_factory(record: AgentRecord):
+        if record.prompt == "blocker":
+            return blocker
+        return AgentExecutor.from_record(record)
+
     scheduler = AgentScheduler(
-        root, root.store.agents, stop_grace=0.01, force_grace=0.01
+        root,
+        root.store.agents,
+        runner_factory=runner_factory,
+        root_concurrency=1,
+        stop_grace=0.01,
+        force_grace=0.01,
     )
     original_tools = EXPLORE_AGENT.tools
     assert original_tools is not None
     original_copy = list(original_tools)
     original_when = EXPLORE_AGENT.when_to_use
     original_prompt = EXPLORE_AGENT.get_system_prompt
-    record = await scheduler.spawn(
-        AgentRequest("queued snapshot", "Explore", "d", background=True)
-    )
-
     class SnapshotLLM:
         def __init__(self) -> None:
             self.requests = []
@@ -823,17 +957,38 @@ async def test_queued_definition_uses_detached_snapshot_not_mutated_globals(
     llm = SnapshotLLM()
     monkeypatch.setattr("agents.engine.LLMService", lambda: llm)
     try:
+        blocking_record = await scheduler.spawn(
+            AgentRequest("blocker", "Explore", "d", background=True)
+        )
+        await blocker.started.wait()
+        queued_spawn = asyncio.create_task(
+            scheduler.spawn(
+                AgentRequest("queued snapshot", "Explore", "d", background=True)
+            )
+        )
+        await wait_until(
+            lambda: bool(scheduler.list(status=AgentStatus.PENDING))
+        )
+        queued = scheduler.list(status=AgentStatus.PENDING)[0]
+        assert not queued_spawn.done()
         original_tools.append("write_file")
         EXPLORE_AGENT.when_to_use = "mutated after spawn"
         EXPLORE_AGENT.get_system_prompt = lambda: "mutated prompt"
+        await asyncio.sleep(0)
+        assert scheduler.status(queued.agent_id).status is AgentStatus.PENDING
+        assert not queued_spawn.done()
 
+        blocker.release.set()
+        await scheduler.wait(blocking_record.agent_id)
+        record = await queued_spawn
+        assert record.status is not AgentStatus.PENDING
         completed = await scheduler.wait(record.agent_id)
 
         assert completed.status is AgentStatus.COMPLETED
         request = llm.requests[0]
         schema_names = {item["function"]["name"] for item in request.tools}
         assert "write_file" not in schema_names
-        assert request.messages[0].content == record.definition_snapshot["system_prompt"]
+        assert request.messages[0].content == queued.definition_snapshot["system_prompt"]
     finally:
         original_tools[:] = original_copy
         EXPLORE_AGENT.when_to_use = original_when
@@ -905,14 +1060,16 @@ async def test_parent_limiters_are_refcounted_and_removed(tmp_path: Path) -> Non
 
     create_running_parent(root, "shared")
     runner.release.clear()
-    siblings = [
-        await scheduler.spawn(
-            AgentRequest(
-                f"sibling-{index}",
-                "Explore",
-                "d",
-                background=True,
-                parent_agent_id="shared",
+    sibling_spawns = [
+        asyncio.create_task(
+            scheduler.spawn(
+                AgentRequest(
+                    f"sibling-{index}",
+                    "Explore",
+                    "d",
+                    background=True,
+                    parent_agent_id="shared",
+                )
             )
         )
         for index in range(3)
@@ -920,8 +1077,10 @@ async def test_parent_limiters_are_refcounted_and_removed(tmp_path: Path) -> Non
     await wait_until(lambda: len(runner.calls) == 31)
     assert scheduler.parent_limiter_count == 1
     assert scheduler.parent_limiter_refcounts == {"shared": 3}
+    assert len(scheduler.list(status=AgentStatus.PENDING)) == 2
 
     runner.release.set()
+    siblings = await asyncio.gather(*sibling_spawns)
     await asyncio.gather(*(scheduler.wait(item.agent_id) for item in siblings))
     assert scheduler.parent_limiter_count == 0
     assert scheduler.parent_limiter_refcounts == {}
