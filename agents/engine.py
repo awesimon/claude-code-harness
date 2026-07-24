@@ -10,7 +10,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agents.types import (
     AgentDefinition,
@@ -19,11 +19,13 @@ from agents.types import (
     AgentToolResult,
     parse_agent_definition,
 )
-from harness import SessionHarness, TerminationReason
 from services import ChatCompletionRequest, LLMService, Message
 from state_core import AgentRecord
 from tools import ToolRegistry
 from tools.base import Tool, canonical_tool_name, to_json_value
+
+if TYPE_CHECKING:
+    from harness.session import SessionHarness
 
 
 class AgentExecutor:
@@ -244,7 +246,7 @@ class AgentExecutor:
                         execution = await child_harness.tool_runtime.execute(
                             tool_name, arguments, child_harness.runtime_context
                         )
-                        if execution.termination_reason is TerminationReason.CANCELLED:
+                        if execution.termination_reason.value == "cancelled":
                             raise asyncio.CancelledError
                         execution_name = execution.tool_name
                         result = execution.result

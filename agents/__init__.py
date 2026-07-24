@@ -41,7 +41,6 @@ from .fork import (
     get_fork_manager,
     is_in_fork_child,
 )
-from .tool import AgentTool, AgentToolInput
 from .types import (
     ONE_SHOT_BUILTIN_AGENT_TYPES,
     VERIFICATION_AGENT_TYPE,
@@ -70,6 +69,16 @@ from .types import (
     is_plugin_agent,
     parse_agent_definition,
 )
+
+
+def __getattr__(name: str):
+    """Load canonical Agent tool adapters without creating package import cycles."""
+
+    if name in {"AgentTool", "AgentToolInput"}:
+        from .tool import AgentTool, AgentToolInput
+
+        return {"AgentTool": AgentTool, "AgentToolInput": AgentToolInput}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "AgentDefinition",
