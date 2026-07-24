@@ -157,18 +157,27 @@ class ContextController:
             "through_event_id": through_event_id,
             "source_event_count": len(transcript_events),
         }
+        self.harness.session_runtime.append_event(
+            EventType.COMPACTION_STARTED,
+            details,
+        )
         pre = await self.hooks.run_pre_compact(details, hook_context)
         if pre is not None and getattr(pre, "decision", HookDecision.ALLOW) is HookDecision.BLOCK:
+            self._record_failure(details, "context_compaction_blocked")
             raise ContextCompactionError(
                 getattr(pre, "reason", None) or "compaction blocked by hook",
                 category="context_compaction_blocked",
             )
 
-        reservation = self.harness.budget.reserve(
-            BudgetKind.COMPACTION_TOKENS,
-            max(1, token_count),
-            agent_id=self.harness.agent_id,
-        )
+        try:
+            reservation = self.harness.budget.reserve(
+                BudgetKind.COMPACTION_TOKENS,
+                max(1, token_count),
+                agent_id=self.harness.agent_id,
+            )
+        except Exception as exc:
+            self._record_failure(details, getattr(exc, "category", "budget_exhausted"))
+            raise
         try:
             if self.summarize is None:
                 raise ContextCompactionError("no compaction summary callback is configured")
@@ -180,6 +189,10 @@ class ContextController:
                 span.set_usage(summary.usage)
         except Exception as exc:
             reservation.release()
+            self._record_failure(
+                details,
+                getattr(exc, "category", "context_compaction_failed"),
+            )
             if isinstance(exc, ContextCompactionError):
                 raise
             raise ContextCompactionError(f"context compaction failed: {exc}", cause=exc) from exc
@@ -194,12 +207,34 @@ class ContextController:
             through_event_id,
             len(transcript_events),
         )
-        self._persist_boundary(snapshot)
+        try:
+            self._persist_boundary(snapshot)
+        except Exception as exc:
+            self._record_failure(
+                details,
+                getattr(exc, "category", "context_compaction_failed"),
+            )
+            raise
+        self.harness.session_runtime.append_event(
+            EventType.COMPACTION_BOUNDARY,
+            {
+                **details,
+                "summary_digest": snapshot["summary_digest"],
+                "version": COMPACTION_VERSION,
+            },
+        )
         await self.hooks.run_post_compact(
             {**details, "summary_digest": snapshot["summary_digest"]},
             hook_context,
         )
         return [*system_messages, Message(role="user", content=summary.summary)]
+
+    def _record_failure(self, details: Mapping[str, Any], category: Any) -> None:
+        safe_category = category if isinstance(category, str) and category else "context_compaction_failed"
+        self.harness.session_runtime.append_event(
+            EventType.COMPACTION_FAILED,
+            {**details, "category": safe_category},
+        )
 
     def _transcript_events(self) -> list[SessionEvent]:
         return [

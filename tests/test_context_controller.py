@@ -119,9 +119,17 @@ async def test_hard_threshold_runs_hooks_reserves_budget_and_persists_before_pos
     assert _message_contents(messages) == ["system", "durable summary"]
     boundary = store.metadata.get(harness.root_session_id, COMPACTION_NAMESPACE)
     assert boundary is not None
-    assert boundary.snapshot["through_event_id"] == runtime.events()[-1].id
+    assert boundary.snapshot["through_event_id"] == next(
+        event.id
+        for event in reversed(runtime.events())
+        if event.event_type is EventType.USER_MESSAGE
+    )
     assert boundary.snapshot["summary_digest"] == hashlib.sha256(b"durable summary").hexdigest()
     assert harness.budget.usage()[BudgetKind.COMPACTION_TOKENS] == 7
+    assert [event.event_type for event in runtime.events()][-2:] == [
+        EventType.COMPACTION_STARTED,
+        EventType.COMPACTION_BOUNDARY,
+    ]
 
 
 @pytest.mark.asyncio
@@ -202,6 +210,8 @@ async def test_summary_failure_preserves_prior_valid_boundary(tmp_path: Path) ->
     current = store.metadata.get(harness.root_session_id, COMPACTION_NAMESPACE)
     assert caught.value.category == "context_compaction_failed"
     assert current == prior
+    assert runtime.events()[-1].event_type is EventType.COMPACTION_FAILED
+    assert runtime.events()[-1].payload["category"] == "context_compaction_failed"
     assert _message_contents(ContextController(harness).restore_messages()) == [
         "first summary",
         "second " * 100,

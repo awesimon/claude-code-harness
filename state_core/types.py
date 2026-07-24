@@ -49,6 +49,9 @@ class EventType(str, Enum):
     AGENT_LIFECYCLE = "agent_lifecycle"
     CHECKPOINT = "checkpoint"
     EXECUTION_INTERRUPTED = "execution_interrupted"
+    COMPACTION_STARTED = "compaction_started"
+    COMPACTION_BOUNDARY = "compaction_boundary"
+    COMPACTION_FAILED = "compaction_failed"
 
 
 class StateCoreError(Exception):
