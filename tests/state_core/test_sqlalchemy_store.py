@@ -226,6 +226,45 @@ def test_task_ids_never_reuse_and_list_has_stable_numeric_order(
     assert store.tasks.get("other-list", "13") is None
 
 
+def test_concurrent_task_creation_allocates_unique_monotonic_ids(
+    session_factory: sessionmaker[Session],
+) -> None:
+    stores = [SQLAlchemyStateStore(session_factory) for _ in range(8)]
+    barrier = Barrier(len(stores))
+
+    def create(index: int) -> str:
+        barrier.wait()
+        return stores[index].tasks.create("concurrent", new_task(f"Task {index}")).id
+
+    with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+        ids = list(pool.map(create, range(len(stores))))
+
+    assert sorted(ids, key=int) == [str(index) for index in range(1, len(stores) + 1)]
+    assert [task.id for task in stores[0].tasks.list("concurrent")] == sorted(ids, key=int)
+
+
+def test_task_id_reservation_is_not_reused_after_insert_retry(
+    session_factory: sessionmaker[Session],
+) -> None:
+    store = SQLAlchemyStateStore(session_factory)
+    with session_factory() as db, db.begin():
+        db.execute(
+            text(
+                "CREATE TRIGGER reject_runtime_task BEFORE INSERT ON runtime_tasks "
+                "BEGIN SELECT RAISE(FAIL, 'task rejected'); END"
+            )
+        )
+
+    with pytest.raises(Exception, match="task rejected"):
+        store.tasks.create("retry", new_task("Rejected"))
+
+    with session_factory() as db, db.begin():
+        db.execute(text("DROP TRIGGER reject_runtime_task"))
+    retried = store.tasks.create("retry", new_task("Retried"))
+
+    assert retried.id == "2"
+
+
 def test_task_update_preserves_exact_reciprocal_edges_and_ignores_duplicates(
     store: SQLAlchemyStateStore,
 ) -> None:
@@ -259,6 +298,39 @@ def test_task_update_preserves_exact_reciprocal_edges_and_ignores_duplicates(
     assert removed.blocked_by == []
     assert store.tasks.get("tasks", second.id).blocked_by == []  # type: ignore[union-attr]
     assert store.tasks.get("tasks", third.id).blocks == []  # type: ignore[union-attr]
+
+
+def test_concurrent_dependency_updates_preserve_both_reciprocal_edges(
+    session_factory: sessionmaker[Session],
+) -> None:
+    setup = SQLAlchemyStateStore(session_factory)
+    first = setup.tasks.create("concurrent-deps", new_task("First"))
+    second = setup.tasks.create("concurrent-deps", new_task("Second"))
+    third = setup.tasks.create("concurrent-deps", new_task("Third"))
+    barrier = Barrier(2)
+
+    def add_dependency(task_id: str, dependency_id: str) -> None:
+        contender = SQLAlchemyStateStore(session_factory)
+        barrier.wait()
+        contender.tasks.update("concurrent-deps", task_id, TaskMutation(add_blocks=[dependency_id]))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(add_dependency, first.id, second.id),
+            pool.submit(add_dependency, first.id, third.id),
+        ]
+        for future in futures:
+            future.result()
+
+    final_first = setup.tasks.get("concurrent-deps", first.id)
+    final_second = setup.tasks.get("concurrent-deps", second.id)
+    final_third = setup.tasks.get("concurrent-deps", third.id)
+    assert final_first is not None
+    assert final_second is not None
+    assert final_third is not None
+    assert set(final_first.blocks) == {second.id, third.id}
+    assert final_second.blocked_by == [first.id]
+    assert final_third.blocked_by == [first.id]
 
 
 @pytest.mark.parametrize("dependency_kind", ["self", "missing"])

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from sqlalchemy import (
     DateTime,
@@ -20,6 +21,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from models import Base
 
@@ -284,6 +286,46 @@ class SQLAlchemyTaskRepository:
     def __init__(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
 
+    @contextmanager
+    def _transaction(self, *, immediate: bool = False) -> Iterator[Session]:
+        db = self._session_factory()
+        try:
+            if immediate and db.bind is not None and db.bind.dialect.name == "sqlite":
+                db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            else:
+                db.begin()
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def _allocate_task_id(self, task_list_id: str) -> str:
+        with self._transaction(immediate=True) as db:
+            if db.bind is not None and db.bind.dialect.name == "sqlite":
+                statement = sqlite_insert(RuntimeTaskCounter).values(
+                    task_list_id=task_list_id,
+                    high_water_mark=1,
+                )
+                statement = statement.on_conflict_do_update(
+                    index_elements=[RuntimeTaskCounter.task_list_id],
+                    set_={
+                        "high_water_mark": RuntimeTaskCounter.high_water_mark + 1,
+                    },
+                )
+                db.execute(statement)
+            else:
+                counter = db.get(RuntimeTaskCounter, task_list_id)
+                if counter is None:
+                    db.add(RuntimeTaskCounter(task_list_id=task_list_id, high_water_mark=1))
+                else:
+                    counter.high_water_mark += 1
+            counter = db.get(RuntimeTaskCounter, task_list_id)
+            assert counter is not None
+            return str(counter.high_water_mark)
+
     @staticmethod
     def _to_task_item(row: RuntimeTask) -> TaskItem:
         return TaskItem(
@@ -310,18 +352,11 @@ class SQLAlchemyTaskRepository:
         task_wire = task.to_dict()
         if type(task_list_id) is not str:
             raise TypeError("task_list_id must be a string")
-        with self._session_factory() as db, db.begin():
-            counter = db.get(RuntimeTaskCounter, task_list_id)
-            if counter is None:
-                counter = RuntimeTaskCounter(task_list_id=task_list_id, high_water_mark=1)
-                db.add(counter)
-                task_id = 1
-            else:
-                counter.high_water_mark += 1
-                task_id = counter.high_water_mark
+        task_id = self._allocate_task_id(task_list_id)
+        with self._transaction() as db:
             row = RuntimeTask(
                 task_list_id=task_list_id,
-                task_id=str(task_id),
+                task_id=task_id,
                 subject=task_wire["subject"],
                 description=task_wire["description"],
                 active_form=task_wire["activeForm"],
@@ -386,7 +421,7 @@ class SQLAlchemyTaskRepository:
         mutation: TaskMutation,
     ) -> TaskItem | None:
         mutation.to_dict()
-        with self._session_factory() as db, db.begin():
+        with self._transaction(immediate=True) as db:
             row = db.get(RuntimeTask, (task_list_id, task_id))
             if row is None:
                 return None
@@ -437,7 +472,7 @@ class SQLAlchemyTaskRepository:
     def claim(self, task_list_id: str, task_id: str, owner: str) -> ClaimResult:
         if type(owner) is not str:
             raise TypeError("owner must be a string")
-        with self._session_factory() as db, db.begin():
+        with self._transaction(immediate=True) as db:
             row = db.get(RuntimeTask, (task_list_id, task_id))
             if row is None:
                 return ClaimResult(success=False, reason="not_found")
@@ -497,7 +532,7 @@ class SQLAlchemyTaskRepository:
             )
 
     def delete(self, task_list_id: str, task_id: str) -> bool:
-        with self._session_factory() as db, db.begin():
+        with self._transaction(immediate=True) as db:
             row = db.get(RuntimeTask, (task_list_id, task_id))
             if row is None:
                 return False
