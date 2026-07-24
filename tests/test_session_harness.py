@@ -211,3 +211,34 @@ def test_factory_inherits_and_allows_scope_overrides(
     assert child.runtime_context.permission_mode is PermissionMode.BYPASS
     assert child.runtime_context.approval_callback is None
     assert child.runtime_context.tool_timeout == 3.0
+
+
+def test_factory_without_default_workspace_uses_per_call_workspace(
+    tmp_path: Path, workspace: Path
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'per-call-workspace.db'}")
+    Base.metadata.create_all(engine)
+    factory = harness.SessionHarnessFactory(
+        SessionRuntimeFactory(SQLAlchemyStateStore(sessionmaker(bind=engine)))
+    )
+
+    created = factory.create("per-call", workspace_root=workspace)
+    resumed = factory.resume("per-call", workspace_root=workspace)
+
+    assert created.effective_cwd == workspace.resolve()
+    assert resumed.effective_cwd == workspace.resolve()
+    assert resumed.store is created.store
+
+
+@pytest.mark.parametrize("method_name", ["create", "resume"])
+def test_factory_without_any_workspace_raises_harness_scope_error(
+    tmp_path: Path, method_name: str
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'missing-workspace.db'}")
+    Base.metadata.create_all(engine)
+    factory = harness.SessionHarnessFactory(
+        SessionRuntimeFactory(SQLAlchemyStateStore(sessionmaker(bind=engine)))
+    )
+
+    with pytest.raises(harness.HarnessScopeError, match="workspace_root is required"):
+        getattr(factory, method_name)("missing-workspace")

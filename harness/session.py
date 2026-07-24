@@ -134,8 +134,6 @@ class SessionHarnessFactory:
         approval_callback: ApprovalCallback | None = None,
         tool_timeout: float | None = None,
     ) -> None:
-        if workspace_root is None:
-            raise ValueError("SessionHarnessFactory requires a default workspace_root")
         if tool_registry is None:
             # Late import keeps the harness primitives independent of tool registration imports.
             from tools import ToolRegistry
@@ -144,19 +142,22 @@ class SessionHarnessFactory:
         self.session_runtime_factory = session_runtime_factory
         self.tool_registry = tool_registry
         self.permission_policy = permission_policy
-        self.workspace_root = _canonical_path(workspace_root)
+        self.workspace_root = _canonical_path(workspace_root) if workspace_root is not None else None
         self.permission_mode = permission_mode
         self.approval_callback = approval_callback
         self.tool_timeout = tool_timeout
 
     def create(self, session_id: str, **overrides: Any) -> SessionHarness:
+        self._resolve_workspace_root(overrides)
         return self._compose(self.session_runtime_factory.create(session_id), **overrides)
 
     def resume(self, session_id: str, **overrides: Any) -> SessionHarness:
+        self._resolve_workspace_root(overrides)
         return self._compose(self.session_runtime_factory.resume(session_id), **overrides)
 
     def _compose(self, runtime: SessionRuntime, **overrides: Any) -> SessionHarness:
-        workspace_root = _canonical_path(overrides.pop("workspace_root", self.workspace_root))
+        workspace_root = self._resolve_workspace_root(overrides)
+        overrides.pop("workspace_root", None)
         permission_mode = overrides.pop("permission_mode", self.permission_mode)
         approval_callback = overrides.pop("approval_callback", self.approval_callback)
         tool_timeout = overrides.pop("tool_timeout", self.tool_timeout)
@@ -187,3 +188,11 @@ class SessionHarnessFactory:
             agent_id=agent_id,
             parent_agent_id=parent_agent_id,
         )
+
+    def _resolve_workspace_root(self, overrides: Mapping[str, Any]) -> Path:
+        workspace_root = overrides.get("workspace_root", self.workspace_root)
+        if workspace_root is None:
+            raise HarnessScopeError(
+                "workspace_root is required when no factory default workspace is configured"
+            )
+        return _canonical_path(workspace_root)
