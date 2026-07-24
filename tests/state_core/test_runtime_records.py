@@ -298,6 +298,21 @@ def test_runtime_error_sanitizer_redacts_json_and_escaped_json_credentials() -> 
     assert "escaped-json-secret" not in serialized
 
 
+def test_runtime_error_sanitizer_redacts_multiply_escaped_json_credentials() -> None:
+    sanitized = sanitize_runtime_error(
+        {
+            "message": (
+                r'{\\\"api_key\\\":\\\"double-escaped-secret\\\"}; '
+                r'{\\\\\\\"password\\\\\\\":\\\\\\\"quad-escaped-secret\\\\\\\"}'
+            )
+        }
+    )
+
+    serialized = json.dumps(sanitized)
+    assert "double-escaped-secret" not in serialized
+    assert "quad-escaped-secret" not in serialized
+
+
 @pytest.mark.parametrize(
     "value",
     [

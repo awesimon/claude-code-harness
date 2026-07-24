@@ -102,17 +102,17 @@ _RUNTIME_HEADER_CONTAINER_KEYS = frozenset(
     {"headers", "requestheaders", "responseheaders"}
 )
 _AUTHORIZATION_VALUE = re.compile(
-    r'''(?i)\b(authorization|proxy[-_ ]authorization)(?:[\\]?["'])?\s*[:=]\s*'''
-    r'''(?:(?:[\\]?")(?:\\[\s\S]?|[^"\\])*(?:(?:[\\]?")|$)|'''
-    r'''(?:[\\]?')(?:\\[\s\S]?|[^'\\])*(?:(?:[\\]?')|$)|'''
+    r'''(?i)\b(authorization|proxy[-_ ]authorization)(?:\\*["'])?\s*[:=]\s*'''
+    r'''(?:(?:\\*")(?:\\[\s\S]?|[^"\\])*(?:(?:\\*")|$)|'''
+    r'''(?:\\*')(?:\\[\s\S]?|[^'\\])*(?:(?:\\*')|$)|'''
     r"(?:(?:bearer|basic)\s+)?[^\s,;&]+)"
 )
 _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?i)\b(api[_-]?key|x[-_]?api[-_]?key|password|passwd|secret|"
     r"client[_-]?secret|access[_-]?token|refresh[_-]?token|session[_-]?token|"
-    r'''id[_-]?token|auth[_-]?token|token|credentials?)(?:[\\]?["'])?\s*[:=]\s*'''
-    r'''(?:(?:[\\]?")(?:\\[\s\S]?|[^"\\])*(?:(?:[\\]?")|$)|'''
-    r'''(?:[\\]?')(?:\\[\s\S]?|[^'\\])*(?:(?:[\\]?')|$)|[^\s,;&]+)'''
+    r'''id[_-]?token|auth[_-]?token|token|credentials?)(?:\\*["'])?\s*[:=]\s*'''
+    r'''(?:(?:\\*")(?:\\[\s\S]?|[^"\\])*(?:(?:\\*")|$)|'''
+    r'''(?:\\*')(?:\\[\s\S]?|[^'\\])*(?:(?:\\*')|$)|[^\s,;&]+)'''
 )
 _BEARER_VALUE = re.compile(r"(?i)\bbearer\s+[^\s,;&]+")
 
