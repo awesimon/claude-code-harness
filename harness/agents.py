@@ -64,11 +64,22 @@ _REDACT = re.compile(
 )
 
 
-class _ParentLease:
-    def __init__(self, key: str, semaphore: asyncio.Semaphore) -> None:
+class _ConcurrencyLease:
+    """One idempotent ownership handle for root and parent scheduler capacity."""
+
+    def __init__(
+        self,
+        agent_id: str,
+        key: str,
+        root_semaphore: asyncio.Semaphore,
+        parent_semaphore: asyncio.Semaphore,
+    ) -> None:
+        self.agent_id = agent_id
         self.key = key
-        self.semaphore = semaphore
-        self.acquired = False
+        self.root_semaphore = root_semaphore
+        self.parent_semaphore = parent_semaphore
+        self.root_acquired = False
+        self.parent_acquired = False
         self.released = False
 
 
@@ -196,12 +207,12 @@ class AgentScheduler:
         self.repository = repository or harness.store.agents
         self._runner = runner
         self._runner_factory = runner_factory
-        self._root_semaphore = asyncio.Semaphore(root_concurrency)
+        self._root_semaphore = asyncio.BoundedSemaphore(root_concurrency)
         self._per_parent_concurrency = per_parent_concurrency
         self._parent_semaphores: dict[str, asyncio.Semaphore] = {}
         self._parent_refcounts: dict[str, int] = {}
-        self._parent_leases: dict[str, _ParentLease] = {}
-        self._parent_lock = asyncio.Lock()
+        self._concurrency_leases: dict[str, _ConcurrencyLease] = {}
+        self._concurrency_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[AgentRecord]] = {}
         self._children: dict[str, SessionHarness] = {}
         self._quarantined_tasks: set[asyncio.Task[AgentRecord]] = set()
@@ -225,6 +236,14 @@ class AgentScheduler:
     @property
     def parent_limiter_refcounts(self) -> dict[str, int]:
         return dict(self._parent_refcounts)
+
+    @property
+    def root_available_capacity(self) -> int:
+        return self._root_semaphore._value
+
+    @property
+    def managed_concurrency_count(self) -> int:
+        return len(self._concurrency_leases)
 
     def _owned(self, agent_id: str) -> AgentRecord:
         record = self.repository.get(agent_id)
@@ -370,42 +389,55 @@ class AgentScheduler:
             if child is not None:
                 child.runtime_context.cancellation.dispose()
 
-    async def _acquire_parent_lease(self, record: AgentRecord) -> "_ParentLease":
+    async def _acquire_concurrency_lease(
+        self, record: AgentRecord
+    ) -> "_ConcurrencyLease":
         key = record.parent_agent_id or "<root>"
-        async with self._parent_lock:
-            semaphore = self._parent_semaphores.setdefault(
-                key, asyncio.Semaphore(self._per_parent_concurrency)
+        async with self._concurrency_lock:
+            parent_semaphore = self._parent_semaphores.setdefault(
+                key, asyncio.BoundedSemaphore(self._per_parent_concurrency)
             )
             self._parent_refcounts[key] = self._parent_refcounts.get(key, 0) + 1
-            lease = _ParentLease(key, semaphore)
-            self._parent_leases[record.agent_id] = lease
+            lease = _ConcurrencyLease(
+                record.agent_id,
+                key,
+                self._root_semaphore,
+                parent_semaphore,
+            )
+            self._concurrency_leases[record.agent_id] = lease
         try:
-            await semaphore.acquire()
-            lease.acquired = True
+            await parent_semaphore.acquire()
+            lease.parent_acquired = True
+            await self._root_semaphore.acquire()
+            lease.root_acquired = True
             return lease
         except BaseException:
-            await self._release_parent_lease(record.agent_id, lease)
+            await self._release_concurrency_lease(record.agent_id, lease)
             raise
 
-    async def _release_parent_lease(
-        self, agent_id: str, lease: "_ParentLease" | None = None
+    async def _release_concurrency_lease(
+        self, agent_id: str, lease: "_ConcurrencyLease" | None = None
     ) -> None:
-        lease = lease or self._parent_leases.get(agent_id)
-        if lease is None or lease.released:
+        lease = lease or self._concurrency_leases.get(agent_id)
+        if lease is None:
             return
-        lease.released = True
-        if lease.acquired:
-            lease.semaphore.release()
-        async with self._parent_lock:
+        async with self._concurrency_lock:
+            if lease.released:
+                return
+            lease.released = True
+            if lease.root_acquired:
+                lease.root_semaphore.release()
+            if lease.parent_acquired:
+                lease.parent_semaphore.release()
             current = self._parent_refcounts.get(lease.key, 0)
             if current <= 1:
                 self._parent_refcounts.pop(lease.key, None)
-                if self._parent_semaphores.get(lease.key) is lease.semaphore:
+                if self._parent_semaphores.get(lease.key) is lease.parent_semaphore:
                     self._parent_semaphores.pop(lease.key, None)
             else:
                 self._parent_refcounts[lease.key] = current - 1
-            if self._parent_leases.get(agent_id) is lease:
-                self._parent_leases.pop(agent_id, None)
+            if self._concurrency_leases.get(agent_id) is lease:
+                self._concurrency_leases.pop(agent_id, None)
 
     def _runner_for(self, record: AgentRecord):
         if self._runner_factory is not None:
@@ -417,28 +449,27 @@ class AgentScheduler:
         return AgentExecutor.from_record(record)
 
     async def _execute(self, record: AgentRecord, child: SessionHarness) -> AgentRecord:
-        lease: _ParentLease | None = None
+        lease: _ConcurrencyLease | None = None
         try:
-            lease = await self._acquire_parent_lease(record)
-            async with self._root_semaphore:
-                if child.runtime_context.cancellation.cancelled:
-                    raise asyncio.CancelledError
-                current = self._owned(record.agent_id)
-                current = self.repository.transition(
-                    current.agent_id, AgentStatus.RUNNING, current.revision
-                )
-                runner = self._runner_for(current)
-                invocation = (
-                    runner.run(current, child)
-                    if hasattr(runner, "run")
-                    else runner(current, child)
-                )
-                timeout = current.definition_snapshot.get("execution_timeout")
-                if timeout is None:
-                    result = await invocation
-                else:
-                    result = await asyncio.wait_for(invocation, float(timeout))
-                return self._persist_result(current.agent_id, result)
+            lease = await self._acquire_concurrency_lease(record)
+            if child.runtime_context.cancellation.cancelled:
+                raise asyncio.CancelledError
+            current = self._owned(record.agent_id)
+            current = self.repository.transition(
+                current.agent_id, AgentStatus.RUNNING, current.revision
+            )
+            runner = self._runner_for(current)
+            invocation = (
+                runner.run(current, child)
+                if hasattr(runner, "run")
+                else runner(current, child)
+            )
+            timeout = current.definition_snapshot.get("execution_timeout")
+            if timeout is None:
+                result = await invocation
+            else:
+                result = await asyncio.wait_for(invocation, float(timeout))
+            return self._persist_result(current.agent_id, result)
         except TimeoutError:
             return self._finish(record.agent_id, AgentStatus.TIMED_OUT)
         except asyncio.CancelledError:
@@ -449,7 +480,7 @@ class AgentScheduler:
             )
         finally:
             if lease is not None:
-                await self._release_parent_lease(record.agent_id, lease)
+                await self._release_concurrency_lease(record.agent_id, lease)
 
     def _persist_result(
         self, agent_id: str, result: AgentExecutionResult
@@ -591,7 +622,9 @@ class AgentScheduler:
         child = self._children.pop(agent_id, None)
         if child is not None:
             child.runtime_context.cancellation.dispose()
-        await self._release_parent_lease(agent_id)
+        # Python cannot kill a coroutine that suppresses cancellation. Once its
+        # durable record is cancelled, quarantine removes it from managed quota.
+        await self._release_concurrency_lease(agent_id)
         self._quarantined_tasks.add(task)
         task.add_done_callback(self._reap_quarantined)
 

@@ -247,6 +247,10 @@ async def test_root_and_per_parent_concurrency_limits(tmp_path: Path) -> None:
     runner.release.set()
     await asyncio.gather(*(scheduler.wait(record.agent_id) for record in records))
     assert len(runner.calls) == 6
+    assert scheduler.root_available_capacity == 3
+    assert scheduler.managed_concurrency_count == 0
+    assert scheduler.parent_limiter_count == 0
+    assert scheduler.parent_limiter_refcounts == {}
 
 
 @pytest.mark.asyncio
@@ -619,3 +623,121 @@ async def test_parent_limiters_are_refcounted_and_removed(tmp_path: Path) -> Non
     await asyncio.gather(*(scheduler.wait(item.agent_id) for item in siblings))
     assert scheduler.parent_limiter_count == 0
     assert scheduler.parent_limiter_refcounts == {}
+
+
+class QuarantineCapacityRunner:
+    def __init__(self, *, block_second: bool = False) -> None:
+        self.first_started = asyncio.Event()
+        self.first_cancelled = asyncio.Event()
+        self.release_first = asyncio.Event()
+        self.second_started = asyncio.Event()
+        self.release_second = asyncio.Event()
+        self.block_second = block_second
+
+    async def run(self, record, child):
+        if record.prompt == "first":
+            self.first_started.set()
+            try:
+                await self.release_first.wait()
+            except asyncio.CancelledError:
+                self.first_cancelled.set()
+                await self.release_first.wait()
+        else:
+            self.second_started.set()
+            if self.block_second:
+                await self.release_second.wait()
+        return AgentExecutionResult(content=record.prompt)
+
+
+@pytest.mark.asyncio
+async def test_force_quarantine_releases_root_capacity_before_runner_exits(
+    tmp_path: Path,
+) -> None:
+    root, _ = make_harness(tmp_path)
+    runner = QuarantineCapacityRunner()
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner=runner,
+        root_concurrency=1,
+        per_parent_concurrency=1,
+        stop_grace=0.01,
+        force_grace=0.01,
+    )
+    first = await scheduler.spawn(
+        AgentRequest("first", "Explore", "d", background=True, parent_agent_id="one")
+    )
+    await runner.first_started.wait()
+    assert (await scheduler.stop(first.agent_id)).status is AgentStatus.CANCELLED
+    second = await scheduler.spawn(
+        AgentRequest("second", "Explore", "d", background=True, parent_agent_id="two")
+    )
+
+    try:
+        await asyncio.wait_for(runner.second_started.wait(), 0.5)
+        completed = await scheduler.wait(second.agent_id, timeout=0.5)
+        assert completed.status is AgentStatus.COMPLETED
+        assert scheduler.root_available_capacity == 1
+        assert scheduler.quarantined_task_count == 1
+    finally:
+        runner.release_first.set()
+        await wait_until(lambda: scheduler.quarantined_task_count == 0)
+        if scheduler.status(second.agent_id).status not in {
+            AgentStatus.COMPLETED,
+            AgentStatus.FAILED,
+            AgentStatus.CANCELLED,
+        }:
+            await scheduler.wait(second.agent_id, timeout=1)
+
+    assert scheduler.root_available_capacity == 1
+    assert scheduler.managed_concurrency_count == 0
+    assert scheduler.parent_limiter_count == 0
+    assert scheduler.parent_limiter_refcounts == {}
+
+
+@pytest.mark.asyncio
+async def test_force_quarantine_releases_same_parent_capacity_idempotently(
+    tmp_path: Path,
+) -> None:
+    root, _ = make_harness(tmp_path)
+    runner = QuarantineCapacityRunner(block_second=True)
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner=runner,
+        root_concurrency=2,
+        per_parent_concurrency=1,
+        stop_grace=0.01,
+        force_grace=0.01,
+    )
+    first = await scheduler.spawn(
+        AgentRequest(
+            "first", "Explore", "d", background=True, parent_agent_id="shared"
+        )
+    )
+    await runner.first_started.wait()
+    await scheduler.stop(first.agent_id)
+    second = await scheduler.spawn(
+        AgentRequest(
+            "second", "Explore", "d", background=True, parent_agent_id="shared"
+        )
+    )
+
+    try:
+        await asyncio.wait_for(runner.second_started.wait(), 0.5)
+        assert scheduler.parent_limiter_refcounts == {"shared": 1}
+        assert scheduler.parent_limiter_count == 1
+        runner.release_second.set()
+        assert (await scheduler.wait(second.agent_id)).status is AgentStatus.COMPLETED
+        assert scheduler.parent_limiter_refcounts == {}
+        assert scheduler.parent_limiter_count == 0
+        assert scheduler.root_available_capacity == 2
+        assert scheduler.managed_concurrency_count == 0
+    finally:
+        runner.release_second.set()
+        runner.release_first.set()
+        await wait_until(lambda: scheduler.quarantined_task_count == 0)
+
+    assert scheduler.root_available_capacity == 2
+    assert scheduler.managed_concurrency_count == 0
+    assert scheduler.parent_limiter_count == 0
