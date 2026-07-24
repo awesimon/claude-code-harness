@@ -6,7 +6,23 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Protocol,
+    Union,
+    runtime_checkable,
+)
+
+if TYPE_CHECKING:
+    from harness import SessionHarness
+    from state_core import AgentRecord
 
 
 class AgentSource(str, Enum):
@@ -130,6 +146,42 @@ AgentDefinition = Union[
     CustomAgentDefinition,
     PluginAgentDefinition
 ]
+
+
+@dataclass(frozen=True)
+class AgentRequest:
+    """A validated request to schedule one durable child agent."""
+
+    prompt: str
+    agent_type: str
+    description: str
+    background: bool = False
+    parent_agent_id: Optional[str] = None
+    model: Optional[str] = None
+    cwd: Optional[Union[str, Path]] = None
+    worktree_id: Optional[str] = None
+    definition: Optional[AgentDefinition] = None
+    definition_metadata: Mapping[str, Any] = field(default_factory=dict)
+    timeout: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class AgentExecutionResult:
+    """Storage-neutral output returned by one child execution loop."""
+
+    content: Any = field(default_factory=list)
+    usage: Mapping[str, Any] = field(default_factory=dict)
+    tool_count: int = 0
+    termination_reason: str = "completed"
+    error: Optional[Mapping[str, Any]] = None
+    output: Any = None
+
+
+@runtime_checkable
+class AgentRunner(Protocol):
+    async def run(
+        self, record: "AgentRecord", child_harness: "SessionHarness"
+    ) -> AgentExecutionResult: ...
 
 
 # 内置Agent类型常量

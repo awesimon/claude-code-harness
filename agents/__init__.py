@@ -10,61 +10,64 @@ Agent 子系统（统一包）
 - Worker 池：`from agents.worker_pool import WorkerPoolManager, Agent, Task`
 """
 
-from .types import (
-    AgentDefinition,
-    BuiltInAgentDefinition,
-    CustomAgentDefinition,
-    PluginAgentDefinition,
-    AgentContext,
-    AgentToolResult,
-    AgentExecutionConfig,
-    AgentSource,
-    AgentMemoryScope,
-    AgentIsolationMode,
-    AgentPermissionMode,
-    AgentError,
-    AgentNotFoundError,
-    AgentValidationError,
-    AgentExecutionError,
-    is_built_in_agent,
-    is_custom_agent,
-    is_plugin_agent,
-    is_one_shot_agent,
-    ONE_SHOT_BUILTIN_AGENT_TYPES,
-    VERIFICATION_AGENT_TYPE,
-)
 from .built_in import (
-    EXPLORE_AGENT,
-    PLAN_AGENT,
-    GENERAL_PURPOSE_AGENT,
     CODE_AGENT,
+    EXPLORE_AGENT,
+    GENERAL_PURPOSE_AGENT,
+    PLAN_AGENT,
     TEST_AGENT,
     VERIFICATION_AGENT,
-    get_built_in_agents,
     get_agent_by_type,
+    get_built_in_agents,
 )
+
+# 兼容：旧代码 `from agents import AgentManager` 仍指向 SpawnAgentManager
 from .engine import (
     AgentExecutor,
+    AgentManager,
     SpawnAgentManager,
     get_agent_manager,
     get_spawn_agent_manager,
 )
 from .fork import (
-    ForkSubagentManager,
-    ForkConfig,
-    build_forked_messages,
-    build_child_message,
-    build_worktree_notice,
-    is_in_fork_child,
-    get_fork_manager,
     FORK_BOILERPLATE_TAG,
     FORK_DIRECTIVE_PREFIX,
     FORK_PLACEHOLDER_RESULT,
+    ForkConfig,
+    ForkSubagentManager,
+    build_child_message,
+    build_forked_messages,
+    build_worktree_notice,
+    get_fork_manager,
+    is_in_fork_child,
 )
 from .tool import AgentTool, AgentToolInput
-
-# 兼容：旧代码 `from agents import AgentManager` 仍指向 SpawnAgentManager
-from .engine import AgentManager
+from .types import (
+    ONE_SHOT_BUILTIN_AGENT_TYPES,
+    VERIFICATION_AGENT_TYPE,
+    AgentContext,
+    AgentDefinition,
+    AgentError,
+    AgentExecutionConfig,
+    AgentExecutionError,
+    AgentExecutionResult,
+    AgentIsolationMode,
+    AgentMemoryScope,
+    AgentNotFoundError,
+    AgentPermissionMode,
+    AgentRequest,
+    AgentRunner,
+    AgentSource,
+    AgentToolResult,
+    AgentValidationError,
+    BuiltInAgentDefinition,
+    CustomAgentDefinition,
+    PluginAgentDefinition,
+    is_built_in_agent,
+    is_custom_agent,
+    is_one_shot_agent,
+    is_plugin_agent,
+)
 
 __all__ = [
     "AgentDefinition",
@@ -73,6 +76,9 @@ __all__ = [
     "PluginAgentDefinition",
     "AgentContext",
     "AgentToolResult",
+    "AgentExecutionResult",
+    "AgentRequest",
+    "AgentRunner",
     "AgentExecutionConfig",
     "AgentSource",
     "AgentMemoryScope",
