@@ -2,15 +2,17 @@
 
 Python attributes use snake_case. ``to_dict`` and ``from_dict`` define the
 stable Node-facing wire contract and use camelCase for compound field names.
+Persisted decoders require the complete emitted shape; compatibility defaults
+belong in explicit constructors or migration code.
 """
 
 from __future__ import annotations
 
-from copy import deepcopy
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, ClassVar, Mapping, cast
 
 
 class TaskStatus(str, Enum):
@@ -78,31 +80,167 @@ class InvalidTransition(StateCoreError):
         self.current = current
         self.target = target
         self.domain = domain
-        super().__init__(
-            f"invalid {domain} transition from {current.value!r} to {target.value!r}"
-        )
+        super().__init__(f"invalid {domain} transition from {current.value!r} to {target.value!r}")
 
 
 class InvalidTaskDependency(StateCoreError):
     """Raised when a task dependency would violate task-list invariants."""
 
 
-def _copy_wire_value(value: Any) -> Any:
-    """Return a detached JSON-compatible representation of a payload value."""
+def _copy_json(value: Any, path: str = "$") -> Any:
+    """Validate and detach a JSON tree without coercing values or mapping keys."""
 
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, datetime):
-        return value.isoformat()
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain only finite JSON numbers")
+        return value
     if isinstance(value, Mapping):
-        return {str(key): _copy_wire_value(item) for key, item in value.items()}
+        copied: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{path} mapping keys must be strings")
+            copied[key] = _copy_json(item, f"{path}.{key}")
+        return copied
     if isinstance(value, (list, tuple)):
-        return [_copy_wire_value(item) for item in value]
-    return deepcopy(value)
+        return [_copy_json(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    raise TypeError(f"{path} contains unsupported JSON value {type(value).__name__}")
 
 
-def _datetime_from_wire(value: str | None) -> datetime | None:
-    return datetime.fromisoformat(value) if value is not None else None
+def _require_mapping(value: Any, path: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{path} must be a mapping")
+    for key in value:
+        if type(key) is not str:
+            raise TypeError(f"{path} mapping keys must be strings")
+    return cast(Mapping[str, Any], value)
+
+
+def _require_json_object(value: Any, path: str) -> dict[str, Any]:
+    copied = _copy_json(value, path)
+    if not isinstance(copied, dict):
+        raise TypeError(f"{path} must be a JSON object")
+    return copied
+
+
+def _require_str(value: Any, path: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{path} must be a string")
+    return value
+
+
+def _require_optional_str(value: Any, path: str) -> str | None:
+    if value is None:
+        return None
+    return _require_str(value, path)
+
+
+def _require_bool(value: Any, path: str) -> bool:
+    if type(value) is not bool:
+        raise TypeError(f"{path} must be a boolean")
+    return value
+
+
+def _require_int(value: Any, path: str, *, minimum: int | None = None) -> int:
+    if type(value) is not int:
+        raise TypeError(f"{path} must be an integer")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{path} must be at least {minimum}")
+    return value
+
+
+def _require_optional_int(
+    value: Any,
+    path: str,
+    *,
+    minimum: int | None = None,
+) -> int | None:
+    if value is None:
+        return None
+    return _require_int(value, path, minimum=minimum)
+
+
+def _require_string_sequence(value: Any, path: str) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{path} must be a sequence")
+    return [_require_str(item, f"{path}[{index}]") for index, item in enumerate(value)]
+
+
+def _require_optional_status(value: Any, path: str) -> TaskStatus | None:
+    if value is None:
+        return None
+    return TaskStatus(_require_str(value, path))
+
+
+def _normalize_timestamp(value: datetime, path: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{path} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{path} must be timezone-aware")
+    normalized = value.astimezone(timezone.utc)
+    milliseconds = (normalized.microsecond // 1000) * 1000
+    return normalized.replace(microsecond=milliseconds)
+
+
+def _timestamp_to_wire(value: datetime, path: str) -> str:
+    normalized = _normalize_timestamp(value, path)
+    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _timestamp_from_wire(value: Any, path: str) -> datetime:
+    raw = _require_str(value, path)
+    normalized_raw = f"{raw[:-1]}+00:00" if raw.endswith("Z") else raw
+    try:
+        parsed = datetime.fromisoformat(normalized_raw)
+    except ValueError as exc:
+        raise ValueError(f"{path} must be an ISO 8601 timestamp") from exc
+    return _normalize_timestamp(parsed, path)
+
+
+def _optional_timestamp_to_wire(value: datetime | None, path: str) -> str | None:
+    return _timestamp_to_wire(value, path) if value is not None else None
+
+
+def _optional_timestamp_from_wire(value: Any, path: str) -> datetime | None:
+    return _timestamp_from_wire(value, path) if value is not None else None
+
+
+def _utc_now() -> datetime:
+    return _normalize_timestamp(datetime.now(timezone.utc), "timestamp")
+
+
+def _allowed_prompts(value: Any, path: str = "allowedPrompts") -> list[dict[str, str]]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{path} must be a sequence")
+    prompts: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        item_path = f"{path}[{index}]"
+        prompt = _require_mapping(item, item_path)
+        prompts.append(
+            {
+                _require_str(key, f"{item_path} key"): _require_str(
+                    prompt_value, f"{item_path}.{key}"
+                )
+                for key, prompt_value in prompt.items()
+            }
+        )
+    return prompts
+
+
+def _todos(value: Any) -> dict[str, list[dict[str, Any]]]:
+    copied = _require_json_object(value, "todos")
+    result: dict[str, list[dict[str, Any]]] = {}
+    for scope, raw_todos in copied.items():
+        if not isinstance(raw_todos, list):
+            raise TypeError(f"todos.{scope} must be a list")
+        todos: list[dict[str, Any]] = []
+        for index, todo in enumerate(raw_todos):
+            if not isinstance(todo, dict):
+                raise TypeError(f"todos.{scope}[{index}] must be a JSON object")
+            todos.append(todo)
+        result[scope] = todos
+    return result
 
 
 @dataclass
@@ -119,29 +257,30 @@ class TaskItem:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "id": self.id,
-            "subject": self.subject,
-            "description": self.description,
-            "activeForm": self.active_form,
-            "owner": self.owner,
+            "id": _require_str(self.id, "id"),
+            "subject": _require_str(self.subject, "subject"),
+            "description": _require_str(self.description, "description"),
+            "activeForm": _require_optional_str(self.active_form, "activeForm"),
+            "owner": _require_optional_str(self.owner, "owner"),
             "status": self.status.value,
-            "blocks": list(self.blocks),
-            "blockedBy": list(self.blocked_by),
-            "metadata": _copy_wire_value(self.metadata),
+            "blocks": _require_string_sequence(self.blocks, "blocks"),
+            "blockedBy": _require_string_sequence(self.blocked_by, "blockedBy"),
+            "metadata": _require_json_object(self.metadata, "metadata"),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TaskItem:
+        wire = _require_mapping(value, "task")
         return cls(
-            id=str(value["id"]),
-            subject=str(value["subject"]),
-            description=str(value["description"]),
-            active_form=value.get("activeForm"),
-            owner=value.get("owner"),
-            status=TaskStatus(value.get("status", TaskStatus.PENDING.value)),
-            blocks=[str(item) for item in value.get("blocks", [])],
-            blocked_by=[str(item) for item in value.get("blockedBy", [])],
-            metadata=dict(_copy_wire_value(value.get("metadata", {}))),
+            id=_require_str(wire["id"], "id"),
+            subject=_require_str(wire["subject"], "subject"),
+            description=_require_str(wire["description"], "description"),
+            active_form=_require_optional_str(wire["activeForm"], "activeForm"),
+            owner=_require_optional_str(wire["owner"], "owner"),
+            status=TaskStatus(_require_str(wire["status"], "status")),
+            blocks=_require_string_sequence(wire["blocks"], "blocks"),
+            blocked_by=_require_string_sequence(wire["blockedBy"], "blockedBy"),
+            metadata=_require_json_object(wire["metadata"], "metadata"),
         )
 
 
@@ -154,19 +293,20 @@ class NewTask:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "subject": self.subject,
-            "description": self.description,
-            "activeForm": self.active_form,
-            "metadata": _copy_wire_value(self.metadata),
+            "subject": _require_str(self.subject, "subject"),
+            "description": _require_str(self.description, "description"),
+            "activeForm": _require_optional_str(self.active_form, "activeForm"),
+            "metadata": _require_json_object(self.metadata, "metadata"),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> NewTask:
+        wire = _require_mapping(value, "newTask")
         return cls(
-            subject=str(value["subject"]),
-            description=str(value["description"]),
-            active_form=value.get("activeForm"),
-            metadata=dict(_copy_wire_value(value.get("metadata", {}))),
+            subject=_require_str(wire["subject"], "subject"),
+            description=_require_str(wire["description"], "description"),
+            active_form=_require_optional_str(wire["activeForm"], "activeForm"),
+            metadata=_require_json_object(wire["metadata"], "metadata"),
         )
 
 
@@ -185,33 +325,39 @@ class TaskMutation:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "subject": self.subject,
-            "description": self.description,
-            "activeForm": self.active_form,
+            "subject": _require_optional_str(self.subject, "subject"),
+            "description": _require_optional_str(self.description, "description"),
+            "activeForm": _require_optional_str(self.active_form, "activeForm"),
             "status": self.status.value if self.status is not None else None,
-            "owner": self.owner,
-            "addBlocks": list(self.add_blocks),
-            "addBlockedBy": list(self.add_blocked_by),
-            "removeBlocks": list(self.remove_blocks),
-            "removeBlockedBy": list(self.remove_blocked_by),
-            "metadata": _copy_wire_value(self.metadata) if self.metadata is not None else None,
+            "owner": _require_optional_str(self.owner, "owner"),
+            "addBlocks": _require_string_sequence(self.add_blocks, "addBlocks"),
+            "addBlockedBy": _require_string_sequence(self.add_blocked_by, "addBlockedBy"),
+            "removeBlocks": _require_string_sequence(self.remove_blocks, "removeBlocks"),
+            "removeBlockedBy": _require_string_sequence(self.remove_blocked_by, "removeBlockedBy"),
+            "metadata": (
+                _require_json_object(self.metadata, "metadata")
+                if self.metadata is not None
+                else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TaskMutation:
-        raw_status = value.get("status")
-        raw_metadata = value.get("metadata")
+        wire = _require_mapping(value, "taskMutation")
+        raw_metadata = wire["metadata"]
         return cls(
-            subject=value.get("subject"),
-            description=value.get("description"),
-            active_form=value.get("activeForm"),
-            status=TaskStatus(raw_status) if raw_status is not None else None,
-            owner=value.get("owner"),
-            add_blocks=[str(item) for item in value.get("addBlocks", [])],
-            add_blocked_by=[str(item) for item in value.get("addBlockedBy", [])],
-            remove_blocks=[str(item) for item in value.get("removeBlocks", [])],
-            remove_blocked_by=[str(item) for item in value.get("removeBlockedBy", [])],
-            metadata=(dict(_copy_wire_value(raw_metadata)) if raw_metadata is not None else None),
+            subject=_require_optional_str(wire["subject"], "subject"),
+            description=_require_optional_str(wire["description"], "description"),
+            active_form=_require_optional_str(wire["activeForm"], "activeForm"),
+            status=_require_optional_status(wire["status"], "status"),
+            owner=_require_optional_str(wire["owner"], "owner"),
+            add_blocks=_require_string_sequence(wire["addBlocks"], "addBlocks"),
+            add_blocked_by=_require_string_sequence(wire["addBlockedBy"], "addBlockedBy"),
+            remove_blocks=_require_string_sequence(wire["removeBlocks"], "removeBlocks"),
+            remove_blocked_by=_require_string_sequence(wire["removeBlockedBy"], "removeBlockedBy"),
+            metadata=(
+                _require_json_object(raw_metadata, "metadata") if raw_metadata is not None else None
+            ),
         )
 
 
@@ -224,20 +370,25 @@ class ClaimResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "success": self.success,
+            "success": _require_bool(self.success, "success"),
             "task": self.task.to_dict() if self.task is not None else None,
-            "reason": self.reason,
-            "currentOwner": self.current_owner,
+            "reason": _require_optional_str(self.reason, "reason"),
+            "currentOwner": _require_optional_str(self.current_owner, "currentOwner"),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> ClaimResult:
-        raw_task = value.get("task")
+        wire = _require_mapping(value, "claimResult")
+        raw_task = wire["task"]
         return cls(
-            success=bool(value["success"]),
-            task=TaskItem.from_dict(raw_task) if raw_task is not None else None,
-            reason=value.get("reason"),
-            current_owner=value.get("currentOwner"),
+            success=_require_bool(wire["success"], "success"),
+            task=(
+                TaskItem.from_dict(_require_mapping(raw_task, "task"))
+                if raw_task is not None
+                else None
+            ),
+            reason=_require_optional_str(wire["reason"], "reason"),
+            current_owner=_require_optional_str(wire["currentOwner"], "currentOwner"),
         )
 
 
@@ -252,7 +403,7 @@ class Plan:
     submitted_at: datetime | None = None
     approved_at: datetime | None = None
 
-    _TRANSITIONS = {
+    _TRANSITIONS: ClassVar[dict[PlanState, frozenset[PlanState]]] = {
         PlanState.IDLE: frozenset({PlanState.PLANNING}),
         PlanState.PLANNING: frozenset({PlanState.PENDING_APPROVAL}),
         PlanState.PENDING_APPROVAL: frozenset({PlanState.PLANNING, PlanState.APPROVED}),
@@ -267,26 +418,27 @@ class Plan:
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state.value,
-            "slug": self.slug,
-            "filePath": self.file_path,
-            "allowedPrompts": _copy_wire_value(self.allowed_prompts),
-            "approvedBy": self.approved_by,
-            "approvalMetadata": _copy_wire_value(self.approval_metadata),
-            "submittedAt": self.submitted_at.isoformat() if self.submitted_at else None,
-            "approvedAt": self.approved_at.isoformat() if self.approved_at else None,
+            "slug": _require_optional_str(self.slug, "slug"),
+            "filePath": _require_optional_str(self.file_path, "filePath"),
+            "allowedPrompts": _allowed_prompts(self.allowed_prompts),
+            "approvedBy": _require_optional_str(self.approved_by, "approvedBy"),
+            "approvalMetadata": _require_json_object(self.approval_metadata, "approvalMetadata"),
+            "submittedAt": _optional_timestamp_to_wire(self.submitted_at, "submittedAt"),
+            "approvedAt": _optional_timestamp_to_wire(self.approved_at, "approvedAt"),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> Plan:
+        wire = _require_mapping(value, "plan")
         return cls(
-            state=PlanState(value.get("state", PlanState.IDLE.value)),
-            slug=value.get("slug"),
-            file_path=value.get("filePath"),
-            allowed_prompts=[dict(item) for item in value.get("allowedPrompts", [])],
-            approved_by=value.get("approvedBy"),
-            approval_metadata=dict(_copy_wire_value(value.get("approvalMetadata", {}))),
-            submitted_at=_datetime_from_wire(value.get("submittedAt")),
-            approved_at=_datetime_from_wire(value.get("approvedAt")),
+            state=PlanState(_require_str(wire["state"], "state")),
+            slug=_require_optional_str(wire["slug"], "slug"),
+            file_path=_require_optional_str(wire["filePath"], "filePath"),
+            allowed_prompts=_allowed_prompts(wire["allowedPrompts"]),
+            approved_by=_require_optional_str(wire["approvedBy"], "approvedBy"),
+            approval_metadata=_require_json_object(wire["approvalMetadata"], "approvalMetadata"),
+            submitted_at=_optional_timestamp_from_wire(wire["submittedAt"], "submittedAt"),
+            approved_at=_optional_timestamp_from_wire(wire["approvedAt"], "approvedAt"),
         )
 
 
@@ -302,69 +454,59 @@ class SessionState:
     todos: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     transcript_cursor: int = 0
     last_event_id: int = 0
-    parent_session_id: str | None = None
-    child_agent_ids: list[str] = field(default_factory=list)
-    agent_statuses: dict[str, str] = field(default_factory=dict)
+    agents: dict[str, Any] = field(default_factory=dict)
     health: SessionHealth = SessionHealth.READY
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=_utc_now)
+    updated_at: datetime = field(default_factory=_utc_now)
     interrupted_at: datetime | None = None
 
     @classmethod
     def new(cls, session_id: str, *, now: datetime | None = None) -> SessionState:
-        timestamp = now or datetime.now(timezone.utc)
+        timestamp = _normalize_timestamp(now or _utc_now(), "now")
         return cls(session_id=session_id, created_at=timestamp, updated_at=timestamp)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "sessionId": self.session_id,
-            "revision": self.revision,
-            "permissionMode": self.permission_mode,
-            "prePlanPermissionMode": self.pre_plan_permission_mode,
+            "sessionId": _require_str(self.session_id, "sessionId"),
+            "revision": _require_int(self.revision, "revision", minimum=0),
+            "permissionMode": _require_str(self.permission_mode, "permissionMode"),
+            "prePlanPermissionMode": _require_optional_str(
+                self.pre_plan_permission_mode, "prePlanPermissionMode"
+            ),
             "plan": self.plan.to_dict(),
-            "taskListId": self.task_list_id,
+            "taskListId": _require_optional_str(self.task_list_id, "taskListId"),
             "taskMode": self.task_mode.value,
-            "todos": _copy_wire_value(self.todos),
-            "transcriptCursor": self.transcript_cursor,
-            "lastEventId": self.last_event_id,
-            "parentSessionId": self.parent_session_id,
-            "childAgentIds": list(self.child_agent_ids),
-            "agentStatuses": dict(self.agent_statuses),
+            "todos": _todos(self.todos),
+            "transcriptCursor": _require_int(self.transcript_cursor, "transcriptCursor", minimum=0),
+            "lastEventId": _require_int(self.last_event_id, "lastEventId", minimum=0),
+            "agents": _require_json_object(self.agents, "agents"),
             "health": self.health.value,
-            "createdAt": self.created_at.isoformat(),
-            "updatedAt": self.updated_at.isoformat(),
-            "interruptedAt": self.interrupted_at.isoformat() if self.interrupted_at else None,
+            "createdAt": _timestamp_to_wire(self.created_at, "createdAt"),
+            "updatedAt": _timestamp_to_wire(self.updated_at, "updatedAt"),
+            "interruptedAt": _optional_timestamp_to_wire(self.interrupted_at, "interruptedAt"),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SessionState:
-        raw_plan = value.get("plan", {})
-        created_at = _datetime_from_wire(value.get("createdAt"))
-        updated_at = _datetime_from_wire(value.get("updatedAt"))
+        wire = _require_mapping(value, "sessionState")
         return cls(
-            session_id=str(value["sessionId"]),
-            revision=int(value.get("revision", 0)),
-            permission_mode=str(value.get("permissionMode", "default")),
-            pre_plan_permission_mode=value.get("prePlanPermissionMode"),
-            plan=Plan.from_dict(raw_plan),
-            task_list_id=value.get("taskListId"),
-            task_mode=TaskMode(value.get("taskMode", TaskMode.TASK_V2.value)),
-            todos={
-                str(scope): [dict(_copy_wire_value(todo)) for todo in todos]
-                for scope, todos in value.get("todos", {}).items()
-            },
-            transcript_cursor=int(value.get("transcriptCursor", 0)),
-            last_event_id=int(value.get("lastEventId", 0)),
-            parent_session_id=value.get("parentSessionId"),
-            child_agent_ids=[str(item) for item in value.get("childAgentIds", [])],
-            agent_statuses={
-                str(agent_id): str(status)
-                for agent_id, status in value.get("agentStatuses", {}).items()
-            },
-            health=SessionHealth(value.get("health", SessionHealth.READY.value)),
-            created_at=created_at or datetime.now(timezone.utc),
-            updated_at=updated_at or created_at or datetime.now(timezone.utc),
-            interrupted_at=_datetime_from_wire(value.get("interruptedAt")),
+            session_id=_require_str(wire["sessionId"], "sessionId"),
+            revision=_require_int(wire["revision"], "revision", minimum=0),
+            permission_mode=_require_str(wire["permissionMode"], "permissionMode"),
+            pre_plan_permission_mode=_require_optional_str(
+                wire["prePlanPermissionMode"], "prePlanPermissionMode"
+            ),
+            plan=Plan.from_dict(_require_mapping(wire["plan"], "plan")),
+            task_list_id=_require_optional_str(wire["taskListId"], "taskListId"),
+            task_mode=TaskMode(_require_str(wire["taskMode"], "taskMode")),
+            todos=_todos(wire["todos"]),
+            transcript_cursor=_require_int(wire["transcriptCursor"], "transcriptCursor", minimum=0),
+            last_event_id=_require_int(wire["lastEventId"], "lastEventId", minimum=0),
+            agents=_require_json_object(wire["agents"], "agents"),
+            health=SessionHealth(_require_str(wire["health"], "health")),
+            created_at=_timestamp_from_wire(wire["createdAt"], "createdAt"),
+            updated_at=_timestamp_from_wire(wire["updatedAt"], "updatedAt"),
+            interrupted_at=_optional_timestamp_from_wire(wire["interruptedAt"], "interruptedAt"),
         )
 
 
@@ -374,30 +516,41 @@ class SessionEvent:
     session_id: str
     event_type: EventType
     payload: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=_utc_now)
     parent_event_id: int | None = None
 
+    def _validate_cursor(self) -> tuple[int, int | None]:
+        event_id = _require_int(self.id, "id", minimum=0)
+        parent_id = _require_optional_int(self.parent_event_id, "parentEventId", minimum=0)
+        if parent_id is not None and parent_id >= event_id:
+            raise ValueError("parentEventId must be less than id")
+        return event_id, parent_id
+
     def to_dict(self) -> dict[str, Any]:
+        event_id, parent_id = self._validate_cursor()
         return {
-            "id": self.id,
-            "sessionId": self.session_id,
+            "id": event_id,
+            "sessionId": _require_str(self.session_id, "sessionId"),
             "type": self.event_type.value,
-            "payload": _copy_wire_value(self.payload),
-            "createdAt": self.created_at.isoformat(),
-            "parentEventId": self.parent_event_id,
+            "payload": _require_json_object(self.payload, "payload"),
+            "createdAt": _timestamp_to_wire(self.created_at, "createdAt"),
+            "parentEventId": parent_id,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SessionEvent:
+        wire = _require_mapping(value, "sessionEvent")
+        event_id = _require_int(wire["id"], "id", minimum=0)
+        parent_id = _require_optional_int(wire["parentEventId"], "parentEventId", minimum=0)
+        if parent_id is not None and parent_id >= event_id:
+            raise ValueError("parentEventId must be less than id")
         return cls(
-            id=int(value["id"]),
-            session_id=str(value["sessionId"]),
-            event_type=EventType(value["type"]),
-            payload=dict(_copy_wire_value(value.get("payload", {}))),
-            created_at=_datetime_from_wire(value.get("createdAt")) or datetime.now(timezone.utc),
-            parent_event_id=(
-                int(value["parentEventId"]) if value.get("parentEventId") is not None else None
-            ),
+            id=event_id,
+            session_id=_require_str(wire["sessionId"], "sessionId"),
+            event_type=EventType(_require_str(wire["type"], "type")),
+            payload=_require_json_object(wire["payload"], "payload"),
+            created_at=_timestamp_from_wire(wire["createdAt"], "createdAt"),
+            parent_event_id=parent_id,
         )
 
 
@@ -406,21 +559,39 @@ class SessionSnapshot:
     session_id: str
     last_event_id: int
     state: SessionState
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=_utc_now)
+
+    def _validate_identity_and_cursor(self) -> tuple[str, int]:
+        session_id = _require_str(self.session_id, "sessionId")
+        last_event_id = _require_int(self.last_event_id, "lastEventId", minimum=0)
+        if session_id != self.state.session_id:
+            raise ValueError("snapshot sessionId must match state sessionId")
+        if last_event_id != self.state.last_event_id:
+            raise ValueError("snapshot lastEventId must match state lastEventId")
+        return session_id, last_event_id
 
     def to_dict(self) -> dict[str, Any]:
+        session_id, last_event_id = self._validate_identity_and_cursor()
         return {
-            "sessionId": self.session_id,
-            "lastEventId": self.last_event_id,
+            "sessionId": session_id,
+            "lastEventId": last_event_id,
             "state": self.state.to_dict(),
-            "createdAt": self.created_at.isoformat(),
+            "createdAt": _timestamp_to_wire(self.created_at, "createdAt"),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SessionSnapshot:
+        wire = _require_mapping(value, "sessionSnapshot")
+        session_id = _require_str(wire["sessionId"], "sessionId")
+        last_event_id = _require_int(wire["lastEventId"], "lastEventId", minimum=0)
+        state = SessionState.from_dict(_require_mapping(wire["state"], "state"))
+        if session_id != state.session_id:
+            raise ValueError("snapshot sessionId must match state sessionId")
+        if last_event_id != state.last_event_id:
+            raise ValueError("snapshot lastEventId must match state lastEventId")
         return cls(
-            session_id=str(value["sessionId"]),
-            last_event_id=int(value["lastEventId"]),
-            state=SessionState.from_dict(value["state"]),
-            created_at=_datetime_from_wire(value.get("createdAt")) or datetime.now(timezone.utc),
+            session_id=session_id,
+            last_event_id=last_event_id,
+            state=state,
+            created_at=_timestamp_from_wire(wire["createdAt"], "createdAt"),
         )
