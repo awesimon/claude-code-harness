@@ -25,9 +25,15 @@ from .skills import (
     SkillResource,
     SkillSnapshot,
 )
+from .budget import BudgetController, BudgetExhausted, BudgetKind, BudgetReservation
+from .tracing import TraceController, TraceSpan
 
 __all__ = [
     "CancellationToken",
+    "BudgetController",
+    "BudgetExhausted",
+    "BudgetKind",
+    "BudgetReservation",
     "AgentScheduler",
     "HarnessScopeError",
     "HookContext",
@@ -54,6 +60,8 @@ __all__ = [
     "SkillResource",
     "SkillSnapshot",
     "TerminationReason",
+    "TraceController",
+    "TraceSpan",
     "ToolExecution",
     "ToolRuntime",
 ]

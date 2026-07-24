@@ -15,6 +15,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from agents import AgentRequest
 from harness import PermissionMode, SessionHarness, SessionHarnessFactory
+from harness.budget import BudgetKind
 from services import ChatCompletionRequest, LLMProvider, LLMService, Message
 from services.error_recovery import (
     PromptTooLongError,
@@ -630,19 +631,18 @@ class QueryEngine:
 
             try:
                 # 使用恢复管理器执行LLM调用
-                if self._recovery_manager:
-                    result = await self._recovery_manager.execute_with_recovery(
-                        self._call_llm_with_recovery,
-                        llm_messages,
-                        tools,
-                        temperature,
-                    )
-                    if result.success:
-                        response = result.response
-                    else:
+                async def complete_model_call():
+                    if self._recovery_manager:
+                        result = await self._recovery_manager.execute_with_recovery(
+                            self._call_llm_with_recovery,
+                            llm_messages,
+                            tools,
+                            temperature,
+                        )
+                        if result.success:
+                            return result.response
                         raise result.final_error or Exception(result.message)
-                else:
-                    response = await self.llm_service.chat_completion(
+                    return await self.llm_service.chat_completion(
                         ChatCompletionRequest(
                             messages=llm_messages,
                             model=self.model,
@@ -652,6 +652,10 @@ class QueryEngine:
                             temperature=temperature,
                         )
                     )
+
+                response = await self._budgeted_model_call(
+                    conversation_id, complete_model_call
+                )
             except Exception as e:
                 # 使用错误分类提供友好的错误信息
                 error_info = classify_for_user(e)
@@ -934,7 +938,9 @@ class QueryEngine:
                 # 累积思考内容
                 full_thinking = ""
 
-                async for chunk in stream_iter:
+                async for chunk in self._budgeted_model_stream(
+                    conversation_id, stream_iter
+                ):
                     # 检查是否是工具调用
                     if chunk.tool_calls:
                         # 累积工具调用片段（处理流式delta格式）
@@ -1109,6 +1115,39 @@ class QueryEngine:
             temperature=temperature,
         )
         return await self.llm_service.chat_completion(request)
+
+    async def _budgeted_model_call(self, conversation_id: str, operation):
+        harness = self._session_harness(conversation_id)
+        budget = harness.budget
+        turn = budget.reserve(BudgetKind.MODEL_TURNS, 1)
+        try:
+            async with harness.traces.span("model", self.model or "default") as span:
+                response = await operation()
+                span.set_usage(response.usage or {})
+        except BaseException:
+            turn.release()
+            raise
+        turn.consume()
+        budget.record_model_usage(response.usage or {})
+        return response
+
+    async def _budgeted_model_stream(self, conversation_id: str, stream_iter):
+        harness = self._session_harness(conversation_id)
+        budget = harness.budget
+        turn = budget.reserve(BudgetKind.MODEL_TURNS, 1)
+        usage: dict[str, Any] = {}
+        try:
+            async with harness.traces.span("model", self.model or "default") as span:
+                async for chunk in stream_iter:
+                    if chunk.usage:
+                        usage = dict(chunk.usage)
+                    yield chunk
+                span.set_usage(usage)
+        except BaseException:
+            turn.release()
+            raise
+        turn.consume()
+        budget.record_model_usage(usage)
 
     async def _call_llm_stream_with_recovery(
         self,

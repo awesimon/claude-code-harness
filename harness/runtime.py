@@ -10,7 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
-from state_core import EventType, SessionRuntime
+from state_core import EventType, SessionRuntime, TraceSpanStatus
 from tools.base import (
     ToolError,
     ToolExecutionError,
@@ -113,6 +113,50 @@ class ToolRuntime:
         self.persister = persister or _StateCoreToolPersister()
 
     async def execute(
+        self,
+        tool_name: str,
+        input_data: dict[str, Any],
+        context: RuntimeContext,
+        *,
+        timeout: Optional[float] = None,
+        tool_call_id: str | None = None,
+    ) -> ToolExecution:
+        traces = self._service(context, "traces", None)
+        if traces is None:
+            return await self._execute_pipeline(
+                tool_name,
+                input_data,
+                context,
+                timeout=timeout,
+                tool_call_id=tool_call_id,
+            )
+        canonical = self.registry.resolve_name(tool_name) or tool_name
+        async with traces.span("tool", canonical) as span:
+            execution = await self._execute_pipeline(
+                tool_name,
+                input_data,
+                context,
+                timeout=timeout,
+                tool_call_id=tool_call_id,
+            )
+            span.set_usage({"tool_calls": 1})
+            status = {
+                TerminationReason.CANCELLED: TraceSpanStatus.CANCELLED,
+                TerminationReason.TIMED_OUT: TraceSpanStatus.TIMED_OUT,
+            }.get(execution.termination_reason)
+            if status is None and not execution.result.success:
+                status = TraceSpanStatus.FAILED
+            if status is not None:
+                span.set_status(
+                    status,
+                    error={
+                        "termination_reason": execution.termination_reason.value,
+                        "message": str(execution.result.error),
+                    },
+                )
+            return execution
+
+    async def _execute_pipeline(
         self,
         tool_name: str,
         input_data: dict[str, Any],

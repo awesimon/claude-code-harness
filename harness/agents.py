@@ -555,6 +555,18 @@ class AgentScheduler:
             return self._finish(record.agent_id, AgentStatus.TIMED_OUT)
         except asyncio.CancelledError:
             return self._finish(record.agent_id, AgentStatus.CANCELLED)
+        except Exception as exc:
+            from .budget import BudgetExhausted
+
+            if isinstance(exc, BudgetExhausted):
+                return self._finish(
+                    record.agent_id,
+                    AgentStatus.BUDGET_EXHAUSTED,
+                    error=_error_payload(exc),
+                )
+            return self._finish(
+                record.agent_id, AgentStatus.FAILED, error=_error_payload(exc)
+            )
         except BaseException as exc:
             return self._finish(
                 record.agent_id, AgentStatus.FAILED, error=_error_payload(exc)

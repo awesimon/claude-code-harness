@@ -296,6 +296,7 @@ class AgentStatus(str, Enum):
     TIMED_OUT = "timed_out"
     INTERRUPTED = "interrupted"
     ORPHANED = "orphaned"
+    BUDGET_EXHAUSTED = "budget_exhausted"
 
 
 class AgentTerminationReason(str, Enum):
@@ -305,6 +306,7 @@ class AgentTerminationReason(str, Enum):
     TIMED_OUT = "timed_out"
     INTERRUPTED = "interrupted"
     ORPHANED = "orphaned"
+    BUDGET_EXHAUSTED = "budget_exhausted"
 
 
 class TraceSpanStatus(str, Enum):
@@ -334,6 +336,7 @@ AGENT_TERMINAL_STATUSES = frozenset(
         AgentStatus.TIMED_OUT,
         AgentStatus.INTERRUPTED,
         AgentStatus.ORPHANED,
+        AgentStatus.BUDGET_EXHAUSTED,
     }
 )
 TRACE_TERMINAL_STATUSES = frozenset(set(TraceSpanStatus) - {TraceSpanStatus.RUNNING})

@@ -19,6 +19,7 @@ from agents.types import (
     AgentToolResult,
     parse_agent_definition,
 )
+from harness.budget import BudgetKind
 from services import ChatCompletionRequest, LLMService, Message
 from state_core import AgentRecord
 from tools import ToolRegistry
@@ -182,19 +183,35 @@ class AgentExecutor:
             model = record.definition_snapshot.get("model") or self.config.model
             if model == "inherit":
                 model = self.config.model
-            llm_task = asyncio.create_task(
-                self.llm_service.chat_completion(
-                    ChatCompletionRequest(
-                        messages=llm_messages,
-                        model=model,
-                        temperature=self.config.temperature,
-                        tools=schemas or None,
-                        tool_choice="auto" if schemas else None,
-                    )
-                )
+            budget = child_harness.budget
+            turn = budget.reserve(
+                BudgetKind.MODEL_TURNS,
+                1,
+                agent_id=child_harness.agent_id,
             )
-            cancellation.track(llm_task)
-            response = await llm_task
+            try:
+                async with child_harness.traces.span("model", model or "default") as span:
+                    llm_task = asyncio.create_task(
+                        self.llm_service.chat_completion(
+                            ChatCompletionRequest(
+                                messages=llm_messages,
+                                model=model,
+                                temperature=self.config.temperature,
+                                tools=schemas or None,
+                                tool_choice="auto" if schemas else None,
+                            )
+                        )
+                    )
+                    cancellation.track(llm_task)
+                    response = await llm_task
+                    span.set_usage(response.usage or {})
+            except BaseException:
+                turn.release()
+                raise
+            turn.consume()
+            budget.record_model_usage(
+                response.usage or {}, agent_id=child_harness.agent_id
+            )
             for key, value in (response.usage or {}).items():
                 if isinstance(value, int):
                     usage[key] = usage.get(key, 0) + value

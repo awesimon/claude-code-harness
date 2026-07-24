@@ -244,6 +244,26 @@ class SessionHarness:
         )
 
     @property
+    def budget(self):
+        from .budget import BudgetController
+
+        return BudgetController(
+            self.store.metadata,
+            self.root_session_id,
+            cancellation=self.runtime_context.cancellation,
+        )
+
+    @property
+    def traces(self):
+        from .tracing import TraceController
+
+        return TraceController(
+            self.store.traces,
+            self.root_session_id,
+            agent_id=self.agent_id,
+        )
+
+    @property
     def effective_cwd(self) -> Path:
         assert self.runtime_context.workspace_root is not None
         return _canonical_path(self.runtime_context.workspace_root)
@@ -375,6 +395,7 @@ class SessionHarnessFactory:
         scheduler = AgentScheduler.for_harness(resumed)
         self._agent_schedulers[session_id] = scheduler
         scheduler.reconcile()
+        resumed.traces.interrupt_open()
         return resumed
 
     def _build_config(
