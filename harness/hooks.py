@@ -454,6 +454,95 @@ class HookRuntime:
     ) -> PostHookResult:
         return await self.run_post_tool(tool_name, tool_input, result, context, failed=True)
 
+    async def run_pre_compact(
+        self,
+        details: Mapping[str, Any],
+        context: HookContext,
+    ) -> PreHookResult:
+        current = dict(details)
+        if _HOOK_DEPTH.get() > 0:
+            return PreHookResult(HookDecision.ALLOW, current)
+        failures: list[HookFailure] = []
+        executed: list[str] = []
+        matcher = str(current.get("trigger") or "auto")
+        for hook in self._matching(HookEvent.PRE_COMPACT, matcher):
+            executed.append(hook.hook_id)
+            output, failure = await self._run_one(
+                hook, self._payload(hook.event, context, **current), context
+            )
+            if failure is not None:
+                failures.append(failure)
+                if hook.fail_closed:
+                    return PreHookResult(
+                        HookDecision.BLOCK,
+                        current,
+                        reason=failure.message,
+                        failures=tuple(failures),
+                        executed_hook_ids=tuple(executed),
+                    )
+                continue
+            assert output is not None
+            try:
+                decision = HookDecision(output.get("decision", "allow"))
+            except (TypeError, ValueError) as exc:
+                failure = HookFailure(hook.hook_id, "malformed_output", str(exc))
+                failures.append(failure)
+                self._append_event(hook, "failure", failure.category)
+                if hook.fail_closed:
+                    return PreHookResult(
+                        HookDecision.BLOCK,
+                        current,
+                        reason=failure.message,
+                        failures=tuple(failures),
+                        executed_hook_ids=tuple(executed),
+                    )
+                continue
+            if decision is HookDecision.BLOCK:
+                return PreHookResult(
+                    decision,
+                    current,
+                    reason=str(output.get("reason") or "blocked by hook"),
+                    failures=tuple(failures),
+                    executed_hook_ids=tuple(executed),
+                )
+        return PreHookResult(
+            HookDecision.ALLOW,
+            current,
+            failures=tuple(failures),
+            executed_hook_ids=tuple(executed),
+        )
+
+    async def run_post_compact(
+        self,
+        details: Mapping[str, Any],
+        context: HookContext,
+    ) -> PostHookResult:
+        current = dict(details)
+        if _HOOK_DEPTH.get() > 0:
+            return PostHookResult(current)
+        failures: list[HookFailure] = []
+        executed: list[str] = []
+        metadata: dict[str, Any] = {}
+        matcher = str(current.get("trigger") or "auto")
+        for hook in self._matching(HookEvent.POST_COMPACT, matcher):
+            executed.append(hook.hook_id)
+            output, failure = await self._run_one(
+                hook, self._payload(hook.event, context, **current), context
+            )
+            if failure is not None:
+                failures.append(failure)
+                continue
+            assert output is not None
+            attached = output.get("metadata")
+            if isinstance(attached, dict):
+                metadata.update(attached)
+        return PostHookResult(
+            current,
+            metadata,
+            tuple(failures),
+            tuple(executed),
+        )
+
     def _matching(self, event: HookEvent, matcher_value: str | None) -> tuple[HookDefinition, ...]:
         return tuple(
             hook

@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from agents import AgentRequest
-from harness import PermissionMode, SessionHarness, SessionHarnessFactory
+from harness import (
+    CompactionSummary,
+    ContextControlConfig,
+    ContextController,
+    PermissionMode,
+    SessionHarness,
+    SessionHarnessFactory,
+)
 from harness.budget import BudgetKind
 from services import ChatCompletionRequest, LLMProvider, LLMService, Message
 from services.error_recovery import (
@@ -345,6 +352,8 @@ class QueryEngine:
         approval_callback: Optional[Callable[[Any], Any]] = None,
         tool_timeout: Optional[float] = 60.0,
         session_runtime_factory: Optional[SessionRuntimeFactory] = None,
+        context_control_config: Optional[ContextControlConfig] = None,
+        context_summary_callback: Optional[Callable[[List[Message]], Any]] = None,
     ):
         self.llm_service = llm_service or LLMService()
         self.max_iterations = max_iterations
@@ -369,6 +378,8 @@ class QueryEngine:
             tool_timeout=tool_timeout,
         )
         self._session_harnesses: Dict[str, SessionHarness] = {}
+        self._context_control_config = context_control_config or ContextControlConfig()
+        self._context_summary_callback = context_summary_callback
 
         # 初始化错误恢复管理器
         self._recovery_manager: Optional[RecoveryManager] = None
@@ -523,6 +534,50 @@ class QueryEngine:
     def _session_runtime(self, conversation_id: str) -> SessionRuntime:
         return self._session_harness(conversation_id).session_runtime
 
+    async def _prepare_model_messages(
+        self,
+        conversation_id: str,
+        messages: List[Message],
+    ) -> List[Message]:
+        controller = ContextController(
+            self._session_harness(conversation_id),
+            config=self._context_control_config,
+            summarize=self._context_summary_callback or self._summarize_context,
+        )
+        return await controller.prepare_messages(messages)
+
+    async def _summarize_context(self, messages) -> CompactionSummary:
+        request = ChatCompletionRequest(
+            messages=[
+                *messages,
+                Message(
+                    role="user",
+                    content=(
+                        "Summarize the conversation for continuation. Preserve decisions, "
+                        "constraints, current work, relevant files, and unresolved tasks."
+                    ),
+                ),
+            ],
+            model=self.model,
+            provider=self.provider,
+            temperature=0,
+        )
+        response = await self.llm_service.chat_completion(request)
+        return CompactionSummary(response.content, response.usage or {})
+
+    @staticmethod
+    def _classify_model_error(error: Exception) -> Dict[str, Any]:
+        category = getattr(error, "category", None)
+        if isinstance(category, str) and category:
+            retryable = bool(getattr(error, "retryable", False))
+            return {
+                "type": category,
+                "message": str(error),
+                "retryable": retryable,
+                "action": "retry" if retryable else "review_context",
+            }
+        return classify_for_user(error)
+
     def is_in_plan_mode(self, conversation_id: str) -> bool:
         """检查对话是否在计划模式中"""
         return self._session_runtime(conversation_id).state.plan.state is not PlanModeState.IDLE
@@ -625,11 +680,13 @@ class QueryEngine:
             self._update_state(context, ConversationState.THINKING)
             yield {"type": "state_change", "state": "thinking"}
 
-            # 调用 LLM
-            llm_messages = context.to_llm_messages()
-            tools = self._build_tools_schema(conversation_id)
-
             try:
+                # Context control is part of the model-call boundary so its
+                # failures use the same classified result path.
+                llm_messages = await self._prepare_model_messages(
+                    conversation_id, context.to_llm_messages()
+                )
+                tools = self._build_tools_schema(conversation_id)
                 # 使用恢复管理器执行LLM调用
                 async def complete_model_call():
                     if self._recovery_manager:
@@ -658,7 +715,7 @@ class QueryEngine:
                 )
             except Exception as e:
                 # 使用错误分类提供友好的错误信息
-                error_info = classify_for_user(e)
+                error_info = self._classify_model_error(e)
                 logger.error(f"LLM call failed: {e} (category: {error_info['type']})")
                 self._update_state(context, ConversationState.ERROR)
 
@@ -901,11 +958,11 @@ class QueryEngine:
             self._update_state(context, ConversationState.THINKING)
             yield {"type": "state_change", "state": "thinking"}
 
-            # 调用 LLM（流式）
-            llm_messages = context.to_llm_messages()
-            tools = self._build_tools_schema(conversation_id)
-
             try:
+                llm_messages = await self._prepare_model_messages(
+                    conversation_id, context.to_llm_messages()
+                )
+                tools = self._build_tools_schema(conversation_id)
                 # 使用流式API，带错误恢复
                 full_content = ""
                 # 使用字典来累积工具调用，key是index
@@ -978,9 +1035,8 @@ class QueryEngine:
                             "is_streaming": True
                         }
 
-                    # 检查是否完成
-                    if chunk.finish_reason:
-                        break
+                    # Consume the terminal usage chunk so model budgets and
+                    # traces settle with actual usage.
 
                 # 处理工具调用
                 if tool_calls_accumulator:
@@ -1085,9 +1141,17 @@ class QueryEngine:
                     return
 
             except Exception as e:
-                logger.error(f"LLM call failed: {e}")
+                error_info = self._classify_model_error(e)
+                logger.error(
+                    "LLM call failed: %s (category: %s)", e, error_info["type"]
+                )
                 self._update_state(context, ConversationState.ERROR)
-                yield {"type": "error", "error": f"LLM call failed: {str(e)}"}
+                yield {
+                    "type": "error",
+                    "error": error_info["message"],
+                    "error_category": error_info["type"],
+                    "action": error_info["action"],
+                }
                 return
 
         # 达到最大迭代次数

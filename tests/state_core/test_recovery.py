@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -7,8 +8,15 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from harness import COMPACTION_NAMESPACE, ContextController, SessionHarnessFactory
 from models import Base
-from state_core import EventType, SessionHealth, SessionRuntime, SQLAlchemyStateStore
+from state_core import (
+    EventType,
+    SessionHealth,
+    SessionRuntime,
+    SessionRuntimeFactory,
+    SQLAlchemyStateStore,
+)
 from state_core.sqlalchemy_store import RuntimeEvent, RuntimeSession, RuntimeSnapshot
 
 
@@ -115,3 +123,33 @@ def test_recovery_marks_running_agents_interrupted_without_replaying_work(runtim
     assert recovered.state.agents["worker-1"]["status"] == "interrupted"
     assert recovered.state.agents["worker-2"]["status"] == "completed"
     assert recovered.events()[-1].event_type is EventType.EXECUTION_INTERRUPTED
+
+
+def test_recovery_rejects_compact_boundary_with_inconsistent_event_count(
+    runtime_store, tmp_path: Path
+) -> None:
+    runtime, _ = runtime_store
+    runtime.append_event(EventType.USER_MESSAGE, {"content": "old"})
+    runtime.append_event(EventType.ASSISTANT_MESSAGE, {"content": "new"})
+    summary = "invalid summary"
+    runtime.store.metadata.put(
+        runtime.session_id,
+        COMPACTION_NAMESPACE,
+        {
+            "version": 1,
+            "through_event_id": runtime.events()[-1].id,
+            "summary": summary,
+            "summary_digest": hashlib.sha256(summary.encode()).hexdigest(),
+            "created_at": "2026-07-25T00:00:00Z",
+            "source_event_count": 1,
+        },
+    )
+
+    recovered = SessionHarnessFactory(
+        SessionRuntimeFactory(runtime.store), workspace_root=tmp_path
+    ).resume(runtime.session_id)
+
+    assert [message.content for message in ContextController(recovered).restore_messages()] == [
+        "old",
+        "new",
+    ]

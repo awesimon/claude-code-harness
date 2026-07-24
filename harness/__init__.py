@@ -1,6 +1,13 @@
 """Stable runtime primitives shared by the root and child agents."""
 
 from .context import CancellationToken, PermissionMode, RuntimeContext
+from .context_control import (
+    COMPACTION_NAMESPACE,
+    CompactionSummary,
+    ContextCompactionError,
+    ContextControlConfig,
+    ContextController,
+)
 from .permissions import PermissionDecision, PermissionRequest, PermissionPolicy
 from .runtime import TerminationReason, ToolExecution, ToolRuntime
 from .session import HarnessScopeError, SessionHarness, SessionHarnessFactory
@@ -30,6 +37,11 @@ from .tracing import TraceController, TraceSpan
 
 __all__ = [
     "CancellationToken",
+    "COMPACTION_NAMESPACE",
+    "CompactionSummary",
+    "ContextCompactionError",
+    "ContextControlConfig",
+    "ContextController",
     "BudgetController",
     "BudgetExhausted",
     "BudgetKind",

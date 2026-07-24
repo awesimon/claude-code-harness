@@ -24,6 +24,7 @@ from services.compact.context_compactor import (
     CompressionStrategy,
     CompressionResult,
     compact_messages,
+    micro_compact_messages,
     TokenCount,
 )
 
@@ -388,6 +389,21 @@ class TestConvenienceFunctions:
 
         assert result.success
         assert result.strategy == CompressionStrategy.NONE
+
+    def test_micro_compaction_returns_detached_projection(self):
+        messages = [
+            MockMessage(role="system", content="system"),
+            MockMessage(role="user", content="old " * 500),
+            MockMessage(role="assistant", content="recent"),
+        ]
+        original_contents = [message.content for message in messages]
+
+        result = micro_compact_messages(messages, target_tokens=20)
+
+        assert result.success
+        assert result.compressed_tokens < result.original_tokens
+        assert [message.content for message in messages] == original_contents
+        assert result.compressed_messages is not messages
 
 
 class TestIntegration:
