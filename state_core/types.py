@@ -178,14 +178,15 @@ def _normalize_timestamp(value: datetime, path: str) -> datetime:
         raise TypeError(f"{path} must be a datetime")
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{path} must be timezone-aware")
-    normalized = value.astimezone(timezone.utc)
-    milliseconds = (normalized.microsecond // 1000) * 1000
-    return normalized.replace(microsecond=milliseconds)
+    return value.astimezone(timezone.utc)
 
 
 def _timestamp_to_wire(value: datetime, path: str) -> str:
     normalized = _normalize_timestamp(value, path)
-    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    wire = normalized.isoformat(timespec="seconds").replace("+00:00", "")
+    if normalized.microsecond:
+        wire += f".{normalized.microsecond:06d}".rstrip("0")
+    return f"{wire}Z"
 
 
 def _timestamp_from_wire(value: Any, path: str) -> datetime:
@@ -511,6 +512,66 @@ class SessionState:
 
 
 @dataclass
+class PendingSessionEvent:
+    """An event awaiting ID assignment within one atomic repository commit.
+
+    ``sequence`` is a zero-based caller-assigned position in the commit batch.
+    ``parent_sequence`` may reference only an earlier position in that batch;
+    ``parent_event_id`` references an event persisted before the batch.
+    """
+
+    sequence: int
+    session_id: str
+    event_type: EventType
+    payload: dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=_utc_now)
+    parent_event_id: int | None = None
+    parent_sequence: int | None = None
+
+    def __post_init__(self) -> None:
+        self._validate_links()
+
+    def _validate_links(self) -> tuple[int, int | None, int | None]:
+        sequence = _require_int(self.sequence, "sequence", minimum=0)
+        parent_id = _require_optional_int(self.parent_event_id, "parentEventId", minimum=1)
+        parent_sequence = _require_optional_int(self.parent_sequence, "parentSequence", minimum=0)
+        if parent_id is not None and parent_sequence is not None:
+            raise ValueError("pending event may specify only one parent link")
+        if parent_sequence is not None and parent_sequence >= sequence:
+            raise ValueError("parentSequence must reference an earlier sequence")
+        return sequence, parent_id, parent_sequence
+
+    def to_dict(self) -> dict[str, Any]:
+        sequence, parent_id, parent_sequence = self._validate_links()
+        return {
+            "sequence": sequence,
+            "sessionId": _require_str(self.session_id, "sessionId"),
+            "type": self.event_type.value,
+            "payload": _require_json_object(self.payload, "payload"),
+            "createdAt": _timestamp_to_wire(self.created_at, "createdAt"),
+            "parentEventId": parent_id,
+            "parentSequence": parent_sequence,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PendingSessionEvent:
+        wire = _require_mapping(value, "pendingSessionEvent")
+        return cls(
+            sequence=_require_int(wire["sequence"], "sequence", minimum=0),
+            session_id=_require_str(wire["sessionId"], "sessionId"),
+            event_type=EventType(_require_str(wire["type"], "type")),
+            payload=_require_json_object(wire["payload"], "payload"),
+            created_at=_timestamp_from_wire(wire["createdAt"], "createdAt"),
+            parent_event_id=_require_optional_int(
+                wire["parentEventId"], "parentEventId", minimum=1
+            ),
+            parent_sequence=_require_optional_int(
+                wire["parentSequence"], "parentSequence", minimum=0
+            ),
+        )
+
+
+@dataclass
 class SessionEvent:
     id: int
     session_id: str
@@ -519,9 +580,12 @@ class SessionEvent:
     created_at: datetime = field(default_factory=_utc_now)
     parent_event_id: int | None = None
 
+    def __post_init__(self) -> None:
+        self._validate_cursor()
+
     def _validate_cursor(self) -> tuple[int, int | None]:
-        event_id = _require_int(self.id, "id", minimum=0)
-        parent_id = _require_optional_int(self.parent_event_id, "parentEventId", minimum=0)
+        event_id = _require_int(self.id, "id", minimum=1)
+        parent_id = _require_optional_int(self.parent_event_id, "parentEventId", minimum=1)
         if parent_id is not None and parent_id >= event_id:
             raise ValueError("parentEventId must be less than id")
         return event_id, parent_id
@@ -540,8 +604,8 @@ class SessionEvent:
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> SessionEvent:
         wire = _require_mapping(value, "sessionEvent")
-        event_id = _require_int(wire["id"], "id", minimum=0)
-        parent_id = _require_optional_int(wire["parentEventId"], "parentEventId", minimum=0)
+        event_id = _require_int(wire["id"], "id", minimum=1)
+        parent_id = _require_optional_int(wire["parentEventId"], "parentEventId", minimum=1)
         if parent_id is not None and parent_id >= event_id:
             raise ValueError("parentEventId must be less than id")
         return cls(
@@ -551,6 +615,49 @@ class SessionEvent:
             payload=_require_json_object(wire["payload"], "payload"),
             created_at=_timestamp_from_wire(wire["createdAt"], "createdAt"),
             parent_event_id=parent_id,
+        )
+
+
+@dataclass
+class CommitResult:
+    """State and repository-assigned events produced by one atomic commit."""
+
+    state: SessionState
+    events: list[SessionEvent] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self._validate()
+
+    def _validate(self) -> None:
+        previous_id = 0
+        for index, event in enumerate(self.events):
+            if event.session_id != self.state.session_id:
+                raise ValueError(f"events[{index}] sessionId must match state sessionId")
+            if event.id <= previous_id:
+                raise ValueError("assigned event ids must be strictly increasing")
+            previous_id = event.id
+        if self.events and self.events[-1].id != self.state.last_event_id:
+            raise ValueError("last assigned event id must match state lastEventId")
+
+    def to_dict(self) -> dict[str, Any]:
+        self._validate()
+        return {
+            "state": self.state.to_dict(),
+            "events": [event.to_dict() for event in self.events],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> CommitResult:
+        wire = _require_mapping(value, "commitResult")
+        raw_events = wire["events"]
+        if not isinstance(raw_events, (list, tuple)):
+            raise TypeError("events must be a sequence")
+        return cls(
+            state=SessionState.from_dict(_require_mapping(wire["state"], "state")),
+            events=[
+                SessionEvent.from_dict(_require_mapping(event, f"events[{index}]"))
+                for index, event in enumerate(raw_events)
+            ],
         )
 
 

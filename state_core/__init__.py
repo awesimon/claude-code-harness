@@ -3,10 +3,12 @@
 from .repository import StateRepository, TaskRepository
 from .types import (
     ClaimResult,
+    CommitResult,
     EventType,
     InvalidTaskDependency,
     InvalidTransition,
     NewTask,
+    PendingSessionEvent,
     Plan,
     PlanState,
     RevisionConflict,
@@ -23,10 +25,12 @@ from .types import (
 
 __all__ = [
     "ClaimResult",
+    "CommitResult",
     "EventType",
     "InvalidTaskDependency",
     "InvalidTransition",
     "NewTask",
+    "PendingSessionEvent",
     "Plan",
     "PlanState",
     "RevisionConflict",

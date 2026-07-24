@@ -6,7 +6,9 @@ from typing import Protocol, runtime_checkable
 
 from .types import (
     ClaimResult,
+    CommitResult,
     NewTask,
+    PendingSessionEvent,
     SessionEvent,
     SessionSnapshot,
     SessionState,
@@ -26,9 +28,9 @@ class StateRepository(Protocol):
     def commit(
         self,
         state: SessionState,
-        events: list[SessionEvent],
+        events: list[PendingSessionEvent],
         expected_revision: int,
-    ) -> SessionState: ...
+    ) -> CommitResult: ...
 
     def list_events(self, session_id: str, after_id: int = 0) -> list[SessionEvent]: ...
 

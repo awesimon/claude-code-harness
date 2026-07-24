@@ -1,19 +1,23 @@
 import json
 from datetime import datetime, timedelta, timezone
+from typing import get_type_hints
 
 import pytest
 
 from state_core import (
     ClaimResult,
+    CommitResult,
     EventType,
     InvalidTransition,
     NewTask,
+    PendingSessionEvent,
     Plan,
     PlanState,
     SessionEvent,
     SessionHealth,
     SessionSnapshot,
     SessionState,
+    StateRepository,
     TaskItem,
     TaskMode,
     TaskMutation,
@@ -344,3 +348,124 @@ def test_timestamp_codec_normalizes_offset_datetime_instances():
     )
 
     assert state.to_dict()["createdAt"] == "2026-07-24T12:34:56.789Z"
+
+
+def test_plan_and_event_timestamps_preserve_microsecond_precision():
+    timestamp = datetime(2026, 7, 24, 12, 34, 56, 123456, tzinfo=timezone.utc)
+    plan = Plan(submitted_at=timestamp, approved_at=timestamp)
+    event = SessionEvent(
+        id=1,
+        session_id="session-microseconds",
+        event_type=EventType.CHECKPOINT,
+        created_at=timestamp,
+    )
+
+    plan_wire = plan.to_dict()
+    event_wire = event.to_dict()
+
+    assert plan_wire["submittedAt"] == "2026-07-24T12:34:56.123456Z"
+    assert event_wire["createdAt"] == "2026-07-24T12:34:56.123456Z"
+    assert Plan.from_dict(plan_wire) == plan
+    assert SessionEvent.from_dict(event_wire) == event
+
+
+def test_pending_event_can_reference_an_existing_persisted_parent():
+    pending = PendingSessionEvent(
+        sequence=0,
+        session_id="session-events",
+        event_type=EventType.TOOL_RESULT,
+        payload={"result": "ok"},
+        parent_event_id=41,
+    )
+
+    wire = pending.to_dict()
+
+    assert "id" not in wire
+    assert wire["sequence"] == 0
+    assert wire["parentEventId"] == 41
+    assert wire["parentSequence"] is None
+    assert PendingSessionEvent.from_dict(wire) == pending
+
+
+def test_pending_batch_links_later_result_to_earlier_tool_call():
+    tool_call = PendingSessionEvent(
+        sequence=0,
+        session_id="session-events",
+        event_type=EventType.TOOL_CALL,
+        payload={"toolCallId": "call-1"},
+    )
+    tool_result = PendingSessionEvent(
+        sequence=1,
+        session_id="session-events",
+        event_type=EventType.TOOL_RESULT,
+        payload={"toolCallId": "call-1", "content": "ok"},
+        parent_sequence=tool_call.sequence,
+    )
+
+    assert [event.sequence for event in (tool_call, tool_result)] == [0, 1]
+    assert tool_result.to_dict()["parentSequence"] == 0
+
+
+@pytest.mark.parametrize(
+    ("sequence", "parent_sequence"),
+    [(0, 0), (1, 1), (1, 2)],
+)
+def test_pending_event_rejects_self_and_forward_batch_links(sequence, parent_sequence):
+    with pytest.raises(ValueError, match="parentSequence"):
+        PendingSessionEvent(
+            sequence=sequence,
+            session_id="session-events",
+            event_type=EventType.TOOL_RESULT,
+            parent_sequence=parent_sequence,
+        )
+
+
+def test_pending_event_rejects_two_parent_link_types():
+    with pytest.raises(ValueError, match="only one parent"):
+        PendingSessionEvent(
+            sequence=1,
+            session_id="session-events",
+            event_type=EventType.TOOL_RESULT,
+            parent_event_id=9,
+            parent_sequence=0,
+        )
+
+
+@pytest.mark.parametrize("event_id", [0, -1])
+def test_persisted_event_requires_positive_assigned_id(event_id):
+    with pytest.raises(ValueError, match="id"):
+        SessionEvent(
+            id=event_id,
+            session_id="session-events",
+            event_type=EventType.CHECKPOINT,
+        )
+
+
+@pytest.mark.parametrize("parent_event_id", [0, 4, 5])
+def test_persisted_event_requires_earlier_positive_parent_id(parent_event_id):
+    with pytest.raises(ValueError, match="parentEventId"):
+        SessionEvent(
+            id=4,
+            session_id="session-events",
+            event_type=EventType.TOOL_RESULT,
+            parent_event_id=parent_event_id,
+        )
+
+
+def test_commit_result_round_trip_returns_state_and_assigned_events():
+    state = SessionState.new("session-events")
+    state.last_event_id = 2
+    events = [
+        SessionEvent(1, state.session_id, EventType.TOOL_CALL),
+        SessionEvent(2, state.session_id, EventType.TOOL_RESULT, parent_event_id=1),
+    ]
+    result = CommitResult(state=state, events=events)
+
+    assert CommitResult.from_dict(result.to_dict()) == result
+
+
+def test_state_repository_commit_contract_uses_pending_and_assigned_events():
+    hints = get_type_hints(StateRepository.commit)
+
+    assert hints["events"] == list[PendingSessionEvent]
+    assert hints["return"] is CommitResult
