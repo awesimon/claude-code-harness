@@ -1,12 +1,14 @@
 """Durable, storage-neutral records for the agent harness runtime."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
+import builtins
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Mapping, Protocol, cast, runtime_checkable
 
 from .types import StateCoreError
 
@@ -55,7 +57,7 @@ def _optional_json_object(value: Mapping[str, Any] | None, path: str) -> dict[st
     return _json_object(value, path) if value is not None else None
 
 
-_SENSITIVE_TRACE_ERROR_KEYS = frozenset(
+_EXACT_SENSITIVE_TRACE_ERROR_KEYS = frozenset(
     {
         "authorization",
         "proxyauthorization",
@@ -69,6 +71,14 @@ _SENSITIVE_TRACE_ERROR_KEYS = frozenset(
         "password",
         "secret",
         "token",
+        "credentials",
+        "clientsecret",
+        "secretaccesskey",
+        "privatekey",
+        "signingkey",
+        "bearertoken",
+        "idtoken",
+        "sessiontoken",
     }
 )
 _TRACE_HEADER_CONTAINER_KEYS = frozenset({"headers", "requestheaders", "responseheaders"})
@@ -76,6 +86,13 @@ _TRACE_HEADER_CONTAINER_KEYS = frozenset({"headers", "requestheaders", "response
 
 def _normalize_trace_error_key(key: str) -> str:
     return "".join(character for character in key.casefold() if character.isalnum())
+
+
+def _is_sensitive_trace_error_key(key: str) -> bool:
+    normalized = _normalize_trace_error_key(key)
+    if normalized in _EXACT_SENSITIVE_TRACE_ERROR_KEYS | _TRACE_HEADER_CONTAINER_KEYS:
+        return True
+    return normalized.endswith(("secretaccesskey", "privatekey", "signingkey", "bearertoken"))
 
 
 def _sanitize_trace_error(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -90,8 +107,7 @@ def _sanitize_trace_error(value: Mapping[str, Any] | None) -> dict[str, Any] | N
             return {
                 key: (
                     "[REDACTED]"
-                    if _normalize_trace_error_key(key)
-                    in _SENSITIVE_TRACE_ERROR_KEYS | _TRACE_HEADER_CONTAINER_KEYS
+                    if _is_sensitive_trace_error_key(key)
                     else sanitize(value)
                 )
                 for key, value in item.items()
@@ -100,7 +116,7 @@ def _sanitize_trace_error(value: Mapping[str, Any] | None) -> dict[str, Any] | N
             return [sanitize(value) for value in item]
         return item
 
-    return sanitize(copied)
+    return cast(dict[str, Any], sanitize(copied))
 
 
 class AgentStatus(str, Enum):
@@ -217,6 +233,15 @@ class InvalidWorktreeTransition(StateCoreError):
         super().__init__(f"invalid worktree transition from {current.value!r} to {target.value!r}")
 
 
+class InvalidTraceSpanTransition(StateCoreError):
+    """Raised when a trace span lifecycle transition is not allowed."""
+
+    def __init__(self, current: TraceSpanStatus, target: TraceSpanStatus) -> None:
+        self.current = current
+        self.target = target
+        super().__init__(f"invalid trace span transition from {current.value!r} to {target.value!r}")
+
+
 def ensure_agent_transition(current: AgentStatus, target: AgentStatus) -> None:
     if target not in _AGENT_TRANSITIONS[current]:
         raise InvalidAgentTransition(current, target)
@@ -225,6 +250,11 @@ def ensure_agent_transition(current: AgentStatus, target: AgentStatus) -> None:
 def ensure_worktree_transition(current: WorktreeStatus, target: WorktreeStatus) -> None:
     if target is not current and target not in _WORKTREE_TRANSITIONS[current]:
         raise InvalidWorktreeTransition(current, target)
+
+
+def ensure_trace_span_transition(current: TraceSpanStatus, target: TraceSpanStatus) -> None:
+    if current is not TraceSpanStatus.RUNNING or target not in TRACE_TERMINAL_STATUSES:
+        raise InvalidTraceSpanTransition(current, target)
 
 
 @dataclass(frozen=True)
@@ -263,6 +293,16 @@ class AgentRecord:
             object.__setattr__(self, "started_at", _as_utc(self.started_at))
         if self.finished_at is not None:
             object.__setattr__(self, "finished_at", _as_utc(self.finished_at))
+        expected_reason = (
+            AgentTerminationReason(self.status.value) if self.status in AGENT_TERMINAL_STATUSES else None
+        )
+        if expected_reason is None:
+            if self.termination_reason is not None or self.finished_at is not None or self.output is not None:
+                raise ValueError("nonterminal agents cannot carry terminal fields")
+        elif self.termination_reason is not expected_reason:
+            raise ValueError("termination_reason must match terminal agent status")
+        elif self.finished_at is None:
+            raise ValueError("terminal agents require finished_at")
 
 
 @dataclass(frozen=True)
@@ -308,6 +348,8 @@ class TraceSpanRecord:
         object.__setattr__(self, "started_at", _as_utc(self.started_at))
         object.__setattr__(self, "created_at", _as_utc(self.created_at))
         object.__setattr__(self, "updated_at", _as_utc(self.updated_at))
+        if self.status is TraceSpanStatus.RUNNING and self.finished_at is not None:
+            raise ValueError("running trace spans cannot have finished_at")
         if self.finished_at is not None:
             object.__setattr__(self, "finished_at", _as_utc(self.finished_at))
             expected_duration = int((self.finished_at - self.started_at).total_seconds() * 1000)
@@ -344,6 +386,10 @@ class WorktreeRecord:
         object.__setattr__(self, "updated_at", _as_utc(self.updated_at))
         if self.removed_at is not None:
             object.__setattr__(self, "removed_at", _as_utc(self.removed_at))
+        if self.status is not WorktreeStatus.REMOVED and self.removed_at is not None:
+            raise ValueError("removed_at is only valid for removed worktrees")
+        if self.status is WorktreeStatus.REMOVED and self.removed_at is None:
+            raise ValueError("removed worktrees require removed_at")
 
 
 @runtime_checkable
@@ -357,7 +403,7 @@ class AgentRepository(Protocol):
         parent_agent_id: str | None = None,
         status: AgentStatus | None = None,
         is_background: bool | None = None,
-    ) -> list[AgentRecord]: ...
+    ) -> builtins.list[AgentRecord]: ...
     def transition(
         self,
         agent_id: str,
@@ -369,7 +415,7 @@ class AgentRepository(Protocol):
         usage: Mapping[str, Any] | None = None,
         error: Mapping[str, Any] | None = None,
     ) -> AgentRecord: ...
-    def reconcile(self, root_session_id: str, live_agent_ids: set[str]) -> list[AgentRecord]: ...
+    def reconcile(self, root_session_id: str, live_agent_ids: set[str]) -> builtins.list[AgentRecord]: ...
 
 
 @runtime_checkable
@@ -399,8 +445,8 @@ class TraceSpanRepository(Protocol):
     ) -> TraceSpanRecord: ...
     def list(
         self, root_session_id: str, *, agent_id: str | None = None, status: TraceSpanStatus | None = None
-    ) -> list[TraceSpanRecord]: ...
-    def interrupt_open(self, root_session_id: str) -> list[TraceSpanRecord]: ...
+    ) -> builtins.list[TraceSpanRecord]: ...
+    def interrupt_open(self, root_session_id: str) -> builtins.list[TraceSpanRecord]: ...
 
 
 @runtime_checkable
@@ -409,7 +455,7 @@ class WorktreeRepository(Protocol):
     def get(self, worktree_id: str) -> WorktreeRecord | None: ...
     def list(
         self, root_session_id: str, *, agent_id: str | None = None, status: WorktreeStatus | None = None
-    ) -> list[WorktreeRecord]: ...
+    ) -> builtins.list[WorktreeRecord]: ...
     def update(
         self, worktree_id: str, expected_revision: int, **changes: Any
     ) -> WorktreeRecord: ...

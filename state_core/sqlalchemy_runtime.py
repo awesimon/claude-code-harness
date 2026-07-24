@@ -1,11 +1,14 @@
 """SQLAlchemy-backed repositories for durable harness runtime records."""
+# ruff: noqa: E501
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, and_, inspect, or_, select, text, update
+from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from models import Base
@@ -16,7 +19,6 @@ from .runtime_records import (
     AgentRecord,
     AgentStatus,
     AgentTerminationReason,
-    InvalidAgentTransition,
     RuntimeMetadataRecord,
     RuntimeRecordRevisionConflict,
     TraceSpanRecord,
@@ -26,6 +28,7 @@ from .runtime_records import (
     _json_copy,
     _sanitize_trace_error,
     ensure_agent_transition,
+    ensure_trace_span_transition,
     ensure_worktree_transition,
 )
 
@@ -66,6 +69,7 @@ class RuntimeAgent(Base):
 
     __table_args__ = (
         Index("ix_runtime_agents_root_session", "root_session_id"),
+        Index("ix_runtime_agents_root_status_created", "root_session_id", "status", "created_at"),
         Index("ix_runtime_agents_parent", "parent_agent_id"),
     )
 
@@ -240,12 +244,11 @@ class SQLAlchemyAgentRepository:
             if status is AgentStatus.RUNNING:
                 values["started_at"] = row.started_at or now
             if status in AGENT_TERMINAL_STATUSES:
+                expected_reason = AgentTerminationReason(status.value)
+                if termination_reason is not None and termination_reason is not expected_reason:
+                    raise ValueError("termination_reason must match terminal agent status")
                 values["finished_at"] = now
-                values["termination_reason"] = (
-                    termination_reason.value
-                    if termination_reason is not None
-                    else AgentTerminationReason(status.value).value
-                )
+                values["termination_reason"] = expected_reason.value
             if usage is not None:
                 values["usage"] = _json_copy(usage)
             if error is not None:
@@ -326,6 +329,26 @@ class SQLAlchemyRuntimeMetadataRepository:
         detached_snapshot = _json_copy(snapshot)
         if not isinstance(detached_snapshot, dict):
             raise TypeError("snapshot must be a JSON object")
+        try:
+            return self._put(root_session_id, namespace, detached_snapshot, expected_revision)
+        except IntegrityError as exc:
+            if expected_revision is not None:
+                raise
+            current = self.get(root_session_id, namespace)
+            raise RuntimeRecordRevisionConflict(
+                "metadata",
+                f"{root_session_id}:{namespace}",
+                None,
+                current.revision if current is not None else None,
+            ) from exc
+
+    def _put(
+        self,
+        root_session_id: str,
+        namespace: str,
+        detached_snapshot: dict[str, Any],
+        expected_revision: int | None,
+    ) -> RuntimeMetadataRecord:
         with self._session_factory() as db, db.begin():
             row = db.get(RuntimeMetadata, (root_session_id, namespace))
             actual = row.revision if row is not None else None
@@ -361,8 +384,13 @@ class SQLAlchemyRuntimeMetadataRepository:
                 .values(snapshot=detached_snapshot, revision=actual + 1, updated_at=now)
             )
             if result.rowcount != 1:
+                db.expire_all()
+                current = db.get(RuntimeMetadata, (root_session_id, namespace))
                 raise RuntimeRecordRevisionConflict(
-                    "metadata", f"{root_session_id}:{namespace}", expected_revision, actual
+                    "metadata",
+                    f"{root_session_id}:{namespace}",
+                    expected_revision,
+                    current.revision if current is not None else None,
                 )
             db.expire_all()
             persisted = db.get(RuntimeMetadata, (root_session_id, namespace))
@@ -373,49 +401,63 @@ class SQLAlchemyRuntimeMetadataRepository:
 class SQLAlchemyTraceSpanRepository:
     def __init__(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
-        self._ensure_duration_column()
+        self._migrate_sqlite_runtime_schema()
 
-    def _ensure_duration_column(self) -> None:
-        """Upgrade legacy trace rows with persisted duration and sanitized errors."""
+    def _migrate_sqlite_runtime_schema(self) -> None:
+        """Run the one-time SQLite trace upgrade under an exclusive writer lock."""
 
         with self._session_factory() as db:
             bind = db.get_bind()
-            inspector = inspect(bind)
-            if not inspector.has_table(RuntimeTraceSpan.__tablename__):
+            if bind.dialect.name != "sqlite":
                 return
-            columns = {column["name"] for column in inspector.get_columns(RuntimeTraceSpan.__tablename__)}
-            with db.begin():
-                if "duration_ms" not in columns:
-                    db.execute(text("ALTER TABLE runtime_trace_spans ADD COLUMN duration_ms INTEGER"))
-                rows = db.scalars(
-                    select(RuntimeTraceSpan).where(
-                        or_(
-                            and_(
-                                RuntimeTraceSpan.status.in_(
-                                    [status.value for status in TRACE_TERMINAL_STATUSES]
-                                ),
-                                RuntimeTraceSpan.started_at.is_not(None),
-                                RuntimeTraceSpan.finished_at.is_not(None),
-                                RuntimeTraceSpan.duration_ms.is_(None),
-                            ),
-                            RuntimeTraceSpan.error_json.is_not(None),
+            with bind.connect() as connection:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(
+                        text(
+                            "CREATE TABLE IF NOT EXISTS runtime_schema_migrations "
+                            "(name TEXT PRIMARY KEY, version INTEGER NOT NULL)"
                         )
                     )
-                ).all()
-                for row in rows:
-                    if (
-                        TraceSpanStatus(row.status) in TRACE_TERMINAL_STATUSES
-                        and row.started_at is not None
-                        and row.finished_at is not None
-                        and row.duration_ms is None
-                    ):
-                        row.duration_ms = int(
-                            (_as_utc(row.finished_at) - _as_utc(row.started_at)).total_seconds() * 1000
+                    version = connection.execute(
+                        text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
+                    ).scalar_one_or_none()
+                    columns = connection.execute(text("PRAGMA table_info(runtime_trace_spans)")).all()
+                    if not columns or version is not None and version >= 1:
+                        connection.commit()
+                        return
+                    names = {column.name for column in columns}
+                    if "duration_ms" not in names:
+                        connection.execute(text("ALTER TABLE runtime_trace_spans ADD COLUMN duration_ms INTEGER"))
+                    connection.execute(
+                        text(
+                            "UPDATE runtime_trace_spans SET duration_ms = "
+                            "CAST(ROUND((julianday(finished_at) - julianday(started_at)) * 86400000) AS INTEGER) "
+                            "WHERE status != 'running' AND started_at IS NOT NULL "
+                            "AND finished_at IS NOT NULL AND duration_ms IS NULL"
                         )
-                    if row.error_json is not None:
-                        sanitized_error = _sanitize_trace_error(row.error_json)
-                        if sanitized_error != row.error_json:
-                            row.error_json = sanitized_error
+                    )
+                    rows = connection.execute(
+                        text("SELECT span_id, error_json FROM runtime_trace_spans WHERE error_json IS NOT NULL")
+                    ).all()
+                    for row in rows:
+                        error = json.loads(row.error_json) if isinstance(row.error_json, str) else row.error_json
+                        sanitized = _sanitize_trace_error(error)
+                        if sanitized != error:
+                            connection.execute(
+                                text("UPDATE runtime_trace_spans SET error_json = :error WHERE span_id = :span_id"),
+                                {"span_id": row.span_id, "error": json.dumps(sanitized)},
+                            )
+                    connection.execute(
+                        text(
+                            "INSERT INTO runtime_schema_migrations (name, version) "
+                            "VALUES ('runtime_trace_spans', 1)"
+                        )
+                    )
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
 
     @staticmethod
     def _record(row: RuntimeTraceSpan) -> TraceSpanRecord:
@@ -484,8 +526,7 @@ class SQLAlchemyTraceSpanRepository:
             actual = row.revision if row is not None else None
             if row is None or actual != expected_revision:
                 raise RuntimeRecordRevisionConflict("trace span", span_id, expected_revision, actual)
-            if TraceSpanStatus(row.status) is not TraceSpanStatus.RUNNING:
-                raise InvalidAgentTransition(AgentStatus.FAILED, AgentStatus.FAILED)
+            ensure_trace_span_transition(TraceSpanStatus(row.status), status)
             now = _utc_now()
             duration_ms = int((now - _as_utc(row.started_at)).total_seconds() * 1000)
             values: dict[str, Any] = {

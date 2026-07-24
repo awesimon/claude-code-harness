@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+# ruff: noqa: E501
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -13,6 +16,7 @@ from state_core import (
     AgentStatus,
     AgentTerminationReason,
     InvalidAgentTransition,
+    InvalidTraceSpanTransition,
     RuntimeRecordRevisionConflict,
     SQLAlchemyStateStore,
     TraceSpanRecord,
@@ -187,6 +191,16 @@ def test_trace_errors_are_sanitized_before_persistence(store: SQLAlchemyStateSto
                 "apiKey": "camel secret",
                 "cookies": "cookie secret",
                 "safe": "kept",
+                "clientSecret": "oauth secret",
+                "secret_access_key": "cloud secret",
+                "privateKey": "pem secret",
+                "signing_key": "signing secret",
+                "bearer_token": "bearer secret",
+                "id_token": "id secret",
+                "session_token": "session secret",
+                "credentials": "credential secret",
+                "token_count": 7,
+                "secretariat": "safe word",
             },
             "requestHeaders": {"Authorization": "raw header secret"},
         },
@@ -201,12 +215,82 @@ def test_trace_errors_are_sanitized_before_persistence(store: SQLAlchemyStateSto
             "apiKey": "[REDACTED]",
             "cookies": "[REDACTED]",
             "safe": "kept",
+            "clientSecret": "[REDACTED]",
+            "secret_access_key": "[REDACTED]",
+            "privateKey": "[REDACTED]",
+            "signing_key": "[REDACTED]",
+            "bearer_token": "[REDACTED]",
+            "id_token": "[REDACTED]",
+            "session_token": "[REDACTED]",
+            "credentials": "[REDACTED]",
+            "token_count": 7,
+            "secretariat": "safe word",
         },
         "requestHeaders": "[REDACTED]",
     }
     assert finished.error == expected
     assert persisted is not None
     assert persisted.error == expected
+
+
+def test_trace_rejects_terminal_lifecycle_transition(store: SQLAlchemyStateStore) -> None:
+    started = store.traces.start(
+        TraceSpanRecord(span_id="span-terminal", root_session_id="root-1", kind="tool", name="request")
+    )
+    finished = store.traces.finish(started.span_id, TraceSpanStatus.COMPLETED, started.revision)
+
+    with pytest.raises(InvalidTraceSpanTransition) as error:
+        store.traces.finish(finished.span_id, TraceSpanStatus.FAILED, finished.revision)
+
+    assert error.value.current is TraceSpanStatus.COMPLETED
+    assert error.value.target is TraceSpanStatus.FAILED
+
+
+def test_runtime_record_status_invariants_are_enforced() -> None:
+    with pytest.raises(ValueError, match="termination_reason"):
+        agent("completed", status=AgentStatus.COMPLETED)
+    with pytest.raises(ValueError, match="termination_reason"):
+        agent(
+            "wrong-reason",
+            status=AgentStatus.FAILED,
+            termination_reason=AgentTerminationReason.COMPLETED,
+        )
+    with pytest.raises(ValueError, match="terminal fields"):
+        agent("pending-output", output={"unexpected": True})
+    with pytest.raises(ValueError, match="removed_at"):
+        WorktreeRecord(
+            worktree_id="not-removed",
+            root_session_id="root-1",
+            repository_root="/repo",
+            canonical_path="/repo/wt",
+            branch="branch",
+            base_commit="abc",
+            removed_at=TraceSpanRecord(
+                span_id="time", root_session_id="root-1", kind="tool", name="time"
+            ).started_at,
+        )
+
+
+def test_metadata_create_race_returns_domain_conflict(
+    session_factory: sessionmaker[Session],
+) -> None:
+    stores = [SQLAlchemyStateStore(session_factory) for _ in range(2)]
+    barrier = Barrier(2)
+
+    def put(index: int) -> object:
+        barrier.wait()
+        try:
+            return stores[index].metadata.put("root-race", "namespace", {"writer": index})
+        except RuntimeRecordRevisionConflict as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(put, range(2)))
+
+    assert sum(not isinstance(outcome, RuntimeRecordRevisionConflict) for outcome in outcomes) == 1
+    conflicts = [outcome for outcome in outcomes if isinstance(outcome, RuntimeRecordRevisionConflict)]
+    assert len(conflicts) == 1
+    assert conflicts[0].actual_revision == 0
 
 
 def test_trace_repository_adds_duration_column_to_existing_sqlite_table(tmp_path: Path) -> None:
@@ -268,6 +352,10 @@ def test_trace_repository_adds_duration_column_to_existing_sqlite_table(tmp_path
     assert "legacy-api-key" not in physical_error
     assert "legacy-camel-key" not in physical_error
     assert "legacy-cookie" not in physical_error
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
+        ).scalar_one() == 1
 
     started = store.traces.start(
         TraceSpanRecord(span_id="legacy-span", root_session_id="root-1", kind="tool", name="request")
@@ -277,6 +365,41 @@ def test_trace_repository_adds_duration_column_to_existing_sqlite_table(tmp_path
     )
 
     assert finished.duration_ms is not None
+
+
+def test_concurrent_legacy_trace_schema_initialization_is_versioned(tmp_path: Path) -> None:
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'concurrent-legacy.db'}", connect_args={"timeout": 10}
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE runtime_trace_spans ("
+                "span_id VARCHAR PRIMARY KEY, root_session_id VARCHAR NOT NULL, "
+                "agent_id VARCHAR, parent_span_id VARCHAR, kind VARCHAR NOT NULL, "
+                "name VARCHAR NOT NULL, status VARCHAR NOT NULL, revision INTEGER NOT NULL, "
+                "started_at DATETIME NOT NULL, finished_at DATETIME, usage JSON NOT NULL, "
+                "error_json JSON, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    barrier = Barrier(2)
+
+    def initialize() -> SQLAlchemyStateStore:
+        barrier.wait()
+        return SQLAlchemyStateStore(session_factory)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        stores = list(pool.map(lambda _: initialize(), range(2)))
+
+    assert len(stores) == 2
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
+        ).scalar_one() == 1
+        assert "duration_ms" in {
+            row.name for row in connection.execute(text("PRAGMA table_info(runtime_trace_spans)"))
+        }
 
 
 def test_worktree_create_update_get_and_stale_revision(store: SQLAlchemyStateStore) -> None:
