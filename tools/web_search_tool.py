@@ -53,6 +53,8 @@ class WebSearchTool(Tool[WebSearchInput, WebSearchOutput]):
     支持按域名过滤搜索结果。
 
     需要在环境变量中配置搜索 API 密钥：
+    - TAVILY_API_KEY: Tavily 密钥（默认）
+    或
     - SERPAPI_KEY: SerpAPI 密钥
     或
     - GOOGLE_API_KEY 和 GOOGLE_CSE_ID: Google Custom Search API
@@ -62,8 +64,8 @@ class WebSearchTool(Tool[WebSearchInput, WebSearchOutput]):
     description = "执行网络搜索，获取当前信息。支持按域名过滤结果。"
     version = "1.0"
 
-    # 默认使用 SerpAPI
-    DEFAULT_SEARCH_PROVIDER = "serpapi"
+    # 默认使用 Tavily
+    DEFAULT_SEARCH_PROVIDER = "tavily"
 
     async def validate(self, input_data: WebSearchInput) -> Optional[ToolError]:
         """验证输入参数"""
@@ -82,14 +84,18 @@ class WebSearchTool(Tool[WebSearchInput, WebSearchOutput]):
         # 检查 API 密钥是否配置
         if not self._get_api_key():
             return ToolValidationError(
-                "未配置搜索 API 密钥。请设置 SERPAPI_KEY 环境变量"
+                "未配置搜索 API 密钥。请设置 TAVILY_API_KEY、SERPAPI_KEY 或 GOOGLE_API_KEY 环境变量"
             )
 
         return None
 
     def _get_api_key(self) -> Optional[str]:
         """获取搜索 API 密钥"""
-        return os.environ.get("SERPAPI_KEY") or os.environ.get("GOOGLE_API_KEY")
+        return (
+            os.environ.get("TAVILY_API_KEY")
+            or os.environ.get("SERPAPI_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+        )
 
     async def execute(self, input_data: WebSearchInput) -> ToolResult:
         """执行网络搜索"""
@@ -100,7 +106,13 @@ class WebSearchTool(Tool[WebSearchInput, WebSearchOutput]):
             # 根据配置的 provider 选择搜索方式
             provider = self.DEFAULT_SEARCH_PROVIDER
 
-            if provider == "serpapi":
+            if provider == "tavily":
+                search_results = await self._search_tavily(
+                    query,
+                    input_data.allowed_domains,
+                    input_data.blocked_domains
+                )
+            elif provider == "serpapi":
                 search_results = await self._search_serpapi(
                     query,
                     input_data.allowed_domains,
@@ -155,6 +167,58 @@ class WebSearchTool(Tool[WebSearchInput, WebSearchOutput]):
                     details={"exception_type": type(e).__name__}
                 )
             )
+
+    async def _search_tavily(
+        self,
+        query: str,
+        allowed_domains: Optional[List[str]],
+        blocked_domains: Optional[List[str]]
+    ) -> List[Dict[str, Any]]:
+        """使用 Tavily API 执行搜索"""
+        api_key = os.environ.get("TAVILY_API_KEY")
+        if not api_key:
+            raise ToolValidationError("未配置 TAVILY_API_KEY 环境变量")
+
+        payload: Dict[str, Any] = {
+            "query": query,
+            "api_key": api_key,
+            "max_results": 10,
+            "search_depth": "basic",
+        }
+
+        # Tavily 原生支持 include_domains / exclude_domains
+        if allowed_domains:
+            payload["include_domains"] = allowed_domains
+        elif blocked_domains:
+            payload["exclude_domains"] = blocked_domains
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.tavily.com/search",
+                json=payload
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        results = []
+        for item in data.get("results", [])[:10]:
+            results.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("content", ""),
+            })
+
+        # Tavily 可能返回 answer 字段，作为首条结果插入
+        answer = data.get("answer")
+        if answer:
+            results.insert(0, {
+                "title": "Tavily Answer",
+                "url": "",
+                "snippet": answer,
+                "type": "answer",
+            })
+
+        return results
 
     async def _search_serpapi(
         self,
