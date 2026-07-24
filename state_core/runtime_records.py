@@ -350,6 +350,8 @@ class TraceSpanRecord:
         object.__setattr__(self, "updated_at", _as_utc(self.updated_at))
         if self.status is TraceSpanStatus.RUNNING and self.finished_at is not None:
             raise ValueError("running trace spans cannot have finished_at")
+        if self.status in TRACE_TERMINAL_STATUSES and self.finished_at is None:
+            raise ValueError("terminal trace spans require finished_at")
         if self.finished_at is not None:
             object.__setattr__(self, "finished_at", _as_utc(self.finished_at))
             expected_duration = int((self.finished_at - self.started_at).total_seconds() * 1000)

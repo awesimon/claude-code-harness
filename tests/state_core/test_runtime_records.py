@@ -257,6 +257,14 @@ def test_runtime_record_status_invariants_are_enforced() -> None:
         )
     with pytest.raises(ValueError, match="terminal fields"):
         agent("pending-output", output={"unexpected": True})
+    with pytest.raises(ValueError, match="finished_at"):
+        TraceSpanRecord(
+            span_id="unfinished-terminal",
+            root_session_id="root-1",
+            kind="tool",
+            name="request",
+            status=TraceSpanStatus.COMPLETED,
+        )
     with pytest.raises(ValueError, match="removed_at"):
         WorktreeRecord(
             worktree_id="not-removed",
