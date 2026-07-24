@@ -249,14 +249,15 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_parent_does_not_retain_disposed_child_token(self):
         parent = CancellationToken()
+        callback_count = len(parent._callbacks)
         child = CancellationToken(parent=parent)
         reference = weakref.ref(child)
 
         del child
         gc.collect()
-        parent.cancel()
 
         self.assertIsNone(reference())
+        self.assertEqual(len(parent._callbacks), callback_count)
 
     async def test_callback_failure_does_not_block_sibling_cancellation(self):
         parent = CancellationToken()
@@ -269,6 +270,22 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         parent.cancel()
 
         self.assertTrue(child.cancelled)
+
+    async def test_cancelled_error_callback_does_not_block_tasks_or_descendants(self):
+        parent = CancellationToken()
+        child = CancellationToken(parent=parent)
+        task = parent.track(asyncio.create_task(asyncio.sleep(60)))
+
+        def cancel_callback():
+            raise asyncio.CancelledError()
+
+        parent.add_callback(cancel_callback)
+        parent.cancel()
+
+        self.assertTrue(child.cancelled)
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(task.cancelled())
 
     async def test_runtime_context_values_override_spoofed_metadata(self):
         runtime = ToolRuntime(registry=LocalRegistry(ContextProbeTool()))

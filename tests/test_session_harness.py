@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -256,6 +257,58 @@ def test_direct_harness_rejects_untrusted_identity_and_workspace_capabilities(
             context,
             allowed_workspaces=(outside,),
         )
+
+
+def test_harness_and_context_capabilities_are_immutable_after_construction(
+    factory, workspace: Path, tmp_path: Path
+) -> None:
+    root = factory.create("immutable", metadata={"nested": {"items": []}})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    with pytest.raises(FrozenInstanceError):
+        root.allowed_workspaces = (outside,)
+    with pytest.raises(FrozenInstanceError):
+        root.agent_id = "spoof"
+    with pytest.raises(FrozenInstanceError):
+        root.runtime_context.session_id = "spoof"
+    with pytest.raises(FrozenInstanceError):
+        root.runtime_context.workspace_root = outside
+    with pytest.raises(TypeError):
+        root.runtime_context.metadata["agent_id"] = "spoof"
+    with pytest.raises(TypeError):
+        del root.runtime_context.metadata["session_runtime"]
+    with pytest.raises(harness.HarnessScopeError):
+        root.child("child", cwd=outside)
+
+    child = root.child("child")
+    child.runtime_context.metadata["nested"]["items"].append("child")
+    assert root.runtime_context.metadata["nested"] == {"items": []}
+
+
+@pytest.mark.asyncio
+async def test_immutable_metadata_cannot_redirect_todo_to_another_session(factory) -> None:
+    first = factory.create("todo-first")
+    second = factory.create("todo-second")
+    first.session_runtime.enable_todo_v1()
+    second.session_runtime.enable_todo_v1()
+
+    with pytest.raises(TypeError):
+        first.runtime_context.metadata["session_runtime"] = second.session_runtime
+
+    result = await first.tool_runtime.execute(
+        "TodoWrite",
+        {
+            "todos": [
+                {"content": "first", "status": "pending", "activeForm": "First"}
+            ]
+        },
+        first.runtime_context,
+    )
+
+    assert result.result.success
+    assert first.session_runtime.state.todos["todo-first"][0]["content"] == "first"
+    assert second.session_runtime.state.todos == {}
 
 
 @pytest.mark.asyncio

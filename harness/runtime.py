@@ -75,20 +75,28 @@ class ToolRuntime:
                 TerminationReason.CANCELLED,
             )
 
-        tool_context = {
-            **dict(context.metadata),
-            "session_id": context.session_id,
-            "current_mode": context.permission_mode.value,
-            "workspace_root": str(context.workspace_root) if context.workspace_root else None,
-            "runtime_context": context,
-            "effective_cwd": str(context.workspace_root.resolve())
-            if context.workspace_root
-            else None,
-            "cancellation": context.cancellation,
-            "permission_mode": context.permission_mode,
-            "approval_callback": context.approval_callback,
-            "tool_timeout": context.tool_timeout,
-        }
+        tool_context = dict(context.metadata)
+        tool_context.update(
+            {
+                "session_runtime": context.metadata.get("session_runtime"),
+                "agent_id": context.metadata.get("agent_id"),
+                "session_harness": context.metadata.get("session_harness"),
+                "session_id": context.session_id,
+                "current_mode": context.permission_mode.value,
+                "workspace_root": str(context.workspace_root)
+                if context.workspace_root
+                else None,
+                "runtime_context": context,
+                "effective_cwd": str(context.workspace_root.resolve())
+                if context.workspace_root
+                else None,
+                "cancellation": context.cancellation,
+                "permission_mode": context.permission_mode,
+                "approval_callback": context.approval_callback,
+                "tool_timeout": context.tool_timeout,
+                "tool_timeout_disabled": context.tool_timeout_disabled,
+            }
+        )
         task = asyncio.create_task(tool.run(input_data, tool_context))
         context.cancellation.track(task)
         if timeout is not None:

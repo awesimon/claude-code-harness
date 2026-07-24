@@ -131,7 +131,7 @@ class _HarnessConfig:
     parent_agent_id: str | None
 
 
-@dataclass
+@dataclass(frozen=True)
 class SessionHarness:
     """The authoritative runtime and scoped execution context for one agent."""
 
@@ -146,32 +146,55 @@ class SessionHarness:
     _capability_token: object | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        if self.runtime_context.session_id != self.session_runtime.session_id:
+        input_context = self.runtime_context
+        if input_context.session_id != self.session_runtime.session_id:
             raise HarnessScopeError(
                 "runtime_context.session_id must match session_runtime.session_id"
             )
-        if self.runtime_context.workspace_root is None:
+        if input_context.workspace_root is None:
             raise HarnessScopeError("workspace_root is required")
         if self.allowed_workspaces and self._capability_token is not _CAPABILITY_TOKEN:
             raise HarnessScopeError(
                 "allowed_workspaces capabilities may only be created by the factory"
             )
-        workspace_root = _canonical_path(self.runtime_context.workspace_root)
-        self._root_workspace = _canonical_path(self._root_workspace or workspace_root)
-        self.allowed_workspaces = _canonicalize_allowed_workspaces(
-            self.allowed_workspaces, self._root_workspace
+        workspace_root = _canonical_path(input_context.workspace_root)
+        root_workspace = _canonical_path(self._root_workspace or workspace_root)
+        allowed_workspaces = _canonicalize_allowed_workspaces(
+            self.allowed_workspaces, root_workspace
         )
-        if not any(_is_within(workspace_root, root) for root in self.allowed_workspaces):
+        if not any(_is_within(workspace_root, root) for root in allowed_workspaces):
             raise HarnessScopeError("workspace_root is outside the allowed workspace policy")
-        self.runtime_context.workspace_root = workspace_root
-        if not self._is_child:
-            self.runtime_context.metadata = _copy_metadata(self.runtime_context.metadata)
-        self.runtime_context.metadata.update(
+        if self._is_child:
+            user_metadata = {
+                key: value
+                for key, value in input_context.metadata.items()
+                if key not in _RESERVED_METADATA_KEYS
+            }
+        else:
+            user_metadata = input_context.metadata
+        metadata = _copy_metadata(user_metadata)
+        metadata.update(
             {
                 "session_runtime": self.session_runtime,
                 "agent_id": self.agent_id,
                 "session_harness": self,
             }
+        )
+        object.__setattr__(self, "_root_workspace", root_workspace)
+        object.__setattr__(self, "allowed_workspaces", allowed_workspaces)
+        object.__setattr__(
+            self,
+            "runtime_context",
+            RuntimeContext(
+                session_id=self.session_runtime.session_id,
+                workspace_root=workspace_root,
+                permission_mode=input_context.permission_mode,
+                approval_callback=input_context.approval_callback,
+                cancellation=input_context.cancellation,
+                tool_timeout=input_context.tool_timeout,
+                tool_timeout_disabled=input_context.tool_timeout_disabled,
+                metadata=metadata,
+            ),
         )
 
     @property

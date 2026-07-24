@@ -5,6 +5,7 @@ import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Mapping, Optional
 
 
@@ -45,6 +46,8 @@ class CancellationToken:
         for callback in tuple(self._callbacks.values()):
             try:
                 callback()
+            except asyncio.CancelledError:
+                continue
             except Exception:
                 continue
         self._callbacks.clear()
@@ -64,6 +67,8 @@ class CancellationToken:
         if self.cancelled:
             try:
                 callback()
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
             return lambda: None
@@ -73,7 +78,16 @@ class CancellationToken:
         stored_callback = callback
         if weak:
             try:
-                reference = weakref.WeakMethod(callback)  # type: ignore[arg-type]
+                parent_reference = weakref.ref(self)
+
+                def remove_dead_callback(_reference: weakref.ReferenceType[object]) -> None:
+                    parent = parent_reference()
+                    if parent is not None:
+                        parent._callbacks.pop(callback_id, None)
+
+                reference = weakref.WeakMethod(  # type: ignore[arg-type]
+                    callback, remove_dead_callback
+                )
             except TypeError:
                 reference = None
             if reference is not None:
@@ -104,7 +118,7 @@ class CancellationToken:
 ApprovalCallback = Callable[[Any], Awaitable[bool] | bool]
 
 
-@dataclass
+@dataclass(frozen=True)
 class RuntimeContext:
     session_id: Optional[str] = None
     workspace_root: Optional[Path] = None
@@ -113,7 +127,12 @@ class RuntimeContext:
     cancellation: CancellationToken = field(default_factory=CancellationToken)
     tool_timeout: Optional[float] = None
     tool_timeout_disabled: bool = False
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("RuntimeContext metadata must be a mapping")
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     def child(self, **overrides: Any) -> "RuntimeContext":
         metadata_overrides = overrides.pop("metadata", {})
