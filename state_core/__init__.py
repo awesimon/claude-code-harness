@@ -1,6 +1,8 @@
 """Public domain contract for durable session state."""
 
+from .migration import migrate_legacy_session
 from .repository import StateRepository, TaskRepository
+from .runtime import SessionRuntime, SessionRuntimeFactory
 from .sqlalchemy_store import (
     SQLAlchemyStateRepository,
     SQLAlchemyStateStore,
@@ -35,6 +37,7 @@ __all__ = [
     "EventType",
     "InvalidTaskDependency",
     "InvalidTransition",
+    "migrate_legacy_session",
     "NewTask",
     "PendingEventBatch",
     "PendingSessionEvent",
@@ -42,6 +45,8 @@ __all__ = [
     "PlanState",
     "RevisionConflict",
     "SessionEvent",
+    "SessionRuntime",
+    "SessionRuntimeFactory",
     "SessionHealth",
     "SessionSnapshot",
     "SessionState",

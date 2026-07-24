@@ -3,31 +3,40 @@ QueryEngine - 核心对话引擎
 实现 LLM → Tool → Observation → LLM 的闭环
 """
 
-import json
-import os
 import asyncio
-from typing import List, Dict, Any, Optional, AsyncIterator, Callable
+import json
+import logging
+import os
 from dataclasses import dataclass, field
 from enum import Enum
-import logging
 from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
-from services import LLMService, LLMProvider, Message, ChatCompletionRequest
-from services.error_recovery import (
-    RecoveryManager,
-    RecoveryConfig,
-    classify_for_user,
-    PromptTooLongError,
-    RetryConfig,
-)
-from tools import ToolRegistry
-from tools.base import ToolResult, tool_flag
-from plan import get_plan_mode_manager, PlanModeState
-from agents import get_agent_manager, AgentExecutionConfig
+from agents import AgentExecutionConfig, get_agent_manager
 from harness import CancellationToken, PermissionMode, RuntimeContext, ToolRuntime
+from services import ChatCompletionRequest, LLMProvider, LLMService, Message
+from services.error_recovery import (
+    PromptTooLongError,
+    RecoveryConfig,
+    RecoveryManager,
+    RetryConfig,
+    classify_for_user,
+)
 
 # 启动时加载所有已安装的 skills
 from services.skill_manager import skill_manager
+from state_core import (
+    EventType,
+    SessionRuntime,
+    SessionRuntimeFactory,
+    SQLAlchemyStateStore,
+)
+from state_core import (
+    PlanState as PlanModeState,
+)
+from tools import ToolRegistry
+from tools.base import ToolResult, tool_flag
+
 skill_manager.load_all_skills()
 
 # 系统提示词 - 定义AI助手的行为和能力
@@ -302,6 +311,7 @@ class QueryEngine:
         workspace_root: Optional[Path] = None,
         approval_callback: Optional[Callable[[Any], Any]] = None,
         tool_timeout: Optional[float] = 60.0,
+        session_runtime_factory: Optional[SessionRuntimeFactory] = None,
     ):
         self.llm_service = llm_service or LLMService()
         self.max_iterations = max_iterations
@@ -310,7 +320,13 @@ class QueryEngine:
         self.model = model or os.getenv("DEFAULT_MODEL")
         self._conversations: Dict[str, ConversationContext] = {}
         self._state_callbacks: List[Callable[[str, ConversationState, ConversationState], None]] = []
-        self._plan_mode_manager = get_plan_mode_manager()
+        if session_runtime_factory is None:
+            from models import SessionLocal, init_db
+
+            init_db()
+            session_runtime_factory = SessionRuntimeFactory(SQLAlchemyStateStore(SessionLocal))
+        self._runtime_factory = session_runtime_factory
+        self._session_runtimes: Dict[str, SessionRuntime] = {}
         self._agent_manager = get_agent_manager()
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.approval_callback = approval_callback
@@ -386,6 +402,7 @@ class QueryEngine:
         import uuid
         cid = conversation_id or f"conv-{uuid.uuid4().hex[:8]}"
         self._conversations[cid] = ConversationContext(conversation_id=cid)
+        self._session_runtimes[cid] = self._runtime_factory.create(cid)
         self._cancellations[cid] = CancellationToken()
         logger.info(f"Created conversation: {cid}")
         return cid
@@ -401,17 +418,74 @@ class QueryEngine:
             token = self._cancellations.pop(conversation_id, None)
             if token:
                 token.cancel()
-            # 清理计划模式相关数据
-            self._plan_mode_manager.clear_session(conversation_id)
             logger.info(f"Deleted conversation: {conversation_id}")
+
+    def resume_conversation(self, conversation_id: str) -> str:
+        """Restore the in-process handle from the durable transcript."""
+        runtime = self._runtime_factory.resume(conversation_id)
+        self._session_runtimes[conversation_id] = runtime
+        context = ConversationContext(conversation_id=conversation_id)
+        for event in runtime.events():
+            if event.event_type in {EventType.USER_MESSAGE, EventType.ASSISTANT_MESSAGE}:
+                role = "user" if event.event_type is EventType.USER_MESSAGE else "assistant"
+                context.messages.append(
+                    ConversationTurn(
+                        role=role,
+                        content=str(event.payload.get("content") or ""),
+                        thinking=event.payload.get("thinking"),
+                    )
+                )
+            elif event.event_type is EventType.TOOL_CALL:
+                if not context.messages or context.messages[-1].role != "assistant":
+                    context.messages.append(ConversationTurn(role="assistant", content=""))
+                turn = context.messages[-1]
+                turn.tool_calls = list(turn.tool_calls or [])
+                turn.tool_calls.append(
+                    ToolCall(
+                        id=str(event.payload.get("toolCallId") or ""),
+                        name=str(event.payload.get("name") or ""),
+                        arguments=event.payload.get("input") or {},
+                    )
+                )
+            elif event.event_type is EventType.TOOL_RESULT:
+                result = (
+                    ToolResult.ok(event.payload.get("result"))
+                    if event.payload.get("success", True)
+                    else ToolResult.fail(str(event.payload.get("result") or "tool failed"))
+                )
+                observation = ToolObservation(
+                    tool_call_id=str(event.payload.get("toolCallId") or ""),
+                    name=str(event.payload.get("name") or ""),
+                    result=result,
+                    execution_time=0.0,
+                )
+                if context.messages and context.messages[-1].role == "tool":
+                    context.messages[-1].tool_observations = [
+                        *(context.messages[-1].tool_observations or []),
+                        observation,
+                    ]
+                else:
+                    context.messages.append(
+                        ConversationTurn(role="tool", tool_observations=[observation])
+                    )
+        self._conversations[conversation_id] = context
+        self._cancellations[conversation_id] = CancellationToken()
+        return conversation_id
+
+    def _session_runtime(self, conversation_id: str) -> SessionRuntime:
+        runtime = self._session_runtimes.get(conversation_id)
+        if runtime is None:
+            runtime = self._runtime_factory.resume(conversation_id)
+            self._session_runtimes[conversation_id] = runtime
+        return runtime
 
     def is_in_plan_mode(self, conversation_id: str) -> bool:
         """检查对话是否在计划模式中"""
-        return self._plan_mode_manager.is_in_plan_mode(conversation_id)
+        return self._session_runtime(conversation_id).state.plan.state is not PlanModeState.IDLE
 
     def get_plan_mode_state(self, conversation_id: str) -> PlanModeState:
         """获取计划模式状态"""
-        return self._plan_mode_manager.get_state(conversation_id)
+        return self._session_runtime(conversation_id).state.plan.state
 
     def _filter_tools_for_plan_mode(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -438,7 +512,25 @@ class QueryEngine:
 
     def _build_tools_schema(self, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """构建工具 schema 列表"""
-        tools = [spec.to_openai() for spec in ToolRegistry.list_specs()]
+        runtime = self._session_runtime(conversation_id) if conversation_id else None
+        tools = []
+        for name in ToolRegistry.list_tools():
+            tool = ToolRegistry.get(name)
+            if tool is None:
+                continue
+            enabled = getattr(tool, "is_enabled", None)
+            if runtime is not None and callable(enabled):
+                try:
+                    is_enabled = enabled({"session_runtime": runtime})
+                except TypeError:
+                    is_enabled = enabled()
+                if not is_enabled:
+                    continue
+            elif runtime is not None and enabled is False:
+                continue
+            spec = ToolRegistry.get_spec(name)
+            if spec is not None:
+                tools.append(spec.to_openai())
 
         # 如果在计划模式下，过滤工具
         if conversation_id and self.is_in_plan_mode(conversation_id):
@@ -468,6 +560,7 @@ class QueryEngine:
         if not context:
             yield {"type": "error", "error": f"Conversation {conversation_id} not found"}
             return
+        session_runtime = self._session_runtime(conversation_id)
 
         # 添加用户消息（避免重复添加）
         if not context.messages or context.messages[-1].role != "user" or context.messages[-1].content != user_message:
@@ -475,6 +568,7 @@ class QueryEngine:
                 role="user",
                 content=user_message
             ))
+            session_runtime.append_event(EventType.USER_MESSAGE, {"content": user_message})
 
         yield {"type": "user_message", "content": user_message}
 
@@ -555,6 +649,10 @@ class QueryEngine:
                     thinking=response.reasoning_content
                 )
                 context.messages.append(assistant_turn)
+                session_runtime.append_event(
+                    EventType.ASSISTANT_MESSAGE,
+                    {"content": response.content, "thinking": response.reasoning_content},
+                )
                 self._update_state(context, ConversationState.COMPLETED)
 
                 yield {
@@ -574,6 +672,19 @@ class QueryEngine:
                 thinking=response.reasoning_content
             )
             context.messages.append(assistant_turn)
+            session_runtime.append_event(
+                EventType.ASSISTANT_MESSAGE,
+                {"content": response.content or "", "thinking": response.reasoning_content},
+            )
+            for tool_call in tool_calls:
+                session_runtime.append_event(
+                    EventType.TOOL_CALL,
+                    {
+                        "toolCallId": tool_call.id,
+                        "name": tool_call.name,
+                        "input": tool_call.arguments,
+                    },
+                )
 
             # 发送助手消息（带工具调用意图）
             yield {
@@ -595,6 +706,20 @@ class QueryEngine:
             yield {"type": "state_change", "state": "tool_calling"}
 
             observations = await self._execute_tools(tool_calls, conversation_id)
+            for observation in observations:
+                session_runtime.append_event(
+                    EventType.TOOL_RESULT,
+                    {
+                        "toolCallId": observation.tool_call_id,
+                        "name": observation.name,
+                        "success": observation.result.success,
+                        "result": (
+                            observation.result.data
+                            if observation.result.success
+                            else str(observation.result.error)
+                        ),
+                    },
+                )
 
             # 检查是否是 ExitPlanMode 工具调用
             exit_plan_mode_called = any(
@@ -682,6 +807,12 @@ class QueryEngine:
                 approval_callback=self.approval_callback,
                 cancellation=token,
                 tool_timeout=self.tool_timeout,
+                metadata={
+                    "session_runtime": (
+                        self._session_runtime(conversation_id) if conversation_id else None
+                    ),
+                    "agent_id": None,
+                },
             )
             execution = await self._tool_runtime.execute(
                 tool_call.name,
@@ -734,6 +865,7 @@ class QueryEngine:
         if not context:
             yield {"type": "error", "error": f"Conversation {conversation_id} not found"}
             return
+        session_runtime = self._session_runtime(conversation_id)
 
         # 添加用户消息（避免重复添加）
         if not context.messages or context.messages[-1].role != "user" or context.messages[-1].content != user_message:
@@ -741,6 +873,7 @@ class QueryEngine:
                 role="user",
                 content=user_message
             ))
+            session_runtime.append_event(EventType.USER_MESSAGE, {"content": user_message})
 
         yield {"type": "user_message", "content": user_message}
 
@@ -845,6 +978,19 @@ class QueryEngine:
                         thinking=full_thinking if full_thinking else None
                     )
                     context.messages.append(assistant_turn)
+                    session_runtime.append_event(
+                        EventType.ASSISTANT_MESSAGE,
+                        {"content": full_content or "", "thinking": full_thinking or None},
+                    )
+                    for tool_call in tool_calls:
+                        session_runtime.append_event(
+                            EventType.TOOL_CALL,
+                            {
+                                "toolCallId": tool_call.id,
+                                "name": tool_call.name,
+                                "input": tool_call.arguments,
+                            },
+                        )
 
                     # 发送工具调用事件
                     yield {
@@ -860,6 +1006,20 @@ class QueryEngine:
                     yield {"type": "state_change", "state": "tool_calling"}
 
                     observations = await self._execute_tools(tool_calls, conversation_id)
+                    for observation in observations:
+                        session_runtime.append_event(
+                            EventType.TOOL_RESULT,
+                            {
+                                "toolCallId": observation.tool_call_id,
+                                "name": observation.name,
+                                "success": observation.result.success,
+                                "result": (
+                                    observation.result.data
+                                    if observation.result.success
+                                    else str(observation.result.error)
+                                ),
+                            },
+                        )
 
                     # 检查是否是 ExitPlanMode 工具调用
                     exit_plan_mode_called = any(
@@ -921,6 +1081,10 @@ class QueryEngine:
                         thinking=full_thinking if full_thinking else None
                     )
                     context.messages.append(assistant_turn)
+                    session_runtime.append_event(
+                        EventType.ASSISTANT_MESSAGE,
+                        {"content": full_content, "thinking": full_thinking or None},
+                    )
                     self._update_state(context, ConversationState.COMPLETED)
 
                     yield {
@@ -1005,17 +1169,26 @@ class QueryEngine:
 
     def get_plan_mode_info(self, conversation_id: str) -> Optional[Dict]:
         """获取计划模式信息"""
-        return self._plan_mode_manager.get_session_info(conversation_id)
+        return self._session_runtime(conversation_id).state.plan.to_dict()
 
     async def approve_plan(self, conversation_id: str, edited_content: Optional[str] = None) -> Dict[str, Any]:
         """批准计划"""
-        result = await self._plan_mode_manager.approve_plan(conversation_id, edited_content)
-        return result
+        runtime = self._session_runtime(conversation_id)
+        if edited_content is not None and runtime.state.plan.file_path:
+            Path(runtime.state.plan.file_path).write_text(edited_content, encoding="utf-8")
+        runtime.approve_plan()
+        runtime.exit_plan()
+        return {
+            "success": True,
+            "state": runtime.state.plan.state.value,
+            "restored_mode": runtime.state.permission_mode,
+        }
 
     async def reject_plan(self, conversation_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
         """拒绝计划"""
-        result = await self._plan_mode_manager.reject_plan(conversation_id, reason)
-        return result
+        runtime = self._session_runtime(conversation_id)
+        runtime.reject_plan()
+        return {"success": True, "state": "planning", "reason": reason}
 
     async def spawn_agent(
         self,
@@ -1040,7 +1213,13 @@ class QueryEngine:
             agent_type=agent_type,
             prompt=prompt,
             parent_session_id=conversation_id,
-            config=AgentExecutionConfig(is_async=is_async),
+            config=AgentExecutionConfig(
+                is_async=is_async,
+                workspace_root=self.workspace_root,
+                approval_callback=self.approval_callback,
+                tool_timeout=self.tool_timeout,
+                session_runtime=self._session_runtime(conversation_id),
+            ),
             is_async=is_async,
         )
         return agent_id

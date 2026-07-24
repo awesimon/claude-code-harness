@@ -3,10 +3,19 @@
 定义所有工具的抽象基类和通用接口
 """
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Generic, Optional, TypeVar, Dict, get_args
 import re
+from abc import ABC, abstractmethod
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Any, Dict, Generic, Optional, TypeVar, cast, get_args
+
+_ACTIVE_TOOL_CONTEXT: ContextVar[Dict[str, Any] | None] = ContextVar(
+    "active_tool_context", default=None
+)
+
+
+def get_active_tool_context() -> Dict[str, Any]:
+    return _ACTIVE_TOOL_CONTEXT.get() or {}
 
 
 class ToolError(Exception):
@@ -173,11 +182,14 @@ def _resolve_tool_input_type(tool_cls: type) -> Optional[type]:
     """
     im = getattr(tool_cls, "input_model", None)
     if im is not None:
-        return im
+        return cast(type, im)
+    input_type = getattr(tool_cls, "input_type", None)
+    if input_type is not None:
+        return cast(type, input_type)
     for base in getattr(tool_cls, "__orig_bases__", ()) or ():
         args = get_args(base)
         if args:
-            return args[0]
+            return cast(type, args[0])
     return None
 
 
@@ -317,13 +329,13 @@ class Tool(ABC, Generic[InputType, OutputType]):
                         )
                     )
                 if dataclasses.is_dataclass(input_type):
-                    input_data = input_type(**input_data)
+                    input_data = cast(InputType, input_type(**input_data))
                 elif hasattr(input_type, 'model_validate'):
                     # Pydantic BaseModel
-                    input_data = input_type.model_validate(input_data)
+                    input_data = cast(InputType, input_type.model_validate(input_data))
                 elif hasattr(input_type, '__init__'):
                     # 其他类型，尝试直接实例化
-                    input_data = input_type(**input_data)
+                    input_data = cast(InputType, input_type(**input_data))
         except Exception as e:
             return ToolResult.fail(
                 ToolValidationError(f"Invalid input data: {str(e)}")
@@ -334,7 +346,10 @@ class Tool(ABC, Generic[InputType, OutputType]):
         if validation_error:
             return ToolResult.fail(validation_error)
 
-        # 执行工具
+        # Keep the runtime context available to legacy execute(input) methods.
+        # The context is restored after execution because registry tools are
+        # shared instances and may run concurrently.
+        context_token = _ACTIVE_TOOL_CONTEXT.set(context or {})
         try:
             return await self.execute(input_data)
         except ToolError as e:
@@ -346,6 +361,8 @@ class Tool(ABC, Generic[InputType, OutputType]):
                     details={"exception_type": type(e).__name__},
                 )
             )
+        finally:
+            _ACTIVE_TOOL_CONTEXT.reset(context_token)
 
     def get_schema(self) -> Dict[str, Any]:
         """
@@ -428,7 +445,11 @@ class ToolRegistry:
 
     @classmethod
     def list_specs(cls) -> list[ToolSpec]:
-        return [cls.get_spec(name) for name in cls.list_tools()]
+        return [
+            spec
+            for name in cls.list_tools()
+            if (spec := cls.get_spec(name)) is not None
+        ]
 
     @classmethod
     def get_all_schemas(cls) -> Dict[str, Dict[str, Any]]:

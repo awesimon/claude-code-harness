@@ -1,264 +1,221 @@
-"""
-Task Service - Core business logic for task management
-Implements task CRUD, claiming, assignment, and dependency management
-"""
-from typing import Optional, List
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
-from fastapi import HTTPException
+"""Legacy REST adapter over the authoritative durable task repository."""
 
-from models import Task, TaskStatus, Conversation
-from schemas import TaskCreate, TaskUpdate, TaskClaimResponse, TaskResponse
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
+
+from schemas import TaskClaimResponse, TaskCreate, TaskResponse, TaskUpdate
+from state_core import NewTask, SessionRuntime, SQLAlchemyStateStore, TaskMutation, TaskStatus
+from state_core.sqlalchemy_store import RuntimeTask
+
+
+@dataclass
+class TaskView:
+    id: str
+    conversation_id: str | None
+    subject: str
+    description: str
+    active_form: str | None
+    owner: str | None
+    status: str
+    blocks: list[str]
+    blocked_by: list[str]
+    meta: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
 
 
 class TaskService:
     def __init__(self, db: Session):
         self.db = db
+        self._factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+        self._store = SQLAlchemyStateStore(self._factory)
 
-    def create_task(self, task_data: TaskCreate) -> Task:
-        """Create a new task"""
-        # Validate conversation exists if provided
-        if task_data.conversation_id:
-            conversation = self.db.query(Conversation).filter(
-                Conversation.id == task_data.conversation_id
-            ).first()
-            if not conversation:
-                raise HTTPException(status_code=404, detail="Conversation not found")
+    def _runtime(self, task_list_id: str) -> SessionRuntime:
+        return SessionRuntime(task_list_id, self._store)
 
-        task = Task(
-            subject=task_data.subject,
-            description=task_data.description,
-            active_form=task_data.active_form,
-            owner=task_data.owner,
-            status=TaskStatus(task_data.status),
-            blocks=task_data.blocks,
-            blocked_by=task_data.blocked_by,
-            meta=task_data.meta,
-            conversation_id=task_data.conversation_id
+    def _locate(self, task_id: str) -> tuple[str, Any] | None:
+        row = self.db.scalar(
+            select(RuntimeTask)
+            .where(RuntimeTask.task_id == task_id)
+            .order_by(RuntimeTask.task_list_id)
+            .limit(1)
         )
-        self.db.add(task)
-        self.db.commit()
-        self.db.refresh(task)
-        return task
+        if row is None:
+            return None
+        return row.task_list_id, self._store.tasks.get(row.task_list_id, task_id)
 
-    def get_task(self, task_id: str) -> Optional[Task]:
-        """Get a task by ID"""
-        return self.db.query(Task).filter(Task.id == task_id).first()
+    @staticmethod
+    def _view(task_list_id: str, task: Any) -> TaskView:
+        now = datetime.now(timezone.utc)
+        return TaskView(
+            id=task.id,
+            conversation_id=None if task_list_id == "global" else task_list_id,
+            subject=task.subject,
+            description=task.description,
+            active_form=task.active_form,
+            owner=task.owner,
+            status=task.status.value,
+            blocks=list(task.blocks),
+            blocked_by=list(task.blocked_by),
+            meta=dict(task.metadata),
+            created_at=now,
+            updated_at=now,
+        )
+
+    def create_task(self, task_data: TaskCreate) -> TaskView:
+        task_list_id = task_data.conversation_id or "global"
+        task = self._runtime(task_list_id).create_task(
+            NewTask(
+                subject=task_data.subject,
+                description=task_data.description,
+                active_form=task_data.active_form,
+                metadata=task_data.meta,
+            )
+        )
+        mutation = TaskMutation(
+            owner=task_data.owner,
+            status=(
+                TaskStatus(task_data.status.value)
+                if task_data.status.value != TaskStatus.PENDING.value
+                else None
+            ),
+            add_blocks=list(task_data.blocks),
+            add_blocked_by=list(task_data.blocked_by),
+        )
+        if any([mutation.owner, mutation.status, mutation.add_blocks, mutation.add_blocked_by]):
+            task = self._runtime(task_list_id).update_task(task.id, mutation) or task
+        return self._view(task_list_id, task)
+
+    def get_task(self, task_id: str) -> TaskView | None:
+        located = self._locate(task_id)
+        return self._view(*located) if located is not None else None
 
     def list_tasks(
         self,
-        conversation_id: Optional[str] = None,
-        status: Optional[str] = None,
-        owner: Optional[str] = None
-    ) -> List[Task]:
-        """List tasks with optional filters"""
-        query = self.db.query(Task)
+        conversation_id: str | None = None,
+        status: str | None = None,
+        owner: str | None = None,
+    ) -> list[TaskView]:
+        rows = self.db.scalars(
+            select(RuntimeTask).where(
+                RuntimeTask.task_list_id == (conversation_id or RuntimeTask.task_list_id)
+            )
+        ).all()
+        views = [
+            self._view(row.task_list_id, self._store.tasks.get(row.task_list_id, row.task_id))
+            for row in rows
+        ]
+        if status is not None:
+            views = [task for task in views if task.status == status]
+        if owner is not None:
+            views = [task for task in views if task.owner == owner]
+        return sorted(views, key=lambda task: (task.conversation_id or "", int(task.id)))
 
-        if conversation_id:
-            query = query.filter(Task.conversation_id == conversation_id)
-        if status:
-            query = query.filter(Task.status == TaskStatus(status))
-        if owner:
-            query = query.filter(Task.owner == owner)
-
-        return query.order_by(Task.created_at.desc()).all()
-
-    def update_task(self, task_id: str, updates: TaskUpdate) -> Optional[Task]:
-        """Update a task"""
-        task = self.get_task(task_id)
-        if not task:
+    def update_task(self, task_id: str, updates: TaskUpdate) -> TaskView | None:
+        located = self._locate(task_id)
+        if located is None:
             return None
-
-        update_data = updates.model_dump(exclude_unset=True)
-
-        # Convert status string to enum if present
-        if 'status' in update_data and update_data['status']:
-            update_data['status'] = TaskStatus(update_data['status'])
-
-        for field, value in update_data.items():
-            setattr(task, field, value)
-
-        self.db.commit()
-        self.db.refresh(task)
-        return task
+        task_list_id, current = located
+        data = updates.model_dump(exclude_unset=True)
+        desired_blocks = (
+            data["blocks"] if "blocks" in data and data["blocks"] is not None else current.blocks
+        )
+        desired_blocked_by = (
+            data["blocked_by"]
+            if "blocked_by" in data and data["blocked_by"] is not None
+            else current.blocked_by
+        )
+        mutation = TaskMutation(
+            subject=data.get("subject"),
+            description=data.get("description"),
+            active_form=data.get("active_form"),
+            owner=data.get("owner"),
+            status=TaskStatus(data["status"].value) if data.get("status") else None,
+            add_blocks=[item for item in desired_blocks if item not in current.blocks],
+            remove_blocks=[item for item in current.blocks if item not in desired_blocks],
+            add_blocked_by=[item for item in desired_blocked_by if item not in current.blocked_by],
+            remove_blocked_by=[
+                item for item in current.blocked_by if item not in desired_blocked_by
+            ],
+            metadata=data.get("meta"),
+        )
+        task = self._runtime(task_list_id).update_task(task_id, mutation)
+        return self._view(task_list_id, task) if task is not None else None
 
     def delete_task(self, task_id: str) -> bool:
-        """Delete a task and clean up references"""
-        task = self.get_task(task_id)
-        if not task:
-            return False
-
-        # Remove references from other tasks
-        all_tasks = self.list_tasks()
-        for t in all_tasks:
-            if task_id in t.blocks:
-                t.blocks = [b for b in t.blocks if b != task_id]
-            if task_id in t.blocked_by:
-                t.blocked_by = [b for b in t.blocked_by if b != task_id]
-
-        self.db.delete(task)
-        self.db.commit()
-        return True
+        located = self._locate(task_id)
+        return located is not None and self._runtime(located[0]).delete_task(task_id)
 
     def claim_task(
-        self,
-        task_id: str,
-        agent_id: str,
-        check_agent_busy: bool = False
+        self, task_id: str, agent_id: str, check_agent_busy: bool = False
     ) -> TaskClaimResponse:
-        """
-        Claim a task for an agent.
-        Returns success or reason for failure.
-        """
-        task = self.get_task(task_id)
-        if not task:
+        located = self._locate(task_id)
+        if located is None:
             return TaskClaimResponse(success=False, reason="task_not_found")
-
-        # Check if already claimed by another agent
-        if task.owner and task.owner != agent_id:
-            return TaskClaimResponse(
-                success=False,
-                reason="already_claimed",
-                task=TaskResponse.model_validate(task)
-            )
-
-        # Check if already resolved
-        if task.status == TaskStatus.COMPLETED:
-            return TaskClaimResponse(
-                success=False,
-                reason="already_resolved",
-                task=TaskResponse.model_validate(task)
-            )
-
-        # Check for unresolved blockers
-        all_tasks = {t.id: t for t in self.list_tasks()}
-        blocked_by_tasks = []
-        for blocker_id in task.blocked_by:
-            if blocker_id in all_tasks:
-                blocker = all_tasks[blocker_id]
-                if blocker.status != TaskStatus.COMPLETED:
-                    blocked_by_tasks.append(blocker_id)
-
-        if blocked_by_tasks:
-            return TaskClaimResponse(
-                success=False,
-                reason="blocked",
-                task=TaskResponse.model_validate(task),
-                blocked_by_tasks=blocked_by_tasks
-            )
-
-        # Check if agent is busy
+        task_list_id, _ = located
         if check_agent_busy:
-            agent_open_tasks = self.db.query(Task).filter(
-                Task.owner == agent_id,
-                Task.status != TaskStatus.COMPLETED,
-                Task.id != task_id
-            ).all()
+            busy = [
+                task.id
+                for task in self.list_tasks(task_list_id, owner=agent_id)
+                if task.status != TaskStatus.COMPLETED.value and task.id != task_id
+            ]
+            if busy:
+                return TaskClaimResponse(success=False, reason="agent_busy", busy_with_tasks=busy)
+        result = self._runtime(task_list_id).claim_task(task_id, agent_id)
+        view = self._view(task_list_id, result.task) if result.task is not None else None
+        return TaskClaimResponse(
+            success=result.success,
+            reason=result.reason,
+            task=TaskResponse.model_validate(view) if view is not None else None,
+            blocked_by_tasks=(
+                list(result.task.blocked_by)
+                if result.reason == "blocked" and result.task is not None
+                else None
+            ),
+        )
 
-            if agent_open_tasks:
-                return TaskClaimResponse(
-                    success=False,
-                    reason="agent_busy",
-                    task=TaskResponse.model_validate(task),
-                    busy_with_tasks=[t.id for t in agent_open_tasks]
-                )
-
-        # Claim the task
-        task.owner = agent_id
-        if task.status == TaskStatus.PENDING:
-            task.status = TaskStatus.IN_PROGRESS
-
-        self.db.commit()
-        self.db.refresh(task)
-
-        return TaskClaimResponse(success=True, task=TaskResponse.model_validate(task))
-
-    def unassign_task(self, task_id: str) -> Optional[Task]:
-        """Unassign a task from its owner"""
-        task = self.get_task(task_id)
-        if not task:
+    def unassign_task(self, task_id: str) -> TaskView | None:
+        located = self._locate(task_id)
+        if located is None:
             return None
-
-        task.owner = None
-        if task.status == TaskStatus.IN_PROGRESS:
-            task.status = TaskStatus.PENDING
-
-        self.db.commit()
-        self.db.refresh(task)
-        return task
+        task_list_id, _ = located
+        updated = self._runtime(task_list_id).unassign_task(task_id)
+        return self._view(task_list_id, updated) if updated is not None else None
 
     def block_task(self, from_task_id: str, to_task_id: str) -> bool:
-        """
-        Make from_task block to_task.
-        Returns True if successful.
-        """
-        from_task = self.get_task(from_task_id)
-        to_task = self.get_task(to_task_id)
-
-        if not from_task or not to_task:
+        located = self._locate(from_task_id)
+        target = self._locate(to_task_id)
+        if located is None or target is None or located[0] != target[0]:
             return False
+        return (
+            self._runtime(located[0]).update_task(
+                from_task_id, TaskMutation(add_blocks=[to_task_id])
+            )
+            is not None
+        )
 
-        # Update from_task: A blocks B
-        if to_task_id not in from_task.blocks:
-            from_task.blocks.append(to_task_id)
+    def get_agent_statuses(self) -> list[dict[str, Any]]:
+        owners: dict[str, list[str]] = {}
+        for task in self.list_tasks():
+            if task.owner and task.status != TaskStatus.COMPLETED.value:
+                owners.setdefault(task.owner, []).append(task.id)
+        return [
+            {"agent_id": owner, "name": owner, "status": "busy", "current_tasks": ids}
+            for owner, ids in owners.items()
+        ]
 
-        # Update to_task: B is blocked_by A
-        if from_task_id not in to_task.blocked_by:
-            to_task.blocked_by.append(from_task_id)
-
-        self.db.commit()
-        return True
-
-    def get_agent_statuses(self) -> List[dict]:
-        """Get status of all agents based on task ownership"""
-        from collections import defaultdict
-
-        # Get all non-completed tasks grouped by owner
-        tasks_by_owner = defaultdict(list)
-        all_tasks = self.list_tasks()
-
-        for task in all_tasks:
-            if task.status != TaskStatus.COMPLETED and task.owner:
-                tasks_by_owner[task.owner].append(task.id)
-
-        # Build agent statuses
-        agent_statuses = []
-        for owner, task_ids in tasks_by_owner.items():
-            agent_statuses.append({
-                "agent_id": owner,
-                "name": owner,  # Simplified - in real app, lookup agent name
-                "status": "busy" if task_ids else "idle",
-                "current_tasks": task_ids
-            })
-
-        return agent_statuses
-
-    def get_next_available_task(self, agent_id: str) -> Optional[Task]:
-        """
-        Get the next available task for an agent.
-        Returns a task that:
-        - Is pending
-        - Is not blocked
-        - Is not already claimed
-        """
-        pending_tasks = self.db.query(Task).filter(
-            Task.status == TaskStatus.PENDING,
-            or_(Task.owner == None, Task.owner == agent_id)
-        ).order_by(Task.created_at).all()
-
-        all_tasks = {t.id: t for t in self.list_tasks()}
-
-        for task in pending_tasks:
-            # Check if blocked
-            is_blocked = False
-            for blocker_id in task.blocked_by:
-                if blocker_id in all_tasks:
-                    blocker = all_tasks[blocker_id]
-                    if blocker.status != TaskStatus.COMPLETED:
-                        is_blocked = True
-                        break
-
-            if not is_blocked:
-                return task
-
-        return None
+    def get_next_available_task(self, agent_id: str) -> TaskView | None:
+        return next(
+            (
+                task
+                for task in self.list_tasks()
+                if task.status == TaskStatus.PENDING.value and not task.blocked_by
+            ),
+            None,
+        )

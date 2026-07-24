@@ -15,6 +15,17 @@ This project implements a Python-based alternative to Claude Code, featuring a F
 - **Multi-Provider LLM Support**: OpenAI, Anthropic, DeepSeek, GLM, MiniMax, and Moonshot AI (Kimi)
 - **Streaming Responses**: Server-Sent Events (SSE) for real-time streaming chat completions
 - **Plan Mode**: Structured implementation planning with approval workflow
+- **Durable Agent Harness**: Session-scoped runtime with append-only transcripts,
+  snapshots, restart recovery, Task V2/Todo compatibility modes, and interrupted
+  subagent detection
+
+### Durable Session State
+
+`state_core.SessionRuntime` is the single authority for plan state, task lists,
+TodoWrite compatibility data, transcript events, and agent lifecycle state.
+Task V2 and TodoWrite are mutually exclusive per session. Restart recovery loads
+the latest valid state, marks active work as interrupted, and never replays a
+mutating tool call.
 
 ### Production-Ready Features
 
@@ -144,6 +155,7 @@ The application will be available at:
 
 ### Chat
 - `POST /chat/create` - Create new conversation
+- `POST /chat/{id}/resume` - Restore a durable conversation after restart
 - `POST /chat` - Send message (non-streaming)
 - `POST /chat/stream` - Send message (SSE streaming)
 - `GET /chat/{id}/history` - Get conversation history

@@ -2,11 +2,11 @@
 Agent 系统核心类型定义
 全面对齐 Claude Code 源码架构
 """
-from enum import Enum
-from typing import Optional, Dict, Any, List, Callable, Union, Literal
-from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 
 class AgentSource(str, Enum):
@@ -184,6 +184,7 @@ class AgentExecutionConfig:
     approval_callback: Optional[Callable[[Any], Any]] = None
     tool_timeout: Optional[float] = 60.0
     parent_cancellation: Optional[Any] = None
+    session_runtime: Optional[Any] = None
 
 
 class AgentError(Exception):

@@ -9,19 +9,20 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
 from sqlalchemy import (
+    JSON,
     DateTime,
     ForeignKey,
     Index,
     Integer,
-    JSON,
     String,
     Text,
     cast,
+    delete,
     select,
     update,
 )
-from sqlalchemy.orm import Mapped, Session, mapped_column
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from models import Base
 
@@ -144,6 +145,15 @@ class SQLAlchemyStateRepository:
         with self._session_factory() as db:
             row = db.get(RuntimeSession, session_id)
             return SessionState.from_dict(row.state) if row is not None else None
+
+    def delete_session(self, session_id: str) -> bool:
+        with self._session_factory() as db, db.begin():
+            db.execute(delete(RuntimeSnapshot).where(RuntimeSnapshot.session_id == session_id))
+            db.execute(delete(RuntimeEvent).where(RuntimeEvent.session_id == session_id))
+            result = db.execute(
+                delete(RuntimeSession).where(RuntimeSession.session_id == session_id)
+            )
+            return result.rowcount == 1
 
     def commit(
         self,
@@ -273,6 +283,10 @@ class SQLAlchemyStateRepository:
                 .limit(1)
             )
             if row is None:
+                return None
+            state_json = json.dumps(row.state, sort_keys=True, separators=(",", ":"))
+            checksum = hashlib.sha256(state_json.encode()).hexdigest()
+            if row.checksum is not None and row.checksum != checksum:
                 return None
             return SessionSnapshot(
                 session_id=row.session_id,
@@ -550,6 +564,26 @@ class SQLAlchemyTaskRepository:
                     other.version += 1
             db.delete(row)
         return True
+
+    def unassign(self, task_list_id: str, task_id: str) -> TaskItem | None:
+        with self._transaction(immediate=True) as db:
+            row = db.get(RuntimeTask, (task_list_id, task_id))
+            if row is None:
+                return None
+            row.owner = None
+            if row.status == TaskStatus.IN_PROGRESS.value:
+                row.status = TaskStatus.PENDING.value
+            row.version += 1
+            db.flush()
+            return self._to_task_item(row)
+
+    def delete_list(self, task_list_id: str) -> int:
+        with self._transaction(immediate=True) as db:
+            tasks = db.execute(delete(RuntimeTask).where(RuntimeTask.task_list_id == task_list_id))
+            db.execute(
+                delete(RuntimeTaskCounter).where(RuntimeTaskCounter.task_list_id == task_list_id)
+            )
+            return int(tasks.rowcount or 0)
 
 
 class SQLAlchemyStateStore:
