@@ -3,11 +3,15 @@
 定义所有工具的抽象基类和通用接口
 """
 
+import math
 import re
 from abc import ABC, abstractmethod
 from contextvars import ContextVar
-from dataclasses import dataclass, field
-from typing import Any, Dict, Generic, Optional, TypeVar, cast, get_args
+from dataclasses import dataclass, field, fields, is_dataclass
+from enum import Enum
+from typing import Any, Dict, Generic, Mapping, Optional, TypeVar, cast, get_args
+
+from pydantic import BaseModel
 
 _ACTIVE_TOOL_CONTEXT: ContextVar[Dict[str, Any] | None] = ContextVar(
     "active_tool_context", default=None
@@ -91,6 +95,39 @@ class ToolTimeoutError(ToolError):
             error_code=504,
             details={"timeout_seconds": timeout_seconds},
         )
+
+
+def to_json_value(value: Any, path: str = "$") -> Any:
+    """Convert supported structured tool output into a detached JSON value."""
+
+    if isinstance(value, Enum):
+        return to_json_value(value.value, path)
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must contain only finite JSON numbers")
+        return value
+    if isinstance(value, BaseModel):
+        return to_json_value(value.model_dump(mode="json"), path)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: to_json_value(getattr(value, item.name), f"{path}.{item.name}")
+            for item in fields(value)
+        }
+    if isinstance(value, Mapping):
+        converted: Dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{path} mapping keys must be strings")
+            converted[key] = to_json_value(item, f"{path}.{key}")
+        return converted
+    if isinstance(value, (list, tuple)):
+        return [
+            to_json_value(item, f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(f"{path} contains unsupported JSON value {type(value).__name__}")
 
 
 @dataclass

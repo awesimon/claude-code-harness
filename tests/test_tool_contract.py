@@ -1,8 +1,26 @@
 import unittest
+from dataclasses import dataclass
+from enum import Enum
 
-import tools  # noqa: F401 - importing registers the primary tool catalog
+from pydantic import BaseModel
+
 import agents  # noqa: F401 - importing registers the canonical Agent tool
-from tools.base import ToolExecutionError, ToolRegistry, ToolResult
+import tools  # noqa: F401 - importing registers the primary tool catalog
+from tools.base import ToolExecutionError, ToolRegistry, ToolResult, to_json_value
+
+
+class OutputStatus(str, Enum):
+    COMPLETE = "complete"
+
+
+class ModelOutput(BaseModel):
+    count: int
+
+
+@dataclass
+class StructuredOutput:
+    status: OutputStatus
+    items: list[ModelOutput]
 
 
 class ToolResultContractTests(unittest.TestCase):
@@ -20,6 +38,25 @@ class ToolResultContractTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIs(result.error, error)
         self.assertEqual(result.message, "[Error 500] failed")
+
+    def test_structured_output_converts_recursively_to_json(self):
+        output = StructuredOutput(
+            status=OutputStatus.COMPLETE,
+            items=[ModelOutput(count=2)],
+        )
+
+        self.assertEqual(
+            to_json_value(output),
+            {"status": "complete", "items": [{"count": 2}]},
+        )
+
+    def test_unknown_output_object_is_rejected(self):
+        with self.assertRaisesRegex(TypeError, "unsupported JSON value object"):
+            to_json_value(object(), "tool result")
+
+    def test_non_finite_output_number_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "finite JSON numbers"):
+            to_json_value(float("nan"), "tool result")
 
 
 class ToolRegistryContractTests(unittest.TestCase):

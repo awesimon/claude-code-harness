@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -7,9 +8,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from models import Base
-from query_engine import QueryEngine
+from query_engine import QueryEngine, ToolObservation
 from services.llm_service import ChatCompletionResponse
 from state_core import EventType, SessionRuntimeFactory, SQLAlchemyStateStore, TaskMode
+from tools.base import ToolResult
+from tools.web_search_tool import WebSearchOutput
 
 
 class StaticLLM:
@@ -20,6 +23,72 @@ class StaticLLM:
             content="done",
             finish_reason="stop",
         )
+
+
+def tool_call_response() -> ChatCompletionResponse:
+    return ChatCompletionResponse(
+        id="tool-call",
+        model="test",
+        content="",
+        tool_calls=[
+            {
+                "id": "call-search",
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "arguments": '{"query": "python"}',
+                },
+            }
+        ],
+        finish_reason="tool_calls",
+    )
+
+
+def completed_response() -> ChatCompletionResponse:
+    return ChatCompletionResponse(
+        id="completed",
+        model="test",
+        content="done",
+        finish_reason="stop",
+    )
+
+
+class ToolCallingLLM:
+    def __init__(self) -> None:
+        self.responses = [tool_call_response(), completed_response()]
+        self.requests = []
+
+    async def chat_completion(self, request):
+        self.requests.append(request)
+        return self.responses.pop(0)
+
+
+class StreamingToolCallingLLM:
+    def __init__(self) -> None:
+        self.responses = [tool_call_response(), completed_response()]
+        self.requests = []
+
+    async def chat_completion_stream(self, request):
+        self.requests.append(request)
+        yield self.responses.pop(0)
+
+
+class WebSearchResultEngine(QueryEngine):
+    async def _execute_tools(self, tool_calls, conversation_id=None):
+        return [
+            ToolObservation(
+                tool_call_id=tool_calls[0].id,
+                name="web_search",
+                result=ToolResult.ok(
+                    WebSearchOutput(
+                        query="python",
+                        results=[{"title": "Python", "url": "https://python.org"}],
+                        duration_seconds=0.25,
+                    )
+                ),
+                execution_time=0.25,
+            )
+        ]
 
 
 @pytest.fixture
@@ -111,3 +180,48 @@ def test_resume_rebuilds_assistant_tool_call_and_result_order(
     assert turns[0].tool_calls[0].id == "call-1"
     assert turns[1].tool_observations[0].tool_call_id == "call-1"
     assert turns[1].tool_observations[0].result.data == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("llm_service", "chat_method"),
+    [
+        (ToolCallingLLM, "chat"),
+        (StreamingToolCallingLLM, "chat_stream"),
+    ],
+)
+async def test_web_search_result_is_json_at_transcript_boundary(
+    runtime_factory: SessionRuntimeFactory,
+    tmp_path: Path,
+    llm_service,
+    chat_method: str,
+) -> None:
+    llm = llm_service()
+    engine = WebSearchResultEngine(
+        llm_service=llm,
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("web-search-json")
+
+    events = [
+        event
+        async for event in getattr(engine, chat_method)("web-search-json", "search python")
+    ]
+
+    expected = {
+        "query": "python",
+        "results": [{"title": "Python", "url": "https://python.org"}],
+        "duration_seconds": 0.25,
+    }
+    emitted = next(event for event in events if event["type"] == "tool_result")
+    assert emitted["result"] == expected
+    persisted = next(
+        event
+        for event in engine._session_runtime("web-search-json").events()
+        if event.event_type is EventType.TOOL_RESULT
+    )
+    assert persisted.payload["result"] == expected
+    tool_message = next(message for message in llm.requests[1].messages if message.role == "tool")
+    assert json.loads(tool_message.content) == expected
