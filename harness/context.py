@@ -11,6 +11,7 @@ class PermissionMode(str, Enum):
     DEFAULT = "default"
     PLAN = "plan"
     BYPASS = "bypass"
+    AUTO = "auto"
 
 
 class CancellationToken:

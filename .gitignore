@@ -32,6 +32,9 @@ ENV/
 *.swo
 *~
 
+# Local Git worktrees
+.worktrees/
+
 # Environment variables
 .env
 .env.local

@@ -9,13 +9,8 @@ from typing import AsyncIterator
 
 from fastapi import HTTPException
 
-from models import SessionLocal, Conversation
-from query_engine import (
-    ConversationTurn,
-    QueryEngine,
-    ToolCall,
-    ToolObservation,
-)
+from models import Conversation, SessionLocal
+from query_engine import QueryEngine
 from schemas import MessageCreate
 from services.conversation_service import ConversationService
 from services.conversation_title import (
@@ -23,7 +18,7 @@ from services.conversation_title import (
     maybe_update_conversation_title_async,
 )
 from services.llm_service import LLMService
-from tools.base import ToolResult
+from state_core import migrate_legacy_session
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +27,7 @@ async def hydrate_query_engine_conversation(
     query_engine: QueryEngine,
     conversation_id: str,
 ) -> None:
-    """内存中无会话时从 DB 加载并灌入 query_engine。"""
+    """Resume durable state, migrating a legacy conversation once."""
     if query_engine.get_conversation(conversation_id):
         return
     db = SessionLocal()
@@ -40,50 +35,8 @@ async def hydrate_query_engine_conversation(
         service = ConversationService(db)
         conversation = service.get_conversation(conversation_id)
         if conversation:
-            query_engine.create_conversation(conversation_id)
-            messages = service.get_messages(conversation_id)
-            context = query_engine.get_conversation(conversation_id)
-            if context:
-                for msg in messages:
-                    tool_calls = None
-                    if msg.tool_calls:
-                        tool_calls = [
-                            ToolCall(
-                                id=tc.get("id", ""),
-                                name=tc.get("name", ""),
-                                arguments=tc.get("arguments", {}),
-                            )
-                            for tc in msg.tool_calls
-                        ]
-
-                    tool_observations = None
-                    if msg.tool_results:
-                        tool_observations = []
-                        for tr in msg.tool_results:
-                            result_data = tr.get("result", {})
-                            result = ToolResult(
-                                success=tr.get("success", False),
-                                data=result_data,
-                                message="",
-                                error=None,
-                            )
-                            tool_observations.append(
-                                ToolObservation(
-                                    tool_call_id=tr.get("tool_call_id", ""),
-                                    name=tr.get("name", ""),
-                                    result=result,
-                                    execution_time=tr.get("execution_time", 0),
-                                )
-                            )
-
-                    context.messages.append(
-                        ConversationTurn(
-                            role=msg.role,
-                            content=msg.content,
-                            tool_calls=tool_calls,
-                            tool_observations=tool_observations,
-                        )
-                    )
+            migrate_legacy_session(conversation_id, SessionLocal)
+            query_engine.resume_conversation(conversation_id)
         else:
             raise HTTPException(
                 status_code=404, detail=f"对话 {conversation_id} 不存在"
@@ -115,6 +68,7 @@ async def iter_chat_sse(
         svc_user.add_message(
             conversation_id,
             MessageCreate(role="user", content=user_message),
+            project_only=True,
         )
     except Exception as e:
         logger.error("Failed to save user message: %s", e)
@@ -149,6 +103,7 @@ async def iter_chat_sse(
                     tool_calls=current_tool_calls if current_tool_calls else None,
                     tool_results=current_tool_results if current_tool_results else None,
                 ),
+                project_only=True,
             )
             logger.info(
                 "Saved pre-tool assistant: content_len=%s tools=%s results=%s",
@@ -192,6 +147,7 @@ async def iter_chat_sse(
                             tool_calls=None,
                             tool_results=None,
                         ),
+                        project_only=True,
                     )
                     assistant_message_saved = True
                     logger.info(
@@ -247,6 +203,7 @@ async def iter_chat_sse(
                     tool_calls=None,
                     tool_results=None,
                 ),
+                project_only=True,
             )
             logger.info(
                 "Saved assistant message at end with content length: %s",

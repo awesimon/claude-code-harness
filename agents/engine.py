@@ -4,26 +4,26 @@ Agent 执行引擎
 对齐 Claude Code 的 runAgent.ts
 """
 import asyncio
+import json
 import logging
 import uuid
-import json
-from typing import Optional, Dict, Any, List, Callable, AsyncIterator
 from datetime import datetime
 from pathlib import Path
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
-from agents.types import (
-    AgentDefinition,
-    AgentContext,
-    AgentToolResult,
-    AgentExecutionConfig,
-    AgentError,
-    AgentExecutionError,
-)
 from agents.built_in import get_agent_by_type
+from agents.types import (
+    AgentContext,
+    AgentDefinition,
+    AgentError,
+    AgentExecutionConfig,
+    AgentExecutionError,
+    AgentToolResult,
+)
+from harness import CancellationToken, PermissionMode, RuntimeContext, ToolRuntime
+from services import ChatCompletionRequest, LLMService, Message
 from tools import ToolRegistry
 from tools.base import Tool, canonical_tool_name
-from harness import CancellationToken, PermissionMode, RuntimeContext, ToolRuntime
-from services import LLMService, Message, ChatCompletionRequest
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,12 @@ class AgentExecutor:
         self.cancellation = CancellationToken(parent=self.config.parent_cancellation)
         self._termination_reason = "max_turns"
         self._usage: Dict[str, int] = {}
+        if self.config.session_runtime is not None:
+            self.config.session_runtime.update_agent_lifecycle(
+                self.agent_id,
+                "running",
+                agentType=self.agent_definition.agent_type,
+            )
 
     def _generate_agent_id(self) -> str:
         """生成 Agent ID"""
@@ -240,13 +246,17 @@ Output format:
                 elif configured_mode and configured_mode.value == "plan":
                     permission_mode = PermissionMode.PLAN
                 runtime_context = RuntimeContext(
-                    session_id=self.agent_id,
+                    session_id=self.parent_session_id or self.agent_id,
                     workspace_root=(self.config.workspace_root or Path.cwd()).resolve(),
                     permission_mode=permission_mode,
                     approval_callback=self.config.approval_callback,
                     cancellation=self.cancellation,
                     tool_timeout=self.config.tool_timeout,
-                    metadata={"agent_context": self.context},
+                    metadata={
+                        "agent_context": self.context,
+                        "session_runtime": self.config.session_runtime,
+                        "agent_id": self.agent_id,
+                    },
                 )
                 execution = await self.tool_runtime.execute(
                     tool_name,
@@ -346,14 +356,26 @@ Output format:
             )
 
             logger.info(f"Agent {self.agent_id} completed in {duration_ms}ms")
+            if self.config.session_runtime is not None:
+                self.config.session_runtime.update_agent_lifecycle(
+                    self.agent_id,
+                    self.context.status,
+                    terminationReason=self._termination_reason,
+                )
             return result
 
         except asyncio.CancelledError:
             self.context.status = "killed"
             self.context.completed_at = datetime.now()
+            if self.config.session_runtime is not None:
+                self.config.session_runtime.update_agent_lifecycle(self.agent_id, "interrupted")
             raise
         except Exception as e:
             self.context.status = "failed"
+            if self.config.session_runtime is not None:
+                self.config.session_runtime.update_agent_lifecycle(
+                    self.agent_id, "failed", error=str(e)
+                )
             logger.error(f"Agent {self.agent_id} failed: {e}")
             raise AgentExecutionError(f"Agent execution failed: {e}")
 

@@ -156,6 +156,9 @@ class TeamMember(Base):
 
 def init_db():
     """Initialize the database, creating all tables"""
+    # Register state-core tables only when database initialization is requested.
+    import state_core.sqlalchemy_store  # noqa: F401
+
     Base.metadata.create_all(bind=engine)
 
 

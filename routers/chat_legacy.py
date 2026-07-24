@@ -37,6 +37,17 @@ async def create_conversation():
     )
 
 
+@router.post("/chat/{conversation_id}/resume")
+async def resume_conversation(conversation_id: str):
+    qe = _qe()
+    await hydrate_query_engine_conversation(qe, conversation_id)
+    return APIResponse(
+        success=True,
+        data={"conversation_id": conversation_id},
+        message="对话恢复成功",
+    )
+
+
 @router.post("/chat")
 async def chat(request: LegacyChatRequest):
     qe = _qe()
