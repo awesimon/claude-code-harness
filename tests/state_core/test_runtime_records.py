@@ -419,6 +419,46 @@ def test_concurrent_legacy_trace_schema_initialization_is_versioned(tmp_path: Pa
         }
 
 
+def test_legacy_trace_migration_truncates_fractional_milliseconds(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'fractional-legacy.db'}")
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE runtime_trace_spans ("
+                "span_id VARCHAR PRIMARY KEY, root_session_id VARCHAR NOT NULL, "
+                "agent_id VARCHAR, parent_span_id VARCHAR, kind VARCHAR NOT NULL, "
+                "name VARCHAR NOT NULL, status VARCHAR NOT NULL, revision INTEGER NOT NULL, "
+                "started_at DATETIME NOT NULL, finished_at DATETIME, usage JSON NOT NULL, "
+                "error_json JSON, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO runtime_trace_spans "
+                "(span_id, root_session_id, agent_id, parent_span_id, kind, name, status, revision, "
+                "started_at, finished_at, usage, error_json, created_at, updated_at) "
+                "VALUES (:span_id, 'root-1', NULL, NULL, 'tool', :span_id, 'completed', 0, "
+                "'2026-07-24 00:00:00.000000', :finished_at, '{}', NULL, "
+                "'2026-07-24 00:00:00.000000', :finished_at)"
+            ),
+            [
+                {"span_id": "fraction-600us", "finished_at": "2026-07-24 00:00:00.000600"},
+                {"span_id": "fraction-1600us", "finished_at": "2026-07-24 00:00:00.001600"},
+            ],
+        )
+
+    store = SQLAlchemyStateStore(sessionmaker(bind=engine, expire_on_commit=False))
+    with engine.connect() as connection:
+        raw_durations = dict(
+            connection.execute(
+                text("SELECT span_id, duration_ms FROM runtime_trace_spans ORDER BY span_id")
+            ).all()
+        )
+    assert raw_durations == {"fraction-1600us": 1, "fraction-600us": 0}
+    assert store.traces.get("fraction-600us").duration_ms == 0  # type: ignore[union-attr]
+    assert store.traces.get("fraction-1600us").duration_ms == 1  # type: ignore[union-attr]
+
+
 def test_connection_bound_session_factory_runs_runtime_migration(tmp_path: Path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'connection-bound.db'}")
     Base.metadata.create_all(engine)
