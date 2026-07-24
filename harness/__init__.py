@@ -15,6 +15,16 @@ from .hooks import (
     PostHookResult,
     PreHookResult,
 )
+from .skills import (
+    SkillChangedError,
+    SkillError,
+    SkillIndexEntry,
+    SkillNotFound,
+    SkillPathError,
+    SkillResolver,
+    SkillResource,
+    SkillSnapshot,
+)
 
 __all__ = [
     "CancellationToken",
@@ -35,6 +45,14 @@ __all__ = [
     "RuntimeContext",
     "SessionHarness",
     "SessionHarnessFactory",
+    "SkillChangedError",
+    "SkillError",
+    "SkillIndexEntry",
+    "SkillNotFound",
+    "SkillPathError",
+    "SkillResolver",
+    "SkillResource",
+    "SkillSnapshot",
     "TerminationReason",
     "ToolExecution",
     "ToolRuntime",

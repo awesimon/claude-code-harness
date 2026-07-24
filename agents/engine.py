@@ -59,7 +59,11 @@ class AgentExecutor:
             llm_service=llm_service,
         )
 
-    def _resolve_tools(self, child_harness: SessionHarness) -> list[Tool]:
+    def _resolve_tools(
+        self,
+        child_harness: SessionHarness,
+        skill_snapshots: tuple[Any, ...] = (),
+    ) -> list[Tool]:
         registry = child_harness.tool_runtime.registry
         all_tools = [
             tool
@@ -85,6 +89,17 @@ class AgentExecutor:
             resolved = [
                 tool for tool in resolved if self.tool_name(tool, registry) not in denied
             ]
+        skill_allowed = {
+            name
+            for snapshot in skill_snapshots
+            for name in snapshot.allowed_tools
+        }
+        if skill_allowed:
+            resolved = [
+                tool
+                for tool in resolved
+                if self.tool_name(tool, registry) in skill_allowed
+            ]
         context = child_harness.tool_runtime.tool_context(
             child_harness.runtime_context
         )
@@ -94,23 +109,32 @@ class AgentExecutor:
     def tool_name(tool: Tool, registry: Any = ToolRegistry) -> str:
         return registry.resolve_name(tool.name) or canonical_tool_name(tool.name)
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, skill_snapshots: tuple[Any, ...] = ()) -> str:
         if self.agent_definition.get_system_prompt:
-            return self.agent_definition.get_system_prompt()
-        return (
-            "You are an agent for Claude Code.\n"
-            f"Agent Type: {self.agent_definition.agent_type}\n\n"
-            f"{self.agent_definition.when_to_use}\n\n"
-            "Complete the task and return a concise factual report."
+            base = self.agent_definition.get_system_prompt()
+        else:
+            base = (
+                "You are an agent for Claude Code.\n"
+                f"Agent Type: {self.agent_definition.agent_type}\n\n"
+                f"{self.agent_definition.when_to_use}\n\n"
+                "Complete the task and return a concise factual report."
+            )
+        if not skill_snapshots:
+            return base
+        instructions = "\n\n".join(
+            snapshot.prompt("${CLAUDE_SESSION_ID}") for snapshot in skill_snapshots
         )
+        return f"{base}\n\n{instructions}"
 
     def _available_tools(
-        self, child_harness: SessionHarness
+        self,
+        child_harness: SessionHarness,
+        skill_snapshots: tuple[Any, ...] = (),
     ) -> tuple[dict[str, Tool], list[dict[str, Any]]]:
         registry = child_harness.tool_runtime.registry
         available: dict[str, Tool] = {}
         schemas: list[dict[str, Any]] = []
-        for tool in self._resolve_tools(child_harness):
+        for tool in self._resolve_tools(child_harness, skill_snapshots):
             name = self.tool_name(tool, registry)
             spec = registry.get_spec(name)
             if spec is None:
@@ -132,7 +156,14 @@ class AgentExecutor:
             raise asyncio.CancelledError
 
         registry = child_harness.tool_runtime.registry
-        llm_messages = [Message(role="system", content=self._build_system_prompt())]
+        skill_snapshots = tuple(
+            child_harness.skills.resolve(name)
+            for name in (self.agent_definition.skills or ())
+        )
+        system_prompt = self._build_system_prompt(skill_snapshots).replace(
+            "${CLAUDE_SESSION_ID}", child_harness.session_id
+        )
+        llm_messages = [Message(role="system", content=system_prompt)]
         if self.agent_definition.initial_prompt:
             llm_messages.append(
                 Message(role="user", content=self.agent_definition.initial_prompt)
@@ -147,7 +178,7 @@ class AgentExecutor:
         for _turn in range(max_turns):
             if cancellation.cancelled:
                 raise asyncio.CancelledError
-            _, schemas = self._available_tools(child_harness)
+            _, schemas = self._available_tools(child_harness, skill_snapshots)
             model = record.definition_snapshot.get("model") or self.config.model
             if model == "inherit":
                 model = self.config.model
@@ -237,7 +268,9 @@ class AgentExecutor:
                             "Tool call arguments must decode to a JSON object"
                         )
 
-                    available, _ = self._available_tools(child_harness)
+                    available, _ = self._available_tools(
+                        child_harness, skill_snapshots
+                    )
                     if execution_name not in available:
                         result_data: Any = {
                             "error": f"Tool {tool_name!r} is not available"

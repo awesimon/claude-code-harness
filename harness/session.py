@@ -226,6 +226,24 @@ class SessionHarness:
         )
 
     @property
+    def skills(self):
+        from .skills import SkillResolver
+
+        configured = self.runtime_context.metadata.get("skills_dir")
+        skills_dir = (
+            _canonical_path(configured)
+            if isinstance(configured, (str, Path))
+            else self.effective_cwd / ".claude" / "skills"
+        )
+        return SkillResolver(
+            skills_dir,
+            metadata_repository=self.store.metadata,
+            root_session_id=self.root_session_id,
+            agent_id=self.agent_id,
+            hook_runtime=self.hooks,
+        )
+
+    @property
     def effective_cwd(self) -> Path:
         assert self.runtime_context.workspace_root is not None
         return _canonical_path(self.runtime_context.workspace_root)

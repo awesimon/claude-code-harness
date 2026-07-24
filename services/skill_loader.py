@@ -6,10 +6,9 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional
 from datetime import datetime
 import asyncio
-import urllib.parse
 
 from models.skill import SkillDefinition, SkillMetadata
 from utils.frontmatter_parser import parse_frontmatter, extract_frontmatter_field

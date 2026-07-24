@@ -308,6 +308,20 @@ class HookRuntime:
         self._persist_definitions(self._definitions)
         return hook
 
+    def register(self, hook: HookDefinition) -> HookDefinition:
+        """Register a definition once by stable ID and persist the new snapshot."""
+
+        existing = next(
+            (item for item in self._definitions if item.hook_id == hook.hook_id), None
+        )
+        if existing is not None:
+            if existing != hook:
+                raise ValueError(f"hook_id {hook.hook_id!r} is already registered")
+            return existing
+        self._definitions = (*self._definitions, hook)
+        self._persist_definitions(self._definitions)
+        return hook
+
     def remove(self, index: int) -> HookDefinition:
         if isinstance(index, bool) or not 0 <= index < len(self._definitions):
             raise IndexError("hook index is out of range")
