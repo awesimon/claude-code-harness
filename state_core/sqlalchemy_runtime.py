@@ -285,9 +285,12 @@ class SQLAlchemyAgentRepository:
                 assert persisted is not None
                 return self._record(persisted)
         assert lost_update
-        current = self.get(agent_id)
+        current_record = self.get(agent_id)
         raise RuntimeRecordRevisionConflict(
-            "agent", agent_id, expected_revision, current.revision if current is not None else None
+            "agent",
+            agent_id,
+            expected_revision,
+            current_record.revision if current_record is not None else None,
         )
 
     def reconcile(self, root_session_id: str, live_agent_ids: set[str]) -> builtins.list[AgentRecord]:
