@@ -144,6 +144,12 @@ class SessionHarness:
     _root_workspace: Path | str | None = field(default=None, repr=False)
     _is_child: bool = field(default=False, repr=False)
     _capability_token: object | None = field(default=None, repr=False)
+    _parent_harness: "SessionHarness | None" = field(
+        default=None, repr=False, compare=False
+    )
+    _services: dict[str, Any] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         input_context = self.runtime_context
@@ -264,6 +270,17 @@ class SessionHarness:
         )
 
     @property
+    def mcp(self):
+        from .mcp import MCPConnectionManager
+
+        manager = self._services.get("mcp")
+        if manager is None:
+            parent = self._parent_harness.mcp if self._parent_harness is not None else None
+            manager = MCPConnectionManager(self, parent=parent)
+            self._services["mcp"] = manager
+        return manager
+
+    @property
     def effective_cwd(self) -> Path:
         assert self.runtime_context.workspace_root is not None
         return _canonical_path(self.runtime_context.workspace_root)
@@ -318,6 +335,7 @@ class SessionHarness:
             _root_workspace=self._root_workspace,
             _is_child=True,
             _capability_token=_CAPABILITY_TOKEN,
+            _parent_harness=self,
         )
 
 

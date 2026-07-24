@@ -34,6 +34,17 @@ from .skills import (
 )
 from .budget import BudgetController, BudgetExhausted, BudgetKind, BudgetReservation
 from .tracing import TraceController, TraceSpan
+from .mcp import (
+    MCPConnectionManager,
+    MCPError,
+    MCPResourceContent,
+    MCPResourceDefinition,
+    MCPServerConfig,
+    MCPServerRecord,
+    MCPServerStatus,
+    MCPToolDefinition,
+    MCPTransport,
+)
 
 __all__ = [
     "CancellationToken",
@@ -54,6 +65,15 @@ __all__ = [
     "HookEvent",
     "HookFailure",
     "HookRuntime",
+    "MCPConnectionManager",
+    "MCPError",
+    "MCPResourceContent",
+    "MCPResourceDefinition",
+    "MCPServerConfig",
+    "MCPServerRecord",
+    "MCPServerStatus",
+    "MCPToolDefinition",
+    "MCPTransport",
     "PermissionDecision",
     "PermissionMode",
     "PermissionPolicy",

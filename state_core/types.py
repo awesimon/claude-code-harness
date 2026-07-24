@@ -52,6 +52,9 @@ class EventType(str, Enum):
     COMPACTION_STARTED = "compaction_started"
     COMPACTION_BOUNDARY = "compaction_boundary"
     COMPACTION_FAILED = "compaction_failed"
+    MCP_CONNECTED = "mcp_connected"
+    MCP_DISCONNECTED = "mcp_disconnected"
+    MCP_CALL = "mcp_call"
 
 
 class StateCoreError(Exception):

@@ -1,7 +1,9 @@
-from typing import Any, Dict, Optional
-from dataclasses import dataclass
+from __future__ import annotations
 
-from .base import Tool, ToolResult, ToolError, register_tool
+from dataclasses import dataclass
+from typing import Any, Dict
+
+from .base import Tool, ToolResult, ToolValidationError, register_tool
 from .mcp_tool import get_mcp_manager
 
 
@@ -12,11 +14,26 @@ class McpAuthInput:
 
 @register_tool
 class McpAuthTool(Tool[McpAuthInput, Dict[str, Any]]):
-    """Authenticate with an MCP server."""
-
     name = "mcp_authenticate"
-    description = "Start OAuth flow for an MCP server that requires authentication"
+    description = "Return authentication status for an MCP server"
     version = "1.0"
+
+    async def validate(self, input_data: McpAuthInput):
+        if not input_data.server.strip():
+            return ToolValidationError("Server name is required")
+        return None
+
+    async def execute(self, input_data: McpAuthInput) -> ToolResult:
+        record = get_mcp_manager().status(input_data.server.strip())
+        if record is None:
+            return ToolResult.fail(ToolValidationError(f"MCP server not found: {input_data.server}"))
+        data = {
+            "status": "connected" if record.status.value == "connected" else "unavailable",
+            "server": record.name,
+            "authUrl": None,
+            "message": "OAuth is not required or is managed by the configured HTTP client",
+        }
+        return ToolResult.ok(data=data, message=data["message"])
 
     def get_schema(self) -> Dict[str, Any]:
         return {
@@ -25,30 +42,7 @@ class McpAuthTool(Tool[McpAuthInput, Dict[str, Any]]):
             "version": self.version,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "server": {
-                        "type": "string",
-                        "description": "MCP server name to authenticate"
-                    }
-                },
-                "required": ["server"]
-            }
-        }
-
-    async def validate(self, input_data: McpAuthInput) -> Optional[ToolError]:
-        if not input_data.server:
-            return ToolError("Server name is required", tool_name=self.name)
-        return None
-
-    async def execute(self, input_data: McpAuthInput) -> ToolResult:
-        # Mock implementation - would start OAuth flow in real implementation
-        return ToolResult(
-            success=True,
-            data={
-                "status": "auth_url",
-                "server": input_data.server,
-                "authUrl": f"https://example.com/oauth/authorize?client_id={input_data.server}",
-                "message": f"Please open the authorization URL to authenticate with {input_data.server}"
+                "properties": {"server": {"type": "string", "description": "MCP server name"}},
+                "required": ["server"],
             },
-            message=f"Authentication started for {input_data.server}. Please complete the OAuth flow."
-        )
+        }
