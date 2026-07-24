@@ -192,10 +192,41 @@ class ToolCall:
     @classmethod
     def from_openai(cls, tool_call_dict: Dict) -> "ToolCall":
         """从OpenAI格式创建"""
+        function = tool_call_dict["function"]
+        raw_arguments = function.get("arguments")
+        arguments: Dict[str, Any]
+        if isinstance(raw_arguments, dict):
+            arguments = dict(raw_arguments)
+        elif not raw_arguments:
+            arguments = {}
+        else:
+            try:
+                parsed = json.loads(raw_arguments)
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning(
+                    "Malformed tool input JSON; deferring to tool validation: "
+                    "tool=%s call_id=%s input_len=%s error=%s",
+                    function.get("name", ""),
+                    tool_call_dict.get("id", ""),
+                    len(raw_arguments) if isinstance(raw_arguments, str) else None,
+                    exc,
+                )
+                parsed = {}
+            if isinstance(parsed, dict):
+                arguments = parsed
+            else:
+                logger.warning(
+                    "Tool input is not a JSON object; deferring to tool validation: "
+                    "tool=%s call_id=%s input_type=%s",
+                    function.get("name", ""),
+                    tool_call_dict.get("id", ""),
+                    type(parsed).__name__,
+                )
+                arguments = {}
         return cls(
             id=tool_call_dict["id"],
-            name=tool_call_dict["function"]["name"],
-            arguments=json.loads(tool_call_dict["function"]["arguments"]),
+            name=function["name"],
+            arguments=arguments,
         )
 
 

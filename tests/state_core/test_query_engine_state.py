@@ -73,6 +73,18 @@ class StreamingToolCallingLLM:
         yield self.responses.pop(0)
 
 
+class MalformedStreamingToolCallingLLM:
+    def __init__(self) -> None:
+        malformed = tool_call_response()
+        malformed.tool_calls[0]["function"]["arguments"] = '{"query": "unterminated'
+        self.responses = [malformed, completed_response()]
+        self.requests = []
+
+    async def chat_completion_stream(self, request):
+        self.requests.append(request)
+        yield self.responses.pop(0)
+
+
 class WebSearchResultEngine(QueryEngine):
     async def _execute_tools(self, tool_calls, conversation_id=None):
         return [
@@ -225,3 +237,40 @@ async def test_web_search_result_is_json_at_transcript_boundary(
     assert persisted.payload["result"] == expected
     tool_message = next(message for message in llm.requests[1].messages if message.role == "tool")
     assert json.loads(tool_message.content) == expected
+
+
+@pytest.mark.asyncio
+async def test_malformed_streaming_tool_input_enters_tool_validation_loop(
+    runtime_factory: SessionRuntimeFactory,
+    tmp_path: Path,
+) -> None:
+    llm = MalformedStreamingToolCallingLLM()
+    engine = QueryEngine(
+        llm_service=llm,
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("malformed-tool-input")
+
+    events = [
+        event
+        async for event in engine.chat_stream(
+            "malformed-tool-input",
+            "search python",
+        )
+    ]
+
+    assert not any(event["type"] == "error" for event in events)
+    failed_result = next(event for event in events if event["type"] == "tool_result")
+    assert failed_result["success"] is False
+    assert "Invalid input data" in failed_result["result"]
+    assert events[-1]["content"] == "done"
+    assert len(llm.requests) == 2
+
+    tool_call = next(
+        event
+        for event in engine._session_runtime("malformed-tool-input").events()
+        if event.event_type is EventType.TOOL_CALL
+    )
+    assert tool_call.payload["input"] == {}
