@@ -1,5 +1,7 @@
 import json
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
+from inspect import getdoc
 from typing import get_type_hints
 
 import pytest
@@ -10,6 +12,7 @@ from state_core import (
     EventType,
     InvalidTransition,
     NewTask,
+    PendingEventBatch,
     PendingSessionEvent,
     Plan,
     PlanState,
@@ -467,5 +470,120 @@ def test_commit_result_round_trip_returns_state_and_assigned_events():
 def test_state_repository_commit_contract_uses_pending_and_assigned_events():
     hints = get_type_hints(StateRepository.commit)
 
-    assert hints["events"] == list[PendingSessionEvent]
+    assert hints["batch"] is PendingEventBatch
     assert hints["return"] is CommitResult
+
+
+def _pending_event(
+    sequence,
+    *,
+    session_id="session-batch",
+    parent_sequence=None,
+    parent_event_id=None,
+):
+    return PendingSessionEvent(
+        sequence=sequence,
+        session_id=session_id,
+        event_type=EventType.TOOL_RESULT,
+        parent_sequence=parent_sequence,
+        parent_event_id=parent_event_id,
+    )
+
+
+def test_pending_event_batch_copies_events_to_immutable_tuple():
+    event = _pending_event(0)
+    source = [event]
+
+    batch = PendingEventBatch("session-batch", source)
+    source.append(_pending_event(1))
+
+    assert batch.events == (event,)
+    assert isinstance(batch.events, tuple)
+    with pytest.raises(FrozenInstanceError):
+        batch.events = ()
+    assert PendingEventBatch.from_dict(batch.to_dict()) == batch
+
+
+@pytest.mark.parametrize(
+    "sequences",
+    [
+        [5],
+        [0, 0],
+        [0, 2],
+        [1, 0],
+    ],
+)
+def test_pending_event_batch_rejects_non_contiguous_ordered_sequences(sequences):
+    events = [_pending_event(sequence) for sequence in sequences]
+    if sequences == [5]:
+        events[0] = _pending_event(5, parent_sequence=4)
+
+    with pytest.raises(ValueError, match="sequence"):
+        PendingEventBatch("session-batch", events)
+
+
+def test_pending_event_batch_rejects_mixed_sessions():
+    with pytest.raises(ValueError, match="sessionId"):
+        PendingEventBatch(
+            "session-batch",
+            [
+                _pending_event(0),
+                _pending_event(1, session_id="other-session"),
+            ],
+        )
+
+
+def test_pending_event_batch_rejects_state_session_mismatch():
+    batch = PendingEventBatch("session-batch", [_pending_event(0)])
+
+    with pytest.raises(ValueError, match="state sessionId"):
+        batch.validate_state(SessionState.new("other-session"))
+
+
+def test_pending_event_batch_rejects_missing_persisted_parent():
+    batch = PendingEventBatch(
+        "session-batch",
+        [_pending_event(0, parent_event_id=7)],
+    )
+
+    with pytest.raises(ValueError, match="missing persisted parent"):
+        batch.validate_existing_parents({})
+
+
+def test_pending_event_batch_rejects_cross_session_persisted_parent():
+    batch = PendingEventBatch(
+        "session-batch",
+        [_pending_event(0, parent_event_id=7)],
+    )
+
+    with pytest.raises(ValueError, match="same session"):
+        batch.validate_existing_parents({7: "other-session"})
+
+
+def test_pending_event_batch_accepts_same_session_persisted_parent():
+    batch = PendingEventBatch(
+        "session-batch",
+        [_pending_event(0, parent_event_id=7)],
+    )
+
+    batch.validate_existing_parents({7: "session-batch"})
+
+
+def test_pending_event_batch_accepts_same_batch_backward_link():
+    batch = PendingEventBatch(
+        "session-batch",
+        [
+            _pending_event(0),
+            _pending_event(1, parent_sequence=0),
+        ],
+    )
+
+    assert batch.events[1].parent_sequence == batch.events[0].sequence
+
+
+def test_repository_commit_documents_required_batch_validation():
+    doc = getdoc(StateRepository.commit)
+
+    assert doc is not None
+    assert "validate_state" in doc
+    assert "validate_existing_parents" in doc

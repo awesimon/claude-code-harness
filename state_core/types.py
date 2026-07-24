@@ -511,7 +511,7 @@ class SessionState:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class PendingSessionEvent:
     """An event awaiting ID assignment within one atomic repository commit.
 
@@ -567,6 +567,88 @@ class PendingSessionEvent:
             ),
             parent_sequence=_require_optional_int(
                 wire["parentSequence"], "parentSequence", minimum=0
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PendingEventBatch:
+    """Immutable, single-session pending events for one atomic commit.
+
+    Event sequences are their zero-based tuple indexes. A pending event chooses
+    exactly one parent source: ``parent_sequence`` for an earlier event in this
+    batch, or ``parent_event_id`` for an event already persisted in the same
+    session. Repositories validate the latter after loading parent ownership.
+    """
+
+    session_id: str
+    events: tuple[PendingSessionEvent, ...]
+
+    def __post_init__(self) -> None:
+        session_id = _require_str(self.session_id, "sessionId")
+        try:
+            events = tuple(self.events)
+        except TypeError as exc:
+            raise TypeError("events must be a sequence") from exc
+        object.__setattr__(self, "session_id", session_id)
+        object.__setattr__(self, "events", events)
+        for index, event in enumerate(events):
+            if not isinstance(event, PendingSessionEvent):
+                raise TypeError(f"events[{index}] must be a PendingSessionEvent")
+            if event.session_id != session_id:
+                raise ValueError(f"events[{index}] sessionId must match batch sessionId")
+            if event.sequence != index:
+                raise ValueError(f"events[{index}] sequence must equal its batch index")
+            if event.parent_sequence is not None:
+                if event.parent_sequence >= index:
+                    raise ValueError(
+                        f"events[{index}] parentSequence must reference an earlier event"
+                    )
+                if events[event.parent_sequence].sequence != event.parent_sequence:
+                    raise ValueError(f"events[{index}] parentSequence does not resolve")
+
+    def validate_state(self, state: SessionState) -> None:
+        """Reject a commit state owned by a different session."""
+
+        if not isinstance(state, SessionState):
+            raise TypeError("state must be a SessionState")
+        if state.session_id != self.session_id:
+            raise ValueError("state sessionId must match batch sessionId")
+
+    def validate_existing_parents(self, parent_sessions: Mapping[int, str]) -> None:
+        """Validate loaded persisted-parent IDs and their session ownership."""
+
+        if not isinstance(parent_sessions, Mapping):
+            raise TypeError("parent_sessions must be a mapping")
+        for index, event in enumerate(self.events):
+            parent_id = event.parent_event_id
+            if parent_id is None:
+                continue
+            if parent_id not in parent_sessions:
+                raise ValueError(f"events[{index}] references missing persisted parent {parent_id}")
+            parent_session_id = parent_sessions[parent_id]
+            if type(parent_session_id) is not str:
+                raise TypeError(f"persisted parent {parent_id} sessionId must be a string")
+            if parent_session_id != self.session_id:
+                raise ValueError(f"persisted parent {parent_id} must belong to the same session")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sessionId": self.session_id,
+            "events": [event.to_dict() for event in self.events],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PendingEventBatch:
+        wire = _require_mapping(value, "pendingEventBatch")
+        raw_events = wire["events"]
+        if not isinstance(raw_events, (list, tuple)):
+            raise TypeError("events must be a sequence")
+        return cls(
+            session_id=_require_str(wire["sessionId"], "sessionId"),
+            events=tuple(
+                PendingSessionEvent.from_dict(_require_mapping(event, f"events[{index}]"))
+                for index, event in enumerate(raw_events)
             ),
         )
 

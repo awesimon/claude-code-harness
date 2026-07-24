@@ -8,7 +8,7 @@ from .types import (
     ClaimResult,
     CommitResult,
     NewTask,
-    PendingSessionEvent,
+    PendingEventBatch,
     SessionEvent,
     SessionSnapshot,
     SessionState,
@@ -28,9 +28,17 @@ class StateRepository(Protocol):
     def commit(
         self,
         state: SessionState,
-        events: list[PendingSessionEvent],
+        batch: PendingEventBatch,
         expected_revision: int,
-    ) -> CommitResult: ...
+    ) -> CommitResult:
+        """Atomically persist state and assign IDs to its pending event batch.
+
+        Implementations must call ``batch.validate_state(state)`` first. After
+        loading every referenced persisted parent and its owning session, they
+        must call ``batch.validate_existing_parents(parent_sessions)`` before
+        writing state, assigning event IDs, or committing the transaction.
+        """
+        ...
 
     def list_events(self, session_id: str, after_id: int = 0) -> list[SessionEvent]: ...
 
