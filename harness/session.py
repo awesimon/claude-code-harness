@@ -281,9 +281,28 @@ class SessionHarness:
         return manager
 
     @property
+    def worktrees(self):
+        from .worktrees import WorktreeManager
+
+        manager = self._services.get("worktrees")
+        if manager is None:
+            manager = WorktreeManager(self)
+            self._services["worktrees"] = manager
+        return manager
+
+    @property
     def effective_cwd(self) -> Path:
+        configured = self._services.get("effective_cwd")
+        if configured is not None:
+            return _canonical_path(configured)
         assert self.runtime_context.workspace_root is not None
         return _canonical_path(self.runtime_context.workspace_root)
+
+    def _set_effective_cwd(self, value: Path | str) -> None:
+        candidate = _canonical_path(value)
+        if not any(_is_within(candidate, root) for root in self.allowed_workspaces):
+            raise HarnessScopeError("effective cwd is outside the allowed workspace policy")
+        self._services["effective_cwd"] = candidate
 
     def child(
         self,
@@ -414,6 +433,7 @@ class SessionHarnessFactory:
         self._agent_schedulers[session_id] = scheduler
         scheduler.reconcile()
         resumed.traces.interrupt_open()
+        resumed.worktrees.restore_active()
         return resumed
 
     def _build_config(

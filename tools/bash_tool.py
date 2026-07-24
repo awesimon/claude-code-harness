@@ -15,7 +15,10 @@ from .base import (
     ToolResult,
     ToolTimeoutError,
     ToolValidationError,
+    effective_tool_cwd,
+    get_active_tool_context,
     register_tool,
+    resolve_tool_path,
 )
 
 
@@ -103,6 +106,11 @@ class BashTool(Tool[BashInput, Dict[str, Any]]):
     async def execute(self, input_data: BashInput) -> ToolResult:
         command = input_data.command.strip()
         timeout = input_data.timeout or 120.0
+        working_dir = (
+            resolve_tool_path(input_data.working_dir)
+            if input_data.working_dir
+            else effective_tool_cwd()
+        )
 
         try:
             # 创建子进程
@@ -110,7 +118,7 @@ class BashTool(Tool[BashInput, Dict[str, Any]]):
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=input_data.working_dir,
+                cwd=str(working_dir),
                 env=input_data.env,
             )
 
@@ -212,7 +220,7 @@ class BashBatchTool(Tool[BashBatchInput, List[Dict[str, Any]]]):
                 description=f"批量命令 [{i+1}/{len(input_data.commands)}]"
             )
 
-            result = await bash_tool.run(bash_input)
+            result = await bash_tool.run(bash_input, get_active_tool_context())
             results.append({
                 "command": command,
                 "success": result.success,

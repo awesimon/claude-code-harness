@@ -10,7 +10,15 @@ import asyncio
 import fnmatch
 import re
 
-from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
+from .base import (
+    Tool,
+    ToolResult,
+    ToolError,
+    ToolExecutionError,
+    ToolValidationError,
+    register_tool,
+    resolve_tool_path,
+)
 
 
 @dataclass
@@ -73,7 +81,7 @@ class GlobTool(Tool[GlobInput, List[str]]):
         return None
 
     async def execute(self, input_data: GlobInput) -> ToolResult:
-        search_path = Path(input_data.path or ".").resolve()
+        search_path = resolve_tool_path(input_data.path or ".")
         exclude_patterns = input_data.exclude or []
 
         try:
@@ -107,7 +115,6 @@ class GlobTool(Tool[GlobInput, List[str]]):
         # 如果pattern包含/，说明是相对路径模式
         if '/' in pattern:
             # 在指定路径下搜索
-            full_pattern = search_path / pattern
             for path in search_path.rglob(pattern.split('/')[-1]):
                 if path.match(pattern):
                     str_path = str(path.relative_to(search_path))
@@ -189,7 +196,7 @@ class GrepTool(Tool[GrepInput, Any]):
         return None
 
     async def execute(self, input_data: GrepInput) -> ToolResult:
-        search_path = Path(input_data.path or ".").resolve()
+        search_path = resolve_tool_path(input_data.path or ".")
 
         try:
             # 编译正则表达式

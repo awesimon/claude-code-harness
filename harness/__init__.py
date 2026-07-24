@@ -45,6 +45,15 @@ from .mcp import (
     MCPToolDefinition,
     MCPTransport,
 )
+from .worktrees import (
+    WorktreeError,
+    WorktreeManager,
+    WorktreeNotClean,
+    WorktreeOwnershipError,
+    WorktreePathError,
+    WorktreeStateError,
+)
+from state_core import WorktreeRecord, WorktreeStatus
 
 __all__ = [
     "CancellationToken",
@@ -74,6 +83,14 @@ __all__ = [
     "MCPServerStatus",
     "MCPToolDefinition",
     "MCPTransport",
+    "WorktreeError",
+    "WorktreeManager",
+    "WorktreeNotClean",
+    "WorktreeOwnershipError",
+    "WorktreePathError",
+    "WorktreeRecord",
+    "WorktreeStateError",
+    "WorktreeStatus",
     "PermissionDecision",
     "PermissionMode",
     "PermissionPolicy",

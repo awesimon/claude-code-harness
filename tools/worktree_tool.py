@@ -1,345 +1,151 @@
-"""
-WorktreeTool - Git工作树管理
-支持创建和退出Git工作树，用于隔离开发环境
-"""
+"""Compatibility tools over the session-owned worktree manager."""
 
-import os
-import subprocess
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any
 
-from .base import Tool, ToolResult, ToolError
+from harness.worktrees import WorktreeNotClean
+
+from .base import (
+    Tool,
+    ToolResult,
+    ToolValidationError,
+    get_active_tool_context,
+    register_tool,
+)
+
+
+def _manager():
+    harness = get_active_tool_context().get("session_harness")
+    if harness is None:
+        raise ToolValidationError("worktree tools require an active session harness")
+    return harness.worktrees
 
 
 @dataclass
 class EnterWorktreeInput:
-    """进入工作树输入"""
-    name: Optional[str] = None  # 工作树名称，不指定则自动生成
-    base_branch: Optional[str] = None  # 基于哪个分支创建
+    name: str | None = None
+    base_branch: str | None = None
 
 
 @dataclass
 class ExitWorktreeInput:
-    """退出工作树输入"""
-    keep: bool = False  # 是否保留工作树目录
+    keep: bool = False
+    action: str | None = None
+    discard_changes: bool = False
+    worktree_id: str | None = None
 
 
-class EnterWorktreeTool(Tool):
-    """
-    EnterWorktreeTool - 创建并进入Git工作树
-
-    创建一个新的Git工作树（worktree），用于隔离开发环境。
-    工作树允许你在同一仓库中同时处理多个分支，而不需要克隆多个仓库。
-
-    使用场景:
-    - 并行开发多个功能
-    - 代码审查时保持主分支干净
-    - 实验性开发不影响主线
-    """
-
+@register_tool
+class EnterWorktreeTool(Tool[EnterWorktreeInput, dict[str, Any]]):
     name = "enter_worktree"
-    description = "创建并进入一个新的Git工作树，用于隔离开发环境"
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "description": "工作树名称（可选，默认自动生成）"
+    description = "创建隔离的 Git worktree，并将当前会话切换到该工作目录"
+    input_type = EnterWorktreeInput
+    should_defer = True
+    search_hint = "create an isolated git worktree and switch into it"
+
+    async def execute(self, input_data: EnterWorktreeInput) -> ToolResult:
+        record = _manager().create(input_data.name, base_branch=input_data.base_branch)
+        slug = str(record.details.get("slug", input_data.name or ""))
+        data = {
+            "worktree_id": record.worktree_id,
+            "worktree_name": slug,
+            "worktree_path": record.canonical_path,
+            "worktreePath": record.canonical_path,
+            "branch": record.branch,
+            "worktreeBranch": record.branch,
+            "base_branch": record.details.get("base_ref"),
+            "base_commit": record.base_commit,
+            "original_path": record.repository_root,
+        }
+        return ToolResult.ok(
+            data,
+            f"Created worktree at {record.canonical_path} on branch {record.branch}",
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "base_branch": {"type": "string"},
+                },
             },
-            "base_branch": {
-                "type": "string",
-                "description": "基于哪个分支创建（可选，默认当前分支）"
-            }
-        }
-    }
-
-    async def run(self, input_data: EnterWorktreeInput) -> ToolResult:
-        """
-        创建并进入工作树
-
-        Args:
-            input_data: 工作树输入参数
-
-        Returns:
-            ToolResult: 包含工作树信息
-        """
-        try:
-            # 检查是否在git仓库中
-            if not self._is_git_repo():
-                return ToolResult(
-                    success=False,
-                    error=ToolError(
-                        message="当前目录不是Git仓库",
-                        tool_name=self.name
-                    )
-                )
-
-            # 生成工作树名称
-            worktree_name = input_data.name or self._generate_worktree_name()
-
-            # 检查工作树是否已存在
-            if self._worktree_exists(worktree_name):
-                return ToolResult(
-                    success=False,
-                    error=ToolError(
-                        message=f"工作树 '{worktree_name}' 已存在",
-                        tool_name=self.name
-                    )
-                )
-
-            # 创建工作树路径
-            worktree_path = os.path.join(".claude", "worktrees", worktree_name)
-            os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
-
-            # 确定基础分支
-            base_branch = input_data.base_branch or self._get_current_branch()
-
-            # 创建新分支
-            new_branch = f"worktree/{worktree_name}"
-            branch_result = subprocess.run(
-                ["git", "branch", new_branch, base_branch],
-                capture_output=True,
-                text=True
-            )
-
-            if branch_result.returncode != 0:
-                return ToolResult(
-                    success=False,
-                    error=ToolError(
-                        message=f"创建分支失败: {branch_result.stderr}",
-                        tool_name=self.name
-                    )
-                )
-
-            # 创建工作树
-            result = subprocess.run(
-                ["git", "worktree", "add", worktree_path, new_branch],
-                capture_output=True,
-                text=True
-            )
-
-            if result.returncode != 0:
-                # 清理创建的分支
-                subprocess.run(
-                    ["git", "branch", "-D", new_branch],
-                    capture_output=True
-                )
-                return ToolResult(
-                    success=False,
-                    error=ToolError(
-                        message=f"创建工作树失败: {result.stderr}",
-                        tool_name=self.name
-                    )
-                )
-
-            # 获取原始目录
-            original_path = os.getcwd()
-
-            # 切换到工作树目录
-            os.chdir(worktree_path)
-
-            return ToolResult(
-                success=True,
-                data={
-                    "worktree_name": worktree_name,
-                    "worktree_path": worktree_path,
-                    "branch": new_branch,
-                    "base_branch": base_branch,
-                    "original_path": original_path
-                },
-                message=f"已创建工作树: {worktree_name}\n路径: {worktree_path}\n分支: {new_branch}"
-            )
-
-        except Exception as e:
-            return ToolResult(
-                success=False,
-                error=ToolError(
-                    message=f"创建工作树失败: {str(e)}",
-                    tool_name=self.name
-                )
-            )
-
-    def _is_git_repo(self) -> bool:
-        """检查当前目录是否是Git仓库"""
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            capture_output=True
-        )
-        return result.returncode == 0
-
-    def _get_current_branch(self) -> str:
-        """获取当前分支名"""
-        result = subprocess.run(
-            ["git", "branch", "--show-current"],
-            capture_output=True,
-            text=True
-        )
-        return result.stdout.strip() if result.returncode == 0 else "main"
-
-    def _generate_worktree_name(self) -> str:
-        """生成工作树名称"""
-        import time
-        timestamp = int(time.time())
-        return f"worktree-{timestamp}"
-
-    def _worktree_exists(self, name: str) -> bool:
-        """检查工作树是否已存在"""
-        result = subprocess.run(
-            ["git", "worktree", "list"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode != 0:
-            return False
-        return name in result.stdout
-
-    def get_schema(self) -> dict:
-        """获取工具schema"""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "inputSchema": self.input_schema,
         }
 
 
-class ExitWorktreeTool(Tool):
-    """
-    ExitWorktreeTool - 退出当前工作树
-
-    退出当前工作树，返回到原始仓库目录。
-    可以选择保留或删除工作树。
-
-    使用场景:
-    - 完成工作树中的任务
-    - 切换回主开发分支
-    - 清理临时工作树
-    """
-
+@register_tool
+class ExitWorktreeTool(Tool[ExitWorktreeInput, dict[str, Any]]):
     name = "exit_worktree"
-    description = "退出当前工作树，返回到原始仓库目录"
-    input_schema = {
-        "type": "object",
-        "properties": {
-            "keep": {
-                "type": "boolean",
-                "description": "是否保留工作树目录（默认删除）",
-                "default": False
-            }
+    description = "退出当前会话 worktree，可选择保留或安全删除"
+    input_type = ExitWorktreeInput
+    should_defer = True
+    search_hint = "leave, keep, or safely remove the active git worktree"
+
+    async def validate(self, input_data: ExitWorktreeInput):
+        if input_data.action not in {None, "keep", "remove"}:
+            return ToolValidationError("action must be 'keep' or 'remove'")
+        if input_data.action == "remove" and input_data.keep:
+            return ToolValidationError("keep conflicts with action='remove'")
+        return None
+
+    async def execute(self, input_data: ExitWorktreeInput) -> ToolResult:
+        action = input_data.action or ("keep" if input_data.keep else "remove")
+        manager = _manager()
+        try:
+            record = (
+                manager.keep(input_data.worktree_id)
+                if action == "keep"
+                else manager.remove(
+                    input_data.worktree_id,
+                    discard_changes=input_data.discard_changes,
+                )
+            )
+        except WorktreeNotClean as exc:
+            return ToolResult.fail(
+                ToolValidationError(
+                    str(exc),
+                    details={
+                        "changed_files": exc.changed_files,
+                        "commits": exc.commits,
+                        "discard_changes_required": True,
+                    },
+                )
+            )
+        data = {
+            "action": action,
+            "worktree_id": record.worktree_id,
+            "worktree_path": record.canonical_path,
+            "worktreePath": record.canonical_path,
+            "worktree_branch": record.branch,
+            "worktreeBranch": record.branch,
+            "original_path": record.repository_root,
+            "originalCwd": record.repository_root,
+            "kept": action == "keep",
+            "discardedFiles": record.details.get("discarded_files", 0),
+            "discardedCommits": record.details.get("discarded_commits", 0),
         }
-    }
+        verb = "preserved" if action == "keep" else "removed"
+        return ToolResult.ok(data, f"Exited worktree; {record.canonical_path} was {verb}")
 
-    async def run(self, input_data: ExitWorktreeInput) -> ToolResult:
-        """
-        退出工作树
+    def is_destructive(self) -> bool:
+        return True
 
-        Args:
-            input_data: 退出参数
-
-        Returns:
-            ToolResult: 包含退出结果
-        """
-        try:
-            # 检查当前是否在工作树中
-            worktree_info = self._get_current_worktree_info()
-            if not worktree_info:
-                return ToolResult(
-                    success=False,
-                    error=ToolError(
-                        message="当前不在工作树中",
-                        tool_name=self.name
-                    )
-                )
-
-            worktree_path = worktree_info["path"]
-            original_path = worktree_info.get("original_path")
-
-            # 如果没有记录原始路径，尝试推断
-            if not original_path:
-                # 查找主仓库路径
-                result = subprocess.run(
-                    ["git", "rev-parse", "--show-toplevel"],
-                    capture_output=True,
-                    text=True
-                )
-                if result.returncode == 0:
-                    original_path = result.stdout.strip()
-
-            # 切换回原始目录
-            if original_path and os.path.exists(original_path):
-                os.chdir(original_path)
-
-            # 如果不保留，删除工作树
-            if not input_data.keep:
-                # 移除工作树
-                subprocess.run(
-                    ["git", "worktree", "remove", worktree_path],
-                    capture_output=True
-                )
-
-                # 删除对应分支
-                branch = worktree_info.get("branch", "")
-                if branch.startswith("worktree/"):
-                    subprocess.run(
-                        ["git", "branch", "-D", branch],
-                        capture_output=True
-                    )
-
-            return ToolResult(
-                success=True,
-                data={
-                    "worktree_path": worktree_path,
-                    "original_path": original_path,
-                    "kept": input_data.keep
-                },
-                message=f"已退出工作树: {worktree_path}\n" +
-                        ("工作树已保留" if input_data.keep else "工作树已删除")
-            )
-
-        except Exception as e:
-            return ToolResult(
-                success=False,
-                error=ToolError(
-                    message=f"退出工作树失败: {str(e)}",
-                    tool_name=self.name
-                )
-            )
-
-    def _get_current_worktree_info(self) -> Optional[dict]:
-        """获取当前工作树信息"""
-        try:
-            # 获取当前路径
-            current_path = os.getcwd()
-
-            # 检查是否在.claude/worktrees下
-            if ".claude/worktrees" not in current_path:
-                return None
-
-            # 获取工作树列表
-            result = subprocess.run(
-                ["git", "worktree", "list", "--porcelain"],
-                capture_output=True,
-                text=True
-            )
-
-            if result.returncode != 0:
-                return None
-
-            # 解析工作树信息
-            for line in result.stdout.split("\n"):
-                if line.startswith("worktree "):
-                    path = line[9:]
-                    if current_path.startswith(path):
-                        return {"path": path}
-
-            return {"path": current_path}
-
-        except Exception:
-            return None
-
-    def get_schema(self) -> dict:
-        """获取工具schema"""
+    def get_schema(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
-            "inputSchema": self.input_schema,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "keep": {"type": "boolean", "default": False},
+                    "action": {"type": "string", "enum": ["keep", "remove"]},
+                    "discard_changes": {"type": "boolean", "default": False},
+                    "worktree_id": {"type": "string"},
+                },
+            },
         }

@@ -4,11 +4,18 @@
 """
 
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 import asyncio
 
-from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
+from .base import (
+    Tool,
+    ToolResult,
+    ToolError,
+    ToolExecutionError,
+    ToolValidationError,
+    register_tool,
+    resolve_tool_path,
+)
 
 
 @dataclass
@@ -72,18 +79,15 @@ class ReadFileTool(Tool[ReadFileInput, str]):
         }
 
     async def validate(self, input_data: ReadFileInput) -> Optional[ToolError]:
-        path = Path(input_data.file_path)
+        path = resolve_tool_path(input_data.file_path)
         if not path.exists():
             return ToolValidationError(f"文件不存在: {input_data.file_path}")
         if not path.is_file():
             return ToolValidationError(f"路径不是文件: {input_data.file_path}")
-        if not path.is_absolute():
-            # 转换为绝对路径
-            path = path.resolve()
         return None
 
     async def execute(self, input_data: ReadFileInput) -> ToolResult:
-        path = Path(input_data.file_path).resolve()
+        path = resolve_tool_path(input_data.file_path)
 
         try:
             # 读取文件内容
@@ -163,7 +167,7 @@ class WriteFileTool(Tool[WriteFileInput, str]):
         }
 
     async def validate(self, input_data: WriteFileInput) -> Optional[ToolError]:
-        path = Path(input_data.file_path)
+        path = resolve_tool_path(input_data.file_path)
         if path.exists() and not input_data.overwrite:
             return ToolValidationError(
                 f"文件已存在: {input_data.file_path}，设置 overwrite=True 以覆盖"
@@ -171,7 +175,7 @@ class WriteFileTool(Tool[WriteFileInput, str]):
         return None
 
     async def execute(self, input_data: WriteFileInput) -> ToolResult:
-        path = Path(input_data.file_path).resolve()
+        path = resolve_tool_path(input_data.file_path)
 
         try:
             # 确保父目录存在
@@ -232,7 +236,7 @@ class EditFileTool(Tool[EditFileInput, str]):
         }
 
     async def validate(self, input_data: EditFileInput) -> Optional[ToolError]:
-        path = Path(input_data.file_path)
+        path = resolve_tool_path(input_data.file_path)
         if not path.exists():
             return ToolValidationError(f"文件不存在: {input_data.file_path}")
         if not path.is_file():
@@ -242,7 +246,7 @@ class EditFileTool(Tool[EditFileInput, str]):
         return None
 
     async def execute(self, input_data: EditFileInput) -> ToolResult:
-        path = Path(input_data.file_path).resolve()
+        path = resolve_tool_path(input_data.file_path)
 
         try:
             # 读取文件内容
@@ -252,7 +256,7 @@ class EditFileTool(Tool[EditFileInput, str]):
             if input_data.old_string not in content:
                 return ToolResult.fail(
                     ToolValidationError(
-                        f"未找到要替换的字符串",
+                        "未找到要替换的字符串",
                         details={
                             "old_string": input_data.old_string[:100] + "..." if len(input_data.old_string) > 100 else input_data.old_string,
                             "file_path": str(path),

@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, Generic, Mapping, Optional, TypeVar, cast, get_args
 
 from pydantic import BaseModel
@@ -21,6 +22,18 @@ _ACTIVE_TOOL_CONTEXT: ContextVar[Dict[str, Any] | None] = ContextVar(
 
 def get_active_tool_context() -> Dict[str, Any]:
     return _ACTIVE_TOOL_CONTEXT.get() or {}
+
+
+def effective_tool_cwd() -> Path:
+    value = get_active_tool_context().get("effective_cwd")
+    return Path(value).expanduser().resolve() if value else Path.cwd().resolve()
+
+
+def resolve_tool_path(value: str | Path) -> Path:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = effective_tool_cwd() / candidate
+    return candidate.resolve()
 
 
 class ToolError(Exception):

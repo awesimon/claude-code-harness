@@ -55,6 +55,12 @@ class EventType(str, Enum):
     MCP_CONNECTED = "mcp_connected"
     MCP_DISCONNECTED = "mcp_disconnected"
     MCP_CALL = "mcp_call"
+    WORKTREE_CREATED = "worktree_created"
+    WORKTREE_RESTORED = "worktree_restored"
+    WORKTREE_KEPT = "worktree_kept"
+    WORKTREE_REMOVED = "worktree_removed"
+    WORKTREE_ORPHANED = "worktree_orphaned"
+    WORKTREE_FAILED = "worktree_failed"
 
 
 class StateCoreError(Exception):

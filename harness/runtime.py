@@ -451,7 +451,7 @@ class ToolRuntime:
 
     @staticmethod
     def _hook_context(context: RuntimeContext) -> HookContext:
-        cwd = context.workspace_root or Path.cwd()
+        cwd = ToolRuntime._context_cwd(context)
         return HookContext(
             session_id=context.session_id or "",
             cwd=cwd,
@@ -475,6 +475,7 @@ class ToolRuntime:
         """Build the authoritative legacy context passed to tools and predicates."""
 
         tool_context = dict(context.metadata)
+        cwd = ToolRuntime._context_cwd(context)
         tool_context.update(
             {
                 "session_runtime": context.metadata.get("session_runtime"),
@@ -486,9 +487,7 @@ class ToolRuntime:
                 if context.workspace_root
                 else None,
                 "runtime_context": context,
-                "effective_cwd": str(context.workspace_root.resolve())
-                if context.workspace_root
-                else None,
+                "effective_cwd": str(cwd),
                 "cancellation": context.cancellation,
                 "permission_mode": context.permission_mode,
                 "approval_callback": context.approval_callback,
@@ -499,15 +498,20 @@ class ToolRuntime:
         return tool_context
 
     @staticmethod
+    def _context_cwd(context: RuntimeContext) -> Path:
+        harness = context.metadata.get("session_harness")
+        if harness is not None:
+            return Path(harness.effective_cwd).resolve()
+        return (context.workspace_root or Path.cwd()).resolve()
+
+    @staticmethod
     def _prepare_input(
         tool_name: str,
         input_data: dict[str, Any],
         context: RuntimeContext,
     ) -> dict[str, Any]:
         prepared = dict(input_data)
-        root = context.workspace_root
-        if root is None:
-            return prepared
+        root = ToolRuntime._context_cwd(context)
         path_keys = {
             "path",
             "file_path",
