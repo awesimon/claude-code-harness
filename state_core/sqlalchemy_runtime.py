@@ -3,11 +3,23 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import JSON, DateTime, Index, Integer, String, Text, select, text, update
+from sqlalchemy import (
+    JSON,
+    Connection,
+    DateTime,
+    Index,
+    Integer,
+    String,
+    Text,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -27,6 +39,7 @@ from .runtime_records import (
     WorktreeStatus,
     _json_copy,
     _sanitize_trace_error,
+    _trace_duration_ms,
     ensure_agent_transition,
     ensure_trace_span_transition,
     ensure_worktree_transition,
@@ -136,6 +149,7 @@ class RuntimeWorktree(Base):
 class SQLAlchemyAgentRepository:
     def __init__(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
+        self._before_compare_and_swap: Callable[[], None] | None = None
 
     @staticmethod
     def _record(row: RuntimeAgent) -> AgentRecord:
@@ -209,7 +223,7 @@ class SQLAlchemyAgentRepository:
         parent_agent_id: str | None = None,
         status: AgentStatus | None = None,
         is_background: bool | None = None,
-    ) -> list[AgentRecord]:
+    ) -> builtins.list[AgentRecord]:
         with self._session_factory() as db:
             statement = select(RuntimeAgent).where(RuntimeAgent.root_session_id == root_session_id)
             if parent_agent_id is not None:
@@ -232,6 +246,7 @@ class SQLAlchemyAgentRepository:
         usage: Mapping[str, Any] | None = None,
         error: Mapping[str, Any] | None = None,
     ) -> AgentRecord:
+        lost_update = False
         with self._session_factory() as db, db.begin():
             row = db.get(RuntimeAgent, agent_id)
             actual = row.revision if row is not None else None
@@ -255,19 +270,27 @@ class SQLAlchemyAgentRepository:
                 values["error_json"] = _json_copy(error)
             if output is not None:
                 values["output_json"] = _json_copy(output)
+            if self._before_compare_and_swap is not None:
+                self._before_compare_and_swap()
             result = db.execute(
                 update(RuntimeAgent)
                 .where(RuntimeAgent.agent_id == agent_id, RuntimeAgent.revision == expected_revision)
                 .values(**values)
             )
             if result.rowcount != 1:
-                raise RuntimeRecordRevisionConflict("agent", agent_id, expected_revision, actual)
-            db.expire_all()
-            persisted = db.get(RuntimeAgent, agent_id)
-            assert persisted is not None
-            return self._record(persisted)
+                lost_update = True
+            else:
+                db.expire_all()
+                persisted = db.get(RuntimeAgent, agent_id)
+                assert persisted is not None
+                return self._record(persisted)
+        assert lost_update
+        current = self.get(agent_id)
+        raise RuntimeRecordRevisionConflict(
+            "agent", agent_id, expected_revision, current.revision if current is not None else None
+        )
 
-    def reconcile(self, root_session_id: str, live_agent_ids: set[str]) -> list[AgentRecord]:
+    def reconcile(self, root_session_id: str, live_agent_ids: set[str]) -> builtins.list[AgentRecord]:
         with self._session_factory() as db, db.begin():
             rows = db.scalars(
                 select(RuntimeAgent)
@@ -401,6 +424,7 @@ class SQLAlchemyRuntimeMetadataRepository:
 class SQLAlchemyTraceSpanRepository:
     def __init__(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
+        self._before_compare_and_swap: Callable[[], None] | None = None
         self._migrate_sqlite_runtime_schema()
 
     def _migrate_sqlite_runtime_schema(self) -> None:
@@ -410,9 +434,18 @@ class SQLAlchemyTraceSpanRepository:
             bind = db.get_bind()
             if bind.dialect.name != "sqlite":
                 return
-            if not hasattr(bind, "connect"):
-                with bind.begin_nested():
-                    self._apply_sqlite_runtime_migration(bind)
+            if isinstance(bind, Connection):
+                if bind.in_transaction():
+                    with bind.begin_nested():
+                        self._apply_sqlite_runtime_migration(bind)
+                else:
+                    bind.exec_driver_sql("BEGIN IMMEDIATE")
+                    try:
+                        self._apply_sqlite_runtime_migration(bind)
+                        bind.commit()
+                    except BaseException:
+                        bind.rollback()
+                        raise
                 return
             with bind.connect() as connection:
                 connection.exec_driver_sql("BEGIN IMMEDIATE")
@@ -424,7 +457,7 @@ class SQLAlchemyTraceSpanRepository:
                     raise
 
     @staticmethod
-    def _apply_sqlite_runtime_migration(connection: Any) -> None:
+    def _apply_sqlite_runtime_migration(connection: Connection) -> None:
         connection.execute(
             text(
                 "CREATE TABLE IF NOT EXISTS runtime_schema_migrations "
@@ -435,11 +468,31 @@ class SQLAlchemyTraceSpanRepository:
             text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
         ).scalar_one_or_none()
         columns = connection.execute(text("PRAGMA table_info(runtime_trace_spans)")).all()
-        if not columns or version is not None and version >= 1:
+        if not columns or version is not None and version >= 2:
             return
         names = {column.name for column in columns}
-        if "duration_ms" not in names:
+        if version is None and "duration_ms" not in names:
             connection.execute(text("ALTER TABLE runtime_trace_spans ADD COLUMN duration_ms INTEGER"))
+        if version is None:
+            rows = connection.execute(
+                text(
+                    "SELECT span_id, started_at, finished_at FROM runtime_trace_spans "
+                    "WHERE status != 'running' AND started_at IS NOT NULL "
+                    "AND finished_at IS NOT NULL AND duration_ms IS NULL"
+                )
+            ).all()
+            for row in rows:
+                started_at = datetime.fromisoformat(str(row.started_at)).replace(tzinfo=timezone.utc)
+                finished_at = datetime.fromisoformat(str(row.finished_at)).replace(tzinfo=timezone.utc)
+                if finished_at < started_at:
+                    raise ValueError("finished_at must not precede started_at")
+                connection.execute(
+                    text("UPDATE runtime_trace_spans SET duration_ms = :duration_ms WHERE span_id = :span_id"),
+                    {"span_id": row.span_id, "duration_ms": _trace_duration_ms(started_at, finished_at)},
+                )
+            connection.execute(
+                text("INSERT INTO runtime_schema_migrations (name, version) VALUES ('runtime_trace_spans', 1)")
+            )
         if connection.execute(text("PRAGMA table_info(runtime_agents)")).first() is not None:
             connection.execute(
                 text(
@@ -451,7 +504,7 @@ class SQLAlchemyTraceSpanRepository:
             text(
                 "SELECT span_id, started_at, finished_at FROM runtime_trace_spans "
                 "WHERE status != 'running' AND started_at IS NOT NULL "
-                "AND finished_at IS NOT NULL AND duration_ms IS NULL"
+                "AND finished_at IS NOT NULL"
             )
         ).all()
         for row in rows:
@@ -459,7 +512,7 @@ class SQLAlchemyTraceSpanRepository:
             finished_at = datetime.fromisoformat(str(row.finished_at)).replace(tzinfo=timezone.utc)
             if finished_at < started_at:
                 raise ValueError("finished_at must not precede started_at")
-            duration_ms = int((finished_at - started_at).total_seconds() * 1000)
+            duration_ms = _trace_duration_ms(started_at, finished_at)
             connection.execute(
                 text("UPDATE runtime_trace_spans SET duration_ms = :duration_ms WHERE span_id = :span_id"),
                 {"span_id": row.span_id, "duration_ms": duration_ms},
@@ -476,7 +529,7 @@ class SQLAlchemyTraceSpanRepository:
                     {"span_id": row.span_id, "error": json.dumps(sanitized)},
                 )
         connection.execute(
-            text("INSERT INTO runtime_schema_migrations (name, version) VALUES ('runtime_trace_spans', 1)")
+            text("UPDATE runtime_schema_migrations SET version = 2 WHERE name = 'runtime_trace_spans'")
         )
 
     @staticmethod
@@ -541,6 +594,7 @@ class SQLAlchemyTraceSpanRepository:
     ) -> TraceSpanRecord:
         if status not in TRACE_TERMINAL_STATUSES:
             raise ValueError("trace spans must finish in a terminal status")
+        lost_update = False
         with self._session_factory() as db, db.begin():
             row = db.get(RuntimeTraceSpan, span_id)
             actual = row.revision if row is not None else None
@@ -548,7 +602,7 @@ class SQLAlchemyTraceSpanRepository:
                 raise RuntimeRecordRevisionConflict("trace span", span_id, expected_revision, actual)
             ensure_trace_span_transition(TraceSpanStatus(row.status), status)
             now = _utc_now()
-            duration_ms = int((now - _as_utc(row.started_at)).total_seconds() * 1000)
+            duration_ms = _trace_duration_ms(_as_utc(row.started_at), now)
             values: dict[str, Any] = {
                 "status": status.value,
                 "revision": actual + 1,
@@ -560,17 +614,25 @@ class SQLAlchemyTraceSpanRepository:
                 values["usage"] = _json_copy(usage)
             if error is not None:
                 values["error_json"] = _sanitize_trace_error(error)
+            if self._before_compare_and_swap is not None:
+                self._before_compare_and_swap()
             result = db.execute(
                 update(RuntimeTraceSpan)
                 .where(RuntimeTraceSpan.span_id == span_id, RuntimeTraceSpan.revision == expected_revision)
                 .values(**values)
             )
             if result.rowcount != 1:
-                raise RuntimeRecordRevisionConflict("trace span", span_id, expected_revision, actual)
-            db.expire_all()
-            persisted = db.get(RuntimeTraceSpan, span_id)
-            assert persisted is not None
-            return self._record(persisted)
+                lost_update = True
+            else:
+                db.expire_all()
+                persisted = db.get(RuntimeTraceSpan, span_id)
+                assert persisted is not None
+                return self._record(persisted)
+        assert lost_update
+        current = self.get(span_id)
+        raise RuntimeRecordRevisionConflict(
+            "trace span", span_id, expected_revision, current.revision if current is not None else None
+        )
 
     def list(
         self,
@@ -578,7 +640,7 @@ class SQLAlchemyTraceSpanRepository:
         *,
         agent_id: str | None = None,
         status: TraceSpanStatus | None = None,
-    ) -> list[TraceSpanRecord]:
+    ) -> builtins.list[TraceSpanRecord]:
         with self._session_factory() as db:
             statement = select(RuntimeTraceSpan).where(
                 RuntimeTraceSpan.root_session_id == root_session_id
@@ -590,7 +652,7 @@ class SQLAlchemyTraceSpanRepository:
             rows = db.scalars(statement.order_by(RuntimeTraceSpan.started_at, RuntimeTraceSpan.span_id)).all()
             return [self._record(row) for row in rows]
 
-    def interrupt_open(self, root_session_id: str) -> list[TraceSpanRecord]:
+    def interrupt_open(self, root_session_id: str) -> builtins.list[TraceSpanRecord]:
         with self._session_factory() as db, db.begin():
             rows = db.scalars(
                 select(RuntimeTraceSpan)
@@ -610,7 +672,7 @@ class SQLAlchemyTraceSpanRepository:
                         status=TraceSpanStatus.INTERRUPTED.value,
                         revision=row.revision + 1,
                         finished_at=now,
-                        duration_ms=int((now - _as_utc(row.started_at)).total_seconds() * 1000),
+                        duration_ms=_trace_duration_ms(_as_utc(row.started_at), now),
                         updated_at=now,
                     )
                 )
@@ -623,6 +685,7 @@ class SQLAlchemyTraceSpanRepository:
 class SQLAlchemyWorktreeRepository:
     def __init__(self, session_factory: SessionFactory) -> None:
         self._session_factory = session_factory
+        self._before_compare_and_swap: Callable[[], None] | None = None
 
     @staticmethod
     def _record(row: RuntimeWorktree) -> WorktreeRecord:
@@ -675,7 +738,7 @@ class SQLAlchemyWorktreeRepository:
         *,
         agent_id: str | None = None,
         status: WorktreeStatus | None = None,
-    ) -> list[WorktreeRecord]:
+    ) -> builtins.list[WorktreeRecord]:
         with self._session_factory() as db:
             statement = select(RuntimeWorktree).where(
                 RuntimeWorktree.root_session_id == root_session_id
@@ -692,6 +755,7 @@ class SQLAlchemyWorktreeRepository:
         unknown = set(changes).difference(allowed)
         if unknown:
             raise TypeError(f"unsupported worktree fields: {sorted(unknown)!r}")
+        lost_update = False
         with self._session_factory() as db, db.begin():
             row = db.get(RuntimeWorktree, worktree_id)
             actual = row.revision if row is not None else None
@@ -714,14 +778,22 @@ class SQLAlchemyWorktreeRepository:
                 if not isinstance(details, dict):
                     raise TypeError("details must be a JSON object")
                 values["details"] = details
+            if self._before_compare_and_swap is not None:
+                self._before_compare_and_swap()
             result = db.execute(
                 update(RuntimeWorktree)
                 .where(RuntimeWorktree.worktree_id == worktree_id, RuntimeWorktree.revision == expected_revision)
                 .values(**values)
             )
             if result.rowcount != 1:
-                raise RuntimeRecordRevisionConflict("worktree", worktree_id, expected_revision, actual)
-            db.expire_all()
-            persisted = db.get(RuntimeWorktree, worktree_id)
-            assert persisted is not None
-            return self._record(persisted)
+                lost_update = True
+            else:
+                db.expire_all()
+                persisted = db.get(RuntimeWorktree, worktree_id)
+                assert persisted is not None
+                return self._record(persisted)
+        assert lost_update
+        current = self.get(worktree_id)
+        raise RuntimeRecordRevisionConflict(
+            "worktree", worktree_id, expected_revision, current.revision if current is not None else None
+        )

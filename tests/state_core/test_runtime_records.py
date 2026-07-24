@@ -5,7 +5,8 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, local
+from typing import Callable
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -372,7 +373,7 @@ def test_trace_repository_adds_duration_column_to_existing_sqlite_table(tmp_path
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
-        ).scalar_one() == 1
+        ).scalar_one() == 2
 
     started = store.traces.start(
         TraceSpanRecord(span_id="legacy-span", root_session_id="root-1", kind="tool", name="request")
@@ -413,7 +414,7 @@ def test_concurrent_legacy_trace_schema_initialization_is_versioned(tmp_path: Pa
     with engine.connect() as connection:
         assert connection.execute(
             text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
-        ).scalar_one() == 1
+        ).scalar_one() == 2
         assert "duration_ms" in {
             row.name for row in connection.execute(text("PRAGMA table_info(runtime_trace_spans)"))
         }
@@ -469,6 +470,164 @@ def test_connection_bound_session_factory_runs_runtime_migration(tmp_path: Path)
             TraceSpanRecord(span_id="connection-span", root_session_id="root-1", kind="tool", name="request")
         )
         assert store.traces.get(created.span_id) == created
+
+
+def test_bare_connection_migration_commits_and_runtime_records_are_durable(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'bare-connection.db'}")
+    Base.metadata.create_all(engine)
+    with engine.connect() as connection:
+        store = SQLAlchemyStateStore(sessionmaker(bind=connection, expire_on_commit=False))
+        assert not connection.in_transaction()
+        store.agents.create(agent("durable-agent"))
+        store.traces.start(
+            TraceSpanRecord(span_id="durable-span", root_session_id="root-1", kind="tool", name="request")
+        )
+
+    reopened = SQLAlchemyStateStore(sessionmaker(bind=engine, expire_on_commit=False))
+    assert reopened.agents.get("durable-agent") is not None
+    assert reopened.traces.get("durable-span") is not None
+
+
+def test_connection_owned_transaction_survives_migration_and_controls_runtime_writes(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'caller-transaction.db'}")
+    Base.metadata.create_all(engine)
+    with engine.connect() as connection:
+        transaction = connection.begin()
+        store = SQLAlchemyStateStore(sessionmaker(bind=connection, expire_on_commit=False))
+        assert connection.in_transaction()
+        store.agents.create(agent("rolled-back-agent"))
+        transaction.rollback()
+
+    reopened = SQLAlchemyStateStore(sessionmaker(bind=engine, expire_on_commit=False))
+    assert reopened.agents.get("rolled-back-agent") is None
+
+
+def test_v2_migration_rewrites_v1_history_once(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'v1-runtime.db'}")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX ix_runtime_agents_root_status_created"))
+        connection.execute(
+            text(
+                "CREATE TABLE runtime_schema_migrations "
+                "(name TEXT PRIMARY KEY, version INTEGER NOT NULL)"
+            )
+        )
+        connection.execute(
+            text("INSERT INTO runtime_schema_migrations (name, version) VALUES ('runtime_trace_spans', 1)")
+        )
+        connection.execute(
+            text(
+                "INSERT INTO runtime_trace_spans "
+                "(span_id, root_session_id, agent_id, parent_span_id, kind, name, status, revision, "
+                "started_at, finished_at, duration_ms, usage, error_json, created_at, updated_at) "
+                "VALUES ('v1-span', 'root-1', NULL, NULL, 'tool', 'request', 'failed', 1, "
+                "'2026-07-24 00:00:00.000000', '2026-07-24 00:00:00.000600', 1, '{}', "
+                ":error_json, '2026-07-24 00:00:00.000000', '2026-07-24 00:00:00.000600')"
+            ),
+            {"error_json": json.dumps({"database_password": "legacy secret", "safe": "kept"})},
+        )
+        connection.execute(text("CREATE TABLE migration_updates (count INTEGER NOT NULL)"))
+        connection.execute(text("INSERT INTO migration_updates VALUES (0)"))
+        connection.execute(
+            text(
+                "CREATE TRIGGER count_v2_trace_updates BEFORE UPDATE ON runtime_trace_spans "
+                "BEGIN UPDATE migration_updates SET count = count + 1; END"
+            )
+        )
+
+    store = SQLAlchemyStateStore(sessionmaker(bind=engine, expire_on_commit=False))
+    with engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT version FROM runtime_schema_migrations WHERE name = 'runtime_trace_spans'")
+        ).scalar_one() == 2
+        assert connection.execute(
+            text("SELECT duration_ms FROM runtime_trace_spans WHERE span_id = 'v1-span'")
+        ).scalar_one() == 0
+        assert "legacy secret" not in str(
+            connection.execute(
+                text("SELECT error_json FROM runtime_trace_spans WHERE span_id = 'v1-span'")
+            ).scalar_one()
+        )
+        assert "ix_runtime_agents_root_status_created" in {
+            row.name for row in connection.execute(text("PRAGMA index_list(runtime_agents)"))
+        }
+        assert connection.execute(text("SELECT count FROM migration_updates")).scalar_one() > 0
+        connection.execute(text("UPDATE migration_updates SET count = 0"))
+        connection.commit()
+
+    assert store.traces.get("v1-span").duration_ms == 0  # type: ignore[union-attr]
+    SQLAlchemyStateStore(sessionmaker(bind=engine, expire_on_commit=False))
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT count FROM migration_updates")).scalar_one() == 0
+
+
+def test_concurrent_runtime_cas_losers_report_committed_winner_revision(
+    session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SQLAlchemyStateStore(session_factory)
+    created_agent = store.agents.create(agent("race-agent"))
+    created_span = store.traces.start(
+        TraceSpanRecord(span_id="race-span", root_session_id="root-1", kind="tool", name="request")
+    )
+    created_worktree = store.worktrees.create(
+        WorktreeRecord(
+            worktree_id="race-worktree",
+            root_session_id="root-1",
+            repository_root="/repo",
+            canonical_path="/repo/wt",
+            branch="branch",
+            base_commit="abc",
+            status=WorktreeStatus.CREATING,
+        )
+    )
+    thread_state = local()
+
+    def assert_race(repository: object, winner: Callable[[], object], loser: Callable[[], object]) -> None:
+        both_loaded = Barrier(2)
+        winner_committed = Event()
+
+        def interleave() -> None:
+            both_loaded.wait()
+            if getattr(thread_state, "role", None) == "loser":
+                assert winner_committed.wait(timeout=5)
+
+        monkeypatch.setattr(repository, "_before_compare_and_swap", interleave)
+
+        def run(role: str, operation: Callable[[], object]) -> object:
+            thread_state.role = role
+            try:
+                result = operation()
+                if role == "winner":
+                    winner_committed.set()
+                return result
+            except RuntimeRecordRevisionConflict as error:
+                return error
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            winner_result, loser_result = list(
+                pool.map(lambda item: run(*item), [("winner", winner), ("loser", loser)])
+            )
+        assert not isinstance(winner_result, RuntimeRecordRevisionConflict)
+        assert isinstance(loser_result, RuntimeRecordRevisionConflict)
+        assert loser_result.expected_revision == 0
+        assert loser_result.actual_revision == 1
+
+    assert_race(
+        store.agents,
+        lambda: store.agents.transition(created_agent.agent_id, AgentStatus.RUNNING, 0),
+        lambda: store.agents.transition(created_agent.agent_id, AgentStatus.RUNNING, 0),
+    )
+    assert_race(
+        store.traces,
+        lambda: store.traces.finish(created_span.span_id, TraceSpanStatus.COMPLETED, 0),
+        lambda: store.traces.finish(created_span.span_id, TraceSpanStatus.COMPLETED, 0),
+    )
+    assert_race(
+        store.worktrees,
+        lambda: store.worktrees.update(created_worktree.worktree_id, 0, status=WorktreeStatus.READY),
+        lambda: store.worktrees.update(created_worktree.worktree_id, 0, status=WorktreeStatus.READY),
+    )
 
 
 def test_worktree_create_update_get_and_stale_revision(store: SQLAlchemyStateStore) -> None:
