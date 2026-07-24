@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import tempfile
 import unittest
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -12,7 +14,7 @@ from harness import (
     TerminationReason,
     ToolRuntime,
 )
-from tools.base import Tool, ToolResult
+from tools.base import Tool, ToolResult, get_active_tool_context
 from tools.bash_tool import BashTool
 
 
@@ -79,6 +81,25 @@ class PathEchoTool(Tool[PathInput, dict]):
 
     async def execute(self, input_data: PathInput) -> ToolResult:
         return ToolResult.ok({"file_path": input_data.file_path})
+
+    def is_read_only(self) -> bool:
+        return True
+
+
+class ContextProbeTool(Tool[ValueInput, dict]):
+    name = "context_probe"
+    description = "return active context"
+
+    async def execute(self, input_data: ValueInput) -> ToolResult:
+        context = get_active_tool_context()
+        return ToolResult.ok(
+            {
+                "session_id": context["session_id"],
+                "current_mode": context["current_mode"],
+                "workspace_root": context["workspace_root"],
+                "runtime_context": context["runtime_context"],
+            }
+        )
 
     def is_read_only(self) -> bool:
         return True
@@ -225,6 +246,51 @@ class ToolRuntimeTests(unittest.IsolatedAsyncioTestCase):
         parent.cancel()
 
         self.assertTrue(child.cancelled)
+
+    async def test_parent_does_not_retain_disposed_child_token(self):
+        parent = CancellationToken()
+        child = CancellationToken(parent=parent)
+        reference = weakref.ref(child)
+
+        del child
+        gc.collect()
+        parent.cancel()
+
+        self.assertIsNone(reference())
+
+    async def test_callback_failure_does_not_block_sibling_cancellation(self):
+        parent = CancellationToken()
+        child = CancellationToken(parent=parent)
+
+        def fail():
+            raise RuntimeError("callback failure")
+
+        parent.add_callback(fail)
+        parent.cancel()
+
+        self.assertTrue(child.cancelled)
+
+    async def test_runtime_context_values_override_spoofed_metadata(self):
+        runtime = ToolRuntime(registry=LocalRegistry(ContextProbeTool()))
+        context = RuntimeContext(
+            session_id="actual-session",
+            workspace_root=self.workspace,
+            permission_mode=PermissionMode.BYPASS,
+            metadata={
+                "session_id": "spoofed",
+                "current_mode": "spoofed",
+                "workspace_root": "spoofed",
+                "runtime_context": "spoofed",
+            },
+        )
+
+        execution = await runtime.execute("context_probe", {}, context)
+
+        self.assertTrue(execution.result.success)
+        self.assertEqual(execution.result.data["session_id"], "actual-session")
+        self.assertEqual(execution.result.data["current_mode"], "bypass")
+        self.assertEqual(execution.result.data["workspace_root"], str(self.workspace))
+        self.assertIs(execution.result.data["runtime_context"], context)
 
     async def test_relative_tool_paths_are_resolved_from_workspace(self):
         runtime = ToolRuntime(registry=LocalRegistry(PathEchoTool()))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -8,9 +9,39 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import harness
-from harness import PermissionMode
+from harness import PermissionMode, RuntimeContext, SessionHarness, ToolRuntime
 from models import Base
-from state_core import EventType, SQLAlchemyStateStore, SessionRuntimeFactory
+from state_core import EventType, SessionRuntimeFactory, SQLAlchemyStateStore
+from tools.base import Tool, ToolResult
+
+
+class SlowHarnessTool(Tool[dict, dict]):
+    name = "slow_harness"
+    description = "slow harness tool"
+    input_type = dict
+
+    async def execute(self, input_data: dict) -> ToolResult:
+        await asyncio.sleep(0.03)
+        return ToolResult.ok({"completed": True})
+
+    def is_read_only(self) -> bool:
+        return True
+
+
+class LocalRegistry:
+    def __init__(self, *tools: Tool) -> None:
+        self.tools = {tool.name: tool for tool in tools}
+
+    def get(self, name: str):
+        return self.tools.get(name)
+
+    def resolve_name(self, name: str):
+        return name if name in self.tools else None
+
+
+class NonCopyableMetadata:
+    def __deepcopy__(self, memo):
+        raise TypeError("not copyable")
 
 
 @pytest.fixture
@@ -84,7 +115,7 @@ def test_child_metadata_merges_and_harness_values_cannot_be_overridden(
     child = root.child(
         "worker",
         parent_agent_id="supervisor",
-        metadata={"trace": "child", "extra": True, "agent_id": "wrong"},
+        metadata={"trace": "child", "extra": True},
     )
 
     assert child.parent_agent_id == "supervisor"
@@ -125,13 +156,117 @@ def test_root_metadata_cannot_expand_child_cwd_policy(
         root.child("rejected", cwd=outside)
 
 
+def test_child_metadata_cannot_escalate_grandchild_workspace(
+    factory, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    child = factory.create("capability").child("child")
+
+    with pytest.raises(harness.HarnessScopeError, match="reserved"):
+        child.child("grandchild", metadata={"allowed_workspaces": [outside]})
+
+
+def test_child_cwd_rejects_symlink_escape(factory, workspace: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escape = workspace / "escape"
+    escape.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(harness.HarnessScopeError, match="outside"):
+        factory.create("symlink").child("child", cwd=escape)
+
+
+def test_reserved_metadata_is_rejected_and_user_metadata_isolated(factory) -> None:
+    with pytest.raises(harness.HarnessScopeError, match="reserved"):
+        factory.create("reserved", metadata={"session_id": "spoof"})
+    with pytest.raises(harness.HarnessScopeError, match="reserved"):
+        factory.create("reserved-child").child("child", metadata={"agent_id": "spoof"})
+
+    root = factory.create("isolated", metadata={"nested": {"items": []}})
+    left = root.child("left")
+    right = root.child("right")
+    left.runtime_context.metadata["nested"]["items"].append("left")
+
+    assert root.runtime_context.metadata["nested"] == {"items": []}
+    assert right.runtime_context.metadata["nested"] == {"items": []}
+    with pytest.raises(harness.HarnessScopeError, match="copy"):
+        factory.create("non-copyable", metadata={"value": NonCopyableMetadata()})
+
+
+def test_invalid_factory_calls_do_not_mutate_durable_runtime(
+    factory, workspace: Path
+) -> None:
+    with pytest.raises(harness.HarnessScopeError, match="permission_mode"):
+        factory.create("ghost", permission_mode="invalid")
+    assert factory.session_runtime_factory.store.states.load_session("ghost") is None
+
+    running = factory.create("running")
+    running.session_runtime.update_agent_lifecycle("worker", "running")
+    event_count = len(list(running.session_runtime.events()))
+    with pytest.raises(harness.HarnessScopeError, match="reserved"):
+        factory.resume("running", metadata={"session_id": "spoof"})
+
+    persisted = factory.session_runtime_factory.store.states.load_session("running")
+    assert persisted is not None
+    assert persisted.agents["worker"]["status"] == "running"
+    assert len(list(running.session_runtime.events())) == event_count
+
+
+@pytest.mark.asyncio
+async def test_explicit_child_timeout_none_disables_shared_default(
+    tmp_path: Path, workspace: Path
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'timeout.db'}")
+    Base.metadata.create_all(engine)
+    factory = harness.SessionHarnessFactory(
+        SessionRuntimeFactory(SQLAlchemyStateStore(sessionmaker(bind=engine))),
+        tool_registry=LocalRegistry(SlowHarnessTool()),
+        workspace_root=workspace,
+        tool_timeout=0.01,
+    )
+    root = factory.create("timeout")
+    disabled = root.child("disabled", tool_timeout=None)
+
+    timed_out = await root.tool_runtime.execute("slow_harness", {}, root.runtime_context)
+    completed = await disabled.tool_runtime.execute(
+        "slow_harness", {}, disabled.runtime_context
+    )
+
+    assert timed_out.termination_reason.value == "timeout"
+    assert completed.result.success
+
+
+def test_direct_harness_rejects_untrusted_identity_and_workspace_capabilities(
+    factory, workspace: Path, tmp_path: Path
+) -> None:
+    root = factory.create("identity")
+    context = RuntimeContext(session_id="other", workspace_root=workspace)
+
+    with pytest.raises(harness.HarnessScopeError, match="session_id"):
+        SessionHarness(root.session_runtime, ToolRuntime(root.tool_runtime.registry), context)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    context = RuntimeContext(session_id="identity", workspace_root=workspace)
+    with pytest.raises(harness.HarnessScopeError, match="factory"):
+        SessionHarness(
+            root.session_runtime,
+            ToolRuntime(root.tool_runtime.registry),
+            context,
+            allowed_workspaces=(outside,),
+        )
+
+
 @pytest.mark.asyncio
 async def test_root_and_child_todo_scopes_remain_isolated(factory) -> None:
     root = factory.create("todos")
     root.session_runtime.enable_todo_v1()
     left = root.child("left")
     right = root.child("right")
-    todo = lambda text: [{"content": text, "status": "pending", "activeForm": text}]
+
+    def todo(text: str) -> list[dict[str, str]]:
+        return [{"content": text, "status": "pending", "activeForm": text}]
 
     root_result = await root.tool_runtime.execute(
         "TodoWrite", {"todos": todo("root")}, root.runtime_context
@@ -165,7 +300,9 @@ def test_resume_is_fresh_and_observes_durable_checkpoint_without_replaying_work(
     assert resumed_again is not resumed
     assert resumed.store is first.store
     assert resumed.session_runtime.state.transcript_cursor == 1
-    assert [event.event_type for event in resumed.session_runtime.events()] == [EventType.USER_MESSAGE]
+    assert [
+        event.event_type for event in resumed.session_runtime.events()
+    ] == [EventType.USER_MESSAGE]
 
 
 def test_resume_reconciles_running_agents_through_runtime_recovery(
@@ -188,7 +325,8 @@ def test_factory_inherits_and_allows_scope_overrides(
 ) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'overrides.db'}")
     Base.metadata.create_all(engine)
-    callback = lambda request: True
+    def callback(request) -> bool:
+        return True
     factory = harness.SessionHarnessFactory(
         SessionRuntimeFactory(SQLAlchemyStateStore(sessionmaker(bind=engine))),
         workspace_root=workspace,

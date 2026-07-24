@@ -13,6 +13,7 @@ from tools.base import (
     ToolResult,
     ToolTimeoutError,
 )
+
 from .context import RuntimeContext
 from .permissions import PermissionPolicy
 
@@ -63,7 +64,9 @@ class ToolRuntime:
         )
         if not allowed:
             error = ToolPermissionError(f"Permission denied: {reason}")
-            return ToolExecution(canonical, ToolResult.fail(error), TerminationReason.PERMISSION_DENIED)
+            return ToolExecution(
+                canonical, ToolResult.fail(error), TerminationReason.PERMISSION_DENIED
+            )
 
         if context.cancellation.cancelled:
             return ToolExecution(
@@ -73,16 +76,28 @@ class ToolRuntime:
             )
 
         tool_context = {
+            **dict(context.metadata),
             "session_id": context.session_id,
             "current_mode": context.permission_mode.value,
             "workspace_root": str(context.workspace_root) if context.workspace_root else None,
             "runtime_context": context,
-            **context.metadata,
+            "effective_cwd": str(context.workspace_root.resolve())
+            if context.workspace_root
+            else None,
+            "cancellation": context.cancellation,
+            "permission_mode": context.permission_mode,
+            "approval_callback": context.approval_callback,
+            "tool_timeout": context.tool_timeout,
         }
         task = asyncio.create_task(tool.run(input_data, tool_context))
         context.cancellation.track(task)
-        effective_timeout = timeout if timeout is not None else context.tool_timeout
-        if effective_timeout is None:
+        if timeout is not None:
+            effective_timeout = timeout
+        elif context.tool_timeout_disabled:
+            effective_timeout = None
+        else:
+            effective_timeout = context.tool_timeout
+        if effective_timeout is None and not context.tool_timeout_disabled:
             effective_timeout = self.default_timeout
 
         try:
