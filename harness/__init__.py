@@ -1,5 +1,15 @@
 """Stable runtime primitives shared by the root and child agents."""
 
+from state_core import WorktreeRecord, WorktreeStatus
+
+from .agents import AgentScheduler
+from .approvals import (
+    ApprovalAlreadyClaimed,
+    ApprovalBindingChanged,
+    ApprovalConflict,
+    ApprovalService,
+)
+from .budget import BudgetController, BudgetExhausted, BudgetKind, BudgetReservation
 from .context import CancellationToken, PermissionMode, RuntimeContext
 from .context_control import (
     COMPACTION_NAMESPACE,
@@ -8,32 +18,29 @@ from .context_control import (
     ContextControlConfig,
     ContextController,
 )
-from .permissions import PermissionDecision, PermissionRequest, PermissionPolicy
-from .runtime import TerminationReason, ToolExecution, ToolRuntime
-from .session import HarnessScopeError, SessionHarness, SessionHarnessFactory
-from .agents import AgentScheduler
+from .deferred_tools import (
+    DEFERRED_TOOLS_NAMESPACE,
+    DeferredSearchResult,
+    DeferredToolError,
+    DeferredToolNotActive,
+    DeferredToolNotFound,
+    DeferredToolRegistry,
+    DeferredToolUnavailable,
+)
 from .hooks import (
     HookContext,
     HookDecision,
     HookDefinition,
+    HookDispatcher,
+    HookDispatchResult,
     HookEvent,
     HookFailure,
     HookRuntime,
     PostHookResult,
     PreHookResult,
+    RunnerContext,
 )
-from .skills import (
-    SkillChangedError,
-    SkillError,
-    SkillIndexEntry,
-    SkillNotFound,
-    SkillPathError,
-    SkillResolver,
-    SkillResource,
-    SkillSnapshot,
-)
-from .budget import BudgetController, BudgetExhausted, BudgetKind, BudgetReservation
-from .tracing import TraceController, TraceSpan
+from .lifecycle import LifecycleDispatcher
 from .mcp import (
     MCPConnectionManager,
     MCPError,
@@ -45,6 +52,28 @@ from .mcp import (
     MCPToolDefinition,
     MCPTransport,
 )
+from .permissions import (
+    Allow,
+    ApprovalRequired,
+    Deny,
+    PermissionDecision,
+    PermissionPolicy,
+    PermissionRequest,
+    PermissionRuleService,
+)
+from .runtime import TerminationReason, ToolExecution, ToolRuntime
+from .session import HarnessScopeError, SessionHarness, SessionHarnessFactory
+from .skills import (
+    SkillChangedError,
+    SkillError,
+    SkillIndexEntry,
+    SkillNotFound,
+    SkillPathError,
+    SkillResolver,
+    SkillResource,
+    SkillSnapshot,
+)
+from .tracing import TraceController, TraceSpan
 from .worktrees import (
     WorktreeError,
     WorktreeManager,
@@ -53,18 +82,14 @@ from .worktrees import (
     WorktreePathError,
     WorktreeStateError,
 )
-from .deferred_tools import (
-    DEFERRED_TOOLS_NAMESPACE,
-    DeferredSearchResult,
-    DeferredToolError,
-    DeferredToolNotActive,
-    DeferredToolNotFound,
-    DeferredToolRegistry,
-    DeferredToolUnavailable,
-)
-from state_core import WorktreeRecord, WorktreeStatus
 
 __all__ = [
+    "Allow",
+    "ApprovalAlreadyClaimed",
+    "ApprovalBindingChanged",
+    "ApprovalConflict",
+    "ApprovalRequired",
+    "ApprovalService",
     "CancellationToken",
     "COMPACTION_NAMESPACE",
     "CompactionSummary",
@@ -80,6 +105,8 @@ __all__ = [
     "HookContext",
     "HookDecision",
     "HookDefinition",
+    "HookDispatchResult",
+    "HookDispatcher",
     "HookEvent",
     "HookFailure",
     "HookRuntime",
@@ -92,6 +119,7 @@ __all__ = [
     "MCPServerStatus",
     "MCPToolDefinition",
     "MCPTransport",
+    "LifecycleDispatcher",
     "WorktreeError",
     "WorktreeManager",
     "WorktreeNotClean",
@@ -111,8 +139,11 @@ __all__ = [
     "PermissionMode",
     "PermissionPolicy",
     "PermissionRequest",
+    "PermissionRuleService",
+    "Deny",
     "PostHookResult",
     "PreHookResult",
+    "RunnerContext",
     "RuntimeContext",
     "SessionHarness",
     "SessionHarnessFactory",

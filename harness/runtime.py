@@ -72,6 +72,7 @@ class _StateCoreToolPersister:
                 "toolCallId": tool_call_id,
                 "name": tool_name,
                 "input": to_json_value(dict(input_data), "tool input"),
+                "agentId": context.metadata.get("agent_id"),
             },
         )
         parent_event_id = runtime.state.last_event_id
@@ -83,6 +84,7 @@ class _StateCoreToolPersister:
                 "success": result.success,
                 "result": result.data if result.success else str(result.error),
                 "terminationReason": termination_reason.value,
+                "agentId": context.metadata.get("agent_id"),
             },
             parent_event_id=parent_event_id,
         )

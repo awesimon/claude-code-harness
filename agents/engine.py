@@ -21,6 +21,7 @@ from agents.types import (
     parse_agent_definition,
 )
 from harness.budget import BudgetKind
+from harness.skills import acknowledge_skill_delivery, claim_skill_delivery_attempts
 from services import ChatCompletionRequest, LLMProvider, LLMService, Message
 from state_core import AgentRecord
 from tools import ToolRegistry
@@ -43,6 +44,17 @@ def _message_content_text(content: Any) -> str:
             return "\n".join(str(block.get("text", "")) for block in content)
         return json.dumps(content, ensure_ascii=False)
     return json.dumps(content, ensure_ascii=False)
+
+
+def _connected_mcp_servers(harness: "SessionHarness") -> tuple[str, ...]:
+    connected: list[str] = []
+    for record in harness.mcp.list_servers():
+        status = getattr(record, "status", None)
+        if getattr(status, "value", status) == "connected":
+            name = getattr(record, "name", None)
+            if isinstance(name, str):
+                connected.append(name)
+    return tuple(connected)
 
 
 def _assistant_message(message: Mapping[str, Any]) -> Message:
@@ -164,11 +176,7 @@ class AgentExecutor:
             provider=LLMProvider(record.definition_snapshot.get("provider", "openai")),
         )
 
-    def _resolve_tools(
-        self,
-        child_harness: SessionHarness,
-        skill_snapshots: tuple[Any, ...] = (),
-    ) -> list[Tool]:
+    def _resolve_tools(self, child_harness: SessionHarness) -> list[Tool]:
         registry = child_harness.tool_runtime.registry
         all_tools = [
             tool
@@ -194,17 +202,6 @@ class AgentExecutor:
             resolved = [
                 tool for tool in resolved if self.tool_name(tool, registry) not in denied
             ]
-        skill_allowed = {
-            name
-            for snapshot in skill_snapshots
-            for name in snapshot.allowed_tools
-        }
-        if skill_allowed:
-            resolved = [
-                tool
-                for tool in resolved
-                if self.tool_name(tool, registry) in skill_allowed
-            ]
         context = child_harness.tool_runtime.tool_context(
             child_harness.runtime_context
         )
@@ -214,34 +211,25 @@ class AgentExecutor:
     def tool_name(tool: Tool, registry: Any = ToolRegistry) -> str:
         return registry.resolve_name(tool.name) or canonical_tool_name(tool.name)
 
-    def _build_system_prompt(self, skill_snapshots: tuple[Any, ...] = ()) -> str:
+    def _build_system_prompt(self) -> str:
         if self.agent_definition.get_system_prompt:
-            base = self.agent_definition.get_system_prompt()
-        else:
-            base = (
-                "You are an agent for Claude Code.\n"
-                f"Agent Type: {self.agent_definition.agent_type}\n\n"
-                f"{self.agent_definition.when_to_use}\n\n"
-                "Complete the task and return a concise factual report."
-            )
-        if not skill_snapshots:
-            return base
-        instructions = "\n\n".join(
-            snapshot.prompt("${CLAUDE_SESSION_ID}") for snapshot in skill_snapshots
+            return self.agent_definition.get_system_prompt()
+        return (
+            "You are an agent for Claude Code.\n"
+            f"Agent Type: {self.agent_definition.agent_type}\n\n"
+            f"{self.agent_definition.when_to_use}\n\n"
+            "Complete the task and return a concise factual report."
         )
-        return f"{base}\n\n{instructions}"
 
     def _available_tools(
-        self,
-        child_harness: SessionHarness,
-        skill_snapshots: tuple[Any, ...] = (),
+        self, child_harness: SessionHarness
     ) -> tuple[dict[str, Tool], list[dict[str, Any]]]:
         registry = child_harness.tool_runtime.registry
         deferred = child_harness.deferred_tools
         available: dict[str, Tool] = {}
         schemas: list[dict[str, Any]] = []
         visible = set(deferred.visible_names())
-        for tool in self._resolve_tools(child_harness, skill_snapshots):
+        for tool in self._resolve_tools(child_harness):
             name = self.tool_name(tool, registry)
             spec = deferred.get_spec(name)
             if spec is None or name not in visible:
@@ -274,14 +262,38 @@ class AgentExecutor:
             raise asyncio.CancelledError
 
         registry = child_harness.tool_runtime.registry
-        skill_snapshots = tuple(
-            child_harness.skills.resolve(name)
+        resolver = child_harness.skills
+        available, _ = self._available_tools(child_harness)
+        skill_activations = tuple(
+            resolver.activate(
+                name,
+                available_mcp_servers=_connected_mcp_servers(child_harness),
+                available_tools=available,
+            )
             for name in (self.agent_definition.skills or ())
         )
-        system_prompt = self._build_system_prompt(skill_snapshots).replace(
+        system_prompt = self._build_system_prompt().replace(
             "${CLAUDE_SESSION_ID}", child_harness.session_id
         )
         llm_messages = [Message(role="system", content=system_prompt)]
+        resolver.announcement_delta(context_window_tokens=200_000)
+        llm_messages.extend(
+            Message(role="system", content=f"Available Agent Skills:\n{content}")
+            for content in resolver.announcement_history()
+        )
+        pending_skill_deliveries = claim_skill_delivery_attempts(
+            child_harness,
+            (activation.snapshot for activation in skill_activations),
+            source="static_agent",
+        )
+        llm_messages.extend(
+            Message(
+                role="system",
+                content=attempt.snapshot.prompt(child_harness.session_id),
+            )
+            for attempt in pending_skill_deliveries
+        )
+        announced_history_count = len(resolver.announcement_history())
         if self.agent_definition.initial_prompt:
             llm_messages.append(
                 Message(role="user", content=self.agent_definition.initial_prompt)
@@ -300,7 +312,14 @@ class AgentExecutor:
         for _turn in range(max_turns):
             if cancellation.cancelled:
                 raise asyncio.CancelledError
-            _, schemas = self._available_tools(child_harness, skill_snapshots)
+            resolver.announcement_delta(context_window_tokens=200_000)
+            announcement_history = resolver.announcement_history()
+            llm_messages.extend(
+                Message(role="system", content=f"Available Agent Skills:\n{content}")
+                for content in announcement_history[announced_history_count:]
+            )
+            announced_history_count = len(announcement_history)
+            _, schemas = self._available_tools(child_harness)
             model = record.definition_snapshot.get("model") or self.config.model
             if model == "inherit":
                 model = self.config.model
@@ -331,6 +350,13 @@ class AgentExecutor:
                 turn.release()
                 raise
             turn.consume()
+            for attempt in pending_skill_deliveries:
+                acknowledge_skill_delivery(
+                    child_harness,
+                    attempt,
+                    source="static_agent",
+                )
+            pending_skill_deliveries = ()
             budget.record_model_usage(
                 response.usage or {}, agent_id=child_harness.agent_id
             )
@@ -408,9 +434,7 @@ class AgentExecutor:
                             "Tool call arguments must decode to a JSON object"
                         )
 
-                    available, _ = self._available_tools(
-                        child_harness, skill_snapshots
-                    )
+                    available, _ = self._available_tools(child_harness)
                     if execution_name not in available:
                         result_data: Any = {
                             "error": f"Tool {tool_name!r} is not available"

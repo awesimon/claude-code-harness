@@ -19,10 +19,40 @@ from .base import (
 )
 
 
+def _active_harness():
+    return get_active_tool_context().get("session_harness")
+
+
 def _resolver() -> SkillResolver | None:
-    harness = get_active_tool_context().get("session_harness")
+    harness = _active_harness()
     resolver = getattr(harness, "skills", None)
     return resolver if isinstance(resolver, SkillResolver) else None
+
+
+def _connected_mcp_servers(harness: Any) -> tuple[str, ...]:
+    manager = getattr(harness, "mcp", None)
+    list_servers = getattr(manager, "list_servers", None)
+    if not callable(list_servers):
+        return ()
+    connected: list[str] = []
+    for record in list_servers():
+        status = getattr(record, "status", None)
+        if getattr(status, "value", status) == "connected":
+            name = getattr(record, "name", None)
+            if isinstance(name, str):
+                connected.append(name)
+    return tuple(connected)
+
+
+def _visible_tools(harness: Any) -> tuple[str, ...] | None:
+    deferred = getattr(harness, "deferred_tools", None)
+    visible_names = getattr(deferred, "visible_names", None)
+    if callable(visible_names):
+        return tuple(visible_names())
+    runtime = getattr(harness, "tool_runtime", None)
+    registry = getattr(runtime, "registry", None)
+    list_tools = getattr(registry, "list_tools", None)
+    return tuple(list_tools()) if callable(list_tools) else None
 
 
 @dataclass
@@ -60,18 +90,27 @@ class SkillExecuteToolV2(Tool[SkillExecuteInput, dict[str, Any]]):
         return None
 
     async def execute(self, input_data: SkillExecuteInput) -> ToolResult:
+        harness = _active_harness()
         resolver = _resolver()
         if resolver is None:
             return ToolResult.fail("session_harness is required for skill execution")
         try:
-            snapshot = resolver.resolve(input_data.skill.strip())
+            activation = resolver.activate(
+                input_data.skill.strip(),
+                available_mcp_servers=_connected_mcp_servers(harness),
+                available_tools=_visible_tools(harness),
+                activation_repository=getattr(
+                    getattr(harness, "store", None), "skill_activations", None
+                ),
+            )
+            snapshot = activation.snapshot
         except (OSError, SkillError) as exc:
             return ToolResult.fail(ToolExecutionError(str(exc)))
         return ToolResult.ok(
             {
                 "skill": snapshot.name,
                 "description": snapshot.description,
-                "content": snapshot.content,
+                "content": snapshot.content if activation.newly_activated else None,
                 "base_dir": snapshot.base_dir,
                 "digest": snapshot.digest,
                 "allowed_tools": list(snapshot.allowed_tools),
@@ -79,6 +118,8 @@ class SkillExecuteToolV2(Tool[SkillExecuteInput, dict[str, Any]]):
                 "resources": [item.path for item in snapshot.resources],
                 "scripts": list(snapshot.scripts),
                 "args": input_data.args,
+                "already_active": not activation.newly_activated,
+                "registered_hook_ids": list(activation.registered_hook_ids),
             },
             f"Skill '{snapshot.name}' resolved for this session",
             metadata={"skill": snapshot.name, "digest": snapshot.digest},

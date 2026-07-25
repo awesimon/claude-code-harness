@@ -127,9 +127,7 @@ def _validate_timeout(value: object) -> float:
 
 def _validate_agent_provider(value: object) -> str:
     if not isinstance(value, str) or value not in _SUPPORTED_AGENT_PROVIDERS:
-        raise HarnessScopeError(
-            "agent_provider must be one of: anthropic, openai"
-        )
+        raise HarnessScopeError("agent_provider must be one of: anthropic, openai")
     return value
 
 
@@ -159,12 +157,8 @@ class SessionHarness:
     _root_workspace: Path | str | None = field(default=None, repr=False)
     _is_child: bool = field(default=False, repr=False)
     _capability_token: object | None = field(default=None, repr=False)
-    _parent_harness: "SessionHarness | None" = field(
-        default=None, repr=False, compare=False
-    )
-    _services: dict[str, Any] = field(
-        default_factory=dict, repr=False, compare=False
-    )
+    _parent_harness: "SessionHarness | None" = field(default=None, repr=False, compare=False)
+    _services: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         input_context = self.runtime_context
@@ -271,19 +265,31 @@ class SessionHarness:
     def skills(self):
         from .skills import SkillResolver
 
+        resolver = self._services.get("skills")
+        if resolver is not None:
+            return resolver
         configured = self.runtime_context.metadata.get("skills_dir")
         skills_dir = (
-            _canonical_path(configured)
+            Path(configured).expanduser()
             if isinstance(configured, (str, Path))
             else self.effective_cwd / ".claude" / "skills"
         )
-        return SkillResolver(
+        configured_roots = self.runtime_context.metadata.get("skill_roots", ())
+        if isinstance(configured_roots, (str, bytes)) or not isinstance(configured_roots, Iterable):
+            raise HarnessScopeError("skill_roots must be an iterable of paths")
+        resolver = SkillResolver(
             skills_dir,
+            skill_roots=tuple(Path(root).expanduser() for root in configured_roots),
+            cwd=self.effective_cwd,
+            allowed_roots=self.allowed_workspaces,
             metadata_repository=self.store.metadata,
             root_session_id=self.root_session_id,
             agent_id=self.agent_id,
             hook_runtime=self.hooks,
+            activation_repository=self.store.skill_activations,
         )
+        self._services["skills"] = resolver
+        return resolver
 
     @property
     def budget(self):
@@ -333,9 +339,7 @@ class SessionHarness:
         registry = self._services.get("deferred_tools")
         if registry is None:
             parent = (
-                self._parent_harness.deferred_tools
-                if self._parent_harness is not None
-                else None
+                self._parent_harness.deferred_tools if self._parent_harness is not None else None
             )
             registry = DeferredToolRegistry(self, parent=parent)
             self._services["deferred_tools"] = registry
@@ -353,6 +357,8 @@ class SessionHarness:
         candidate = _canonical_path(value)
         if not any(_is_within(candidate, root) for root in self.allowed_workspaces):
             raise HarnessScopeError("effective cwd is outside the allowed workspace policy")
+        if candidate != self.effective_cwd:
+            self._services.pop("skills", None)
         self._services["effective_cwd"] = candidate
 
     def child(
@@ -465,8 +471,14 @@ class SessionHarnessFactory:
         allowed_workspaces: Iterable[Path | str] | object = _UNSET,
     ) -> SessionHarness:
         config = self._build_config(
-            workspace_root, permission_mode, approval_callback, tool_timeout, metadata,
-            agent_id, parent_agent_id, allowed_workspaces,
+            workspace_root,
+            permission_mode,
+            approval_callback,
+            tool_timeout,
+            metadata,
+            agent_id,
+            parent_agent_id,
+            allowed_workspaces,
         )
         return self._compose(self.session_runtime_factory.create(session_id), config)
 
@@ -484,12 +496,19 @@ class SessionHarnessFactory:
         allowed_workspaces: Iterable[Path | str] | object = _UNSET,
     ) -> SessionHarness:
         config = self._build_config(
-            workspace_root, permission_mode, approval_callback, tool_timeout, metadata,
-            agent_id, parent_agent_id, allowed_workspaces,
+            workspace_root,
+            permission_mode,
+            approval_callback,
+            tool_timeout,
+            metadata,
+            agent_id,
+            parent_agent_id,
+            allowed_workspaces,
         )
-        resumed = self._compose(
-            self.session_runtime_factory.resume(session_id), config
-        )
+        resumed = self._compose(self.session_runtime_factory.resume(session_id), config)
+        from .execution_tasks import ExecutionTaskManager
+
+        ExecutionTaskManager.for_harness(resumed).reconcile()
         scheduler = resumed.agent_scheduler
         self._agent_schedulers[session_id] = scheduler
         scheduler.reconcile()
@@ -513,18 +532,18 @@ class SessionHarnessFactory:
         """Resume durable state while observing, rather than replacing, its agent owner."""
 
         config = self._build_config(
-            workspace_root, permission_mode, approval_callback, tool_timeout, metadata,
-            agent_id, parent_agent_id, allowed_workspaces,
+            workspace_root,
+            permission_mode,
+            approval_callback,
+            tool_timeout,
+            metadata,
+            agent_id,
+            parent_agent_id,
+            allowed_workspaces,
         )
-        resumed = self._compose(
-            self.session_runtime_factory.resume(session_id), config
-        )
+        resumed = self._compose(self.session_runtime_factory.observe(session_id), config)
         scheduler = resumed.observed_agent_scheduler
         self._agent_schedulers[session_id] = scheduler
-        if not scheduler.live_agent_ids and not scheduler.is_degraded:
-            scheduler.reconcile()
-            resumed.traces.interrupt_open()
-            resumed.worktrees.restore_active()
         return resumed
 
     def _build_config(
@@ -575,9 +594,7 @@ class SessionHarnessFactory:
             else _canonicalize_paths(allowed_workspaces)
         )
         metadata_allowed = _canonicalize_paths(metadata_allowed)
-        roots = _canonicalize_allowed_workspaces(
-            [*configured_allowed, *metadata_allowed], root
-        )
+        roots = _canonicalize_allowed_workspaces([*configured_allowed, *metadata_allowed], root)
         resolved_agent_id = None if agent_id is _UNSET else agent_id
         resolved_parent_agent_id = None if parent_agent_id is _UNSET else parent_agent_id
         if resolved_agent_id is not None and not isinstance(resolved_agent_id, str):

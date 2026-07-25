@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -23,6 +24,7 @@ from harness import (
     SessionHarnessFactory,
 )
 from harness.budget import BudgetKind
+from harness.skills import acknowledge_skill_delivery, claim_skill_delivery_attempts
 from services import ChatCompletionRequest, LLMProvider, LLMService, Message
 from services.error_recovery import (
     PromptTooLongError,
@@ -31,11 +33,12 @@ from services.error_recovery import (
     RetryConfig,
     classify_for_user,
 )
-
 from state_core import (
     AgentRecord,
     AgentStatus,
+    AgentTerminationReason,
     EventType,
+    RuntimeRecordRevisionConflict,
     SessionRuntime,
     SessionRuntimeFactory,
     SQLAlchemyStateStore,
@@ -420,6 +423,9 @@ class QueryEngine:
         )
         self._agent_repository = session_runtime_factory.store.agents
         self._session_harnesses: Dict[str, SessionHarness] = {}
+        self._pending_skill_deliveries: ContextVar[
+            tuple[str, tuple[Any, ...]] | None
+        ] = ContextVar("pending_skill_deliveries", default=None)
         self._context_control_config = context_control_config or ContextControlConfig()
         self._context_summary_callback = context_summary_callback
 
@@ -586,12 +592,66 @@ class QueryEngine:
         conversation_id: str,
         messages: List[Message],
     ) -> List[Message]:
+        harness = self._session_harness(conversation_id)
+        context_window_tokens = harness.runtime_context.metadata.get(
+            "context_window_tokens", 200_000
+        )
+        harness.skills.announcement_delta(
+            context_window_tokens=(
+                context_window_tokens
+                if isinstance(context_window_tokens, int)
+                and not isinstance(context_window_tokens, bool)
+                and context_window_tokens > 0
+                else 200_000
+            )
+        )
+        skill_messages = [
+            Message(role="system", content=f"Available Agent Skills:\n{content}")
+            for content in harness.skills.announcement_history()
+        ]
+        pending = claim_skill_delivery_attempts(
+            harness,
+            harness.skills.active_snapshots(),
+            source="root_model",
+        )
+        self._pending_skill_deliveries.set((conversation_id, pending))
+        activation_messages = [
+            Message(
+                role="system",
+                content=attempt.snapshot.prompt(harness.session_id),
+            )
+            for attempt in pending
+        ]
+        system_messages = [message for message in messages if message.role == "system"]
+        transcript_messages = [
+            message for message in messages if message.role != "system"
+        ]
         controller = ContextController(
-            self._session_harness(conversation_id),
+            harness,
             config=self._context_control_config,
             summarize=self._context_summary_callback or self._summarize_context,
         )
-        return await controller.prepare_messages(messages)
+        return await controller.prepare_messages(
+            [
+                *system_messages,
+                *skill_messages,
+                *activation_messages,
+                *transcript_messages,
+            ]
+        )
+
+    def _ack_skill_deliveries(self, conversation_id: str) -> None:
+        harness = self._session_harness(conversation_id)
+        pending = self._pending_skill_deliveries.get()
+        if pending is None or pending[0] != conversation_id:
+            return
+        self._pending_skill_deliveries.set(None)
+        for attempt in pending[1]:
+            acknowledge_skill_delivery(
+                harness,
+                attempt,
+                source="root_model",
+            )
 
     async def _summarize_context(self, messages) -> CompactionSummary:
         request = ChatCompletionRequest(
@@ -748,6 +808,7 @@ class QueryEngine:
                 response = await self._budgeted_model_call(
                     conversation_id, complete_model_call
                 )
+                self._ack_skill_deliveries(conversation_id)
             except Exception as e:
                 # 使用错误分类提供友好的错误信息
                 error_info = self._classify_model_error(e)
@@ -1072,6 +1133,8 @@ class QueryEngine:
 
                     # Consume the terminal usage chunk so model budgets and
                     # traces settle with actual usage.
+
+                self._ack_skill_deliveries(conversation_id)
 
                 # 处理工具调用
                 if tool_calls_accumulator:
@@ -1399,6 +1462,22 @@ class QueryEngine:
             return None
         if record.status not in {AgentStatus.PENDING, AgentStatus.RUNNING}:
             return record
+        store = self._harness_factory.session_runtime_factory.store
+        if store.states.load_session(record.root_session_id) is None:
+            try:
+                return self._agent_repository.transition(
+                    record.agent_id,
+                    AgentStatus.INTERRUPTED,
+                    record.revision,
+                    termination_reason=AgentTerminationReason.INTERRUPTED,
+                )
+            except RuntimeRecordRevisionConflict:
+                current = self._agent_repository.get(record.agent_id)
+                if current is None:
+                    return None
+                if current.status in {AgentStatus.PENDING, AgentStatus.RUNNING}:
+                    raise
+                return current
         harness = self._session_harnesses.get(record.root_session_id)
         if harness is None:
             harness = self._harness_factory.resume_observer(

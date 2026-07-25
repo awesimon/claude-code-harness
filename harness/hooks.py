@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import os
@@ -13,11 +14,20 @@ import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Iterable, Mapping
+from types import MappingProxyType
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Mapping
 
-from state_core import RuntimeMetadataRepository, RuntimeRecordRevisionConflict
+from state_core import (
+    HookAsyncMode,
+    HookDefinitionRecord,
+    HookInvocationRecord,
+    HookInvocationStatus,
+    RuntimeMetadataRepository,
+    RuntimeRecordRevisionConflict,
+)
 
 from .context import CancellationToken
 
@@ -83,6 +93,9 @@ _ENV_ALLOWLIST = frozenset(
     }
 )
 _HOOK_DEPTH: ContextVar[int] = ContextVar("hook_execution_depth", default=0)
+_ACTIVE_HOOK_EVENTS: ContextVar[frozenset[str]] = ContextVar(
+    "active_hook_events", default=frozenset()
+)
 _CONFIG_NAMESPACE = "hooks.config"
 _EVENT_NAMESPACE = "hooks.events"
 
@@ -193,9 +206,7 @@ class _HookCommandFailure(Exception):
         self.exit_code = exit_code
 
 
-async def _read_limited(
-    stream: asyncio.StreamReader, limit: int, consumed: list[int]
-) -> bytes:
+async def _read_limited(stream: asyncio.StreamReader, limit: int, consumed: list[int]) -> bytes:
     chunks: list[bytes] = []
     size = 0
     while True:
@@ -311,9 +322,7 @@ class HookRuntime:
     def register(self, hook: HookDefinition) -> HookDefinition:
         """Register a definition once by stable ID and persist the new snapshot."""
 
-        existing = next(
-            (item for item in self._definitions if item.hook_id == hook.hook_id), None
-        )
+        existing = next((item for item in self._definitions if item.hook_id == hook.hook_id), None)
         if existing is not None:
             if existing != hook:
                 raise ValueError(f"hook_id {hook.hook_id!r} is already registered")
@@ -678,9 +687,7 @@ class HookRuntime:
     def _load_definitions(self) -> tuple[HookDefinition, ...]:
         snapshot = self._metadata_snapshot(_CONFIG_NAMESPACE)
         hooks = snapshot.get("hooks", [])
-        return tuple(
-            HookDefinition.from_json(item) for item in hooks if isinstance(item, Mapping)
-        )
+        return tuple(HookDefinition.from_json(item) for item in hooks if isinstance(item, Mapping))
 
     def _persist_definitions(self, definitions: Iterable[HookDefinition]) -> None:
         if self._metadata is None:
@@ -745,3 +752,623 @@ class HookRuntime:
         raise RuntimeRecordRevisionConflict(
             "metadata", f"{self._root_session_id}:{namespace}", None, None
         )
+
+
+@dataclass(frozen=True)
+class HookDispatchResult:
+    """Stable, runner-neutral effects produced by one lifecycle event."""
+
+    decision: HookDecision = HookDecision.ALLOW
+    input_patch: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    permission_decision: str | None = None
+    permission_updates: tuple[Mapping[str, Any], ...] = ()
+    reason: str | None = None
+    failures: tuple[HookFailure, ...] = ()
+    executed_hook_ids: tuple[str, ...] = ()
+    async_invocation_ids: tuple[str, ...] = ()
+    attempt_limit_reached: bool = False
+
+    @property
+    def blocked(self) -> bool:
+        return self.decision is HookDecision.BLOCK
+
+
+class _RunnerFailure(Exception):
+    def __init__(self, category: str, message: str, *, exit_code: int | None = None):
+        super().__init__(message)
+        self.category = category
+        self.exit_code = exit_code
+
+
+Runner = Callable[
+    [Mapping[str, Any], Mapping[str, Any], CancellationToken],
+    Mapping[str, Any] | Awaitable[Mapping[str, Any]],
+]
+
+
+@dataclass(frozen=True)
+class RunnerContext:
+    """Authority and execution limits supplied to an agent hook by the dispatcher."""
+
+    root_session_id: str
+    agent_id: str | None
+    cancellation: CancellationToken
+    allowed_tools: tuple[str, ...]
+    permission_mode: str
+    budget: Mapping[str, Any]
+    recursion_depth: int
+    recursion_limit: int
+    active_events: frozenset[str]
+    restricted: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "allowed_tools", tuple(self.allowed_tools))
+        object.__setattr__(self, "budget", MappingProxyType(dict(self.budget)))
+
+
+def _plain_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(item) for item in value]
+    return value
+
+
+class HookDispatcher:
+    """Execute versioned durable hooks and aggregate effects deterministically."""
+
+    _FEEDBACK_EVENTS = frozenset({"Stop", "TaskCompleted", "TeammateIdle"})
+
+    def __init__(
+        self,
+        definition_repository: Any,
+        invocation_repository: Any,
+        *,
+        root_session_id: str,
+        owner_token: str,
+        prompt_runner: Runner | None = None,
+        http_runner: Runner | None = None,
+        agent_runner: Runner | None = None,
+        notification_sink: Callable[[dict[str, Any]], Any] | None = None,
+        feedback_attempt_limit: int = 3,
+        output_limit: int = 64 * 1024,
+        recursion_limit: int = 4,
+        budget_consumer: Callable[[HookDefinitionRecord], Any] | None = None,
+        agent_tool_allowlist: Iterable[str] = (),
+        agent_permission_mode: str = "default",
+        agent_budget: Mapping[str, Any] | None = None,
+        hook_transaction_service: Any = None,
+    ) -> None:
+        if feedback_attempt_limit <= 0 or output_limit <= 0 or recursion_limit <= 0:
+            raise ValueError("hook limits must be positive")
+        self._definitions = definition_repository
+        self._invocations = invocation_repository
+        self._root_session_id = root_session_id
+        self._owner_token = owner_token
+        self._prompt_runner = prompt_runner
+        self._http_runner = http_runner
+        self._agent_runner = agent_runner
+        self._notification_sink = notification_sink
+        self._feedback_attempt_limit = feedback_attempt_limit
+        self._output_limit = output_limit
+        self._recursion_limit = recursion_limit
+        self._budget_consumer = budget_consumer
+        self._agent_tool_allowlist = tuple(dict.fromkeys(agent_tool_allowlist))
+        self._agent_permission_mode = agent_permission_mode
+        self._agent_budget = MappingProxyType(dict(agent_budget or {}))
+        if hook_transaction_service is None and hasattr(invocation_repository, "_session_factory"):
+            from state_core.outbox import SQLAlchemyHookTransactionService
+
+            hook_transaction_service = SQLAlchemyHookTransactionService(
+                invocation_repository._session_factory
+            )
+        self._hook_transactions = hook_transaction_service
+        self._background: set[asyncio.Task[Any]] = set()
+
+    async def dispatch(
+        self,
+        envelope: Mapping[str, Any],
+        cancellation: CancellationToken | None = None,
+    ) -> HookDispatchResult:
+        event = str(envelope.get("hook_event_name") or envelope.get("event") or "")
+        correlation_id = str(envelope.get("correlation_id") or "")
+        if not event or not correlation_id:
+            raise ValueError("hook envelopes require hook_event_name and correlation_id")
+        if event in _ACTIVE_HOOK_EVENTS.get():
+            return HookDispatchResult()
+        if str(envelope.get("root_session_id") or self._root_session_id) != self._root_session_id:
+            raise ValueError("hook envelope belongs to another root session")
+        attempt = int(envelope.get("feedback_attempt", 1))
+        if event in self._FEEDBACK_EVENTS and attempt > self._feedback_attempt_limit:
+            return HookDispatchResult(
+                decision=HookDecision.BLOCK,
+                reason="hook feedback attempt limit reached",
+                attempt_limit_reached=True,
+            )
+        token = cancellation or CancellationToken()
+        definitions = sorted(
+            (
+                definition
+                for definition in self._definitions.list(self._root_session_id)
+                if definition.enabled
+                and definition.event == event
+                and self._matches(definition.matcher, envelope)
+            ),
+            key=lambda item: (item.order, item.definition_id),
+        )
+        scheduled: list[tuple[HookDefinitionRecord, asyncio.Task[Any] | None, str | None]] = []
+        for definition in definitions:
+            invocation, claimed = self._claim(definition, envelope, attempt)
+            if not claimed or invocation is None:
+                continue
+            if definition.async_mode is not HookAsyncMode.SYNC:
+                task = asyncio.create_task(
+                    self._complete_async_invocation(
+                        definition,
+                        invocation,
+                        envelope,
+                        token,
+                        rewake=definition.async_mode is HookAsyncMode.ASYNC_REWAKE,
+                    )
+                )
+                self._background.add(task)
+                task.add_done_callback(self._background.discard)
+                scheduled.append((definition, None, invocation.invocation_id))
+            else:
+                scheduled.append(
+                    (
+                        definition,
+                        asyncio.create_task(
+                            self._complete_invocation(definition, invocation, envelope, token)
+                        ),
+                        None,
+                    )
+                )
+
+        sync_tasks = [item[1] for item in scheduled if item[1] is not None]
+        raw = await asyncio.gather(*sync_tasks) if sync_tasks else []
+        outcomes = iter(raw)
+        ordered: list[tuple[HookDefinitionRecord, Mapping[str, Any] | None, HookFailure | None]] = (
+            []
+        )
+        for definition, task, _ in scheduled:
+            if task is None:
+                continue
+            ordered.append((definition, *next(outcomes)))
+        return self._aggregate(
+            ordered,
+            tuple(item.definition_id for item, _, _ in scheduled),
+            tuple(invocation_id for _, _, invocation_id in scheduled if invocation_id),
+        )
+
+    async def drain(self) -> None:
+        while self._background:
+            await asyncio.gather(*tuple(self._background), return_exceptions=True)
+
+    def reconcile(self, *, live_owner_tokens: set[str] | None = None) -> list[Any]:
+        return self._invocations.interrupt_open(
+            self._root_session_id,
+            live_owner_tokens=live_owner_tokens or set(),
+            now=datetime.now(timezone.utc),
+        )
+
+    @staticmethod
+    def _matches(matcher: str | None, envelope: Mapping[str, Any]) -> bool:
+        if matcher is None:
+            return True
+        candidate = (
+            envelope.get("tool_name")
+            or envelope.get("task_id")
+            or envelope.get("mcp_server_id")
+            or envelope.get("payload", {}).get("trigger")
+            if isinstance(envelope.get("payload", {}), Mapping)
+            else None
+        )
+        return candidate is not None and re.search(matcher, str(candidate)) is not None
+
+    def _claim(
+        self,
+        definition: HookDefinitionRecord,
+        envelope: Mapping[str, Any],
+        attempt: int,
+    ) -> tuple[HookInvocationRecord | None, bool]:
+        correlation = str(envelope["correlation_id"])
+        if definition.once:
+            key = (
+                f"hook-once:{self._root_session_id}:{definition.definition_id}:"
+                f"{definition.config_revision}"
+            )
+        else:
+            suffix = f":{attempt}" if definition.event in self._FEEDBACK_EVENTS else ""
+            key = (
+                f"hook:{self._root_session_id}:{definition.definition_id}:"
+                f"{definition.config_revision}:{correlation}{suffix}"
+            )
+        if self._invocations.get_by_idempotency_key(key) is not None:
+            return None, False
+        invocation = HookInvocationRecord(
+            invocation_id=f"hook_{uuid.uuid4().hex}",
+            root_session_id=self._root_session_id,
+            definition_id=definition.definition_id,
+            definition_revision=definition.config_revision,
+            event=definition.event,
+            event_envelope=dict(envelope),
+            correlation_id=correlation,
+            idempotency_key=key,
+            agent_id=envelope.get("agent_id"),
+            attempt=attempt,
+            deadline_at=datetime.now(timezone.utc) + timedelta(milliseconds=definition.timeout_ms),
+        )
+        try:
+            return self._invocations.create(invocation), True
+        except RuntimeRecordRevisionConflict:
+            return None, False
+
+    async def _complete_invocation(
+        self,
+        definition: HookDefinitionRecord,
+        invocation: HookInvocationRecord,
+        envelope: Mapping[str, Any],
+        cancellation: CancellationToken,
+        *,
+        rewake: bool = False,
+    ) -> tuple[Mapping[str, Any] | None, HookFailure | None]:
+        try:
+            running = self._invocations.transition(
+                invocation.invocation_id,
+                HookInvocationStatus.RUNNING,
+                invocation.revision,
+                lease_owner=self._owner_token,
+                lease_expires_at=invocation.deadline_at,
+            )
+        except RuntimeRecordRevisionConflict:
+            return None, HookFailure(
+                definition.definition_id, "interrupted", "invocation claim lost"
+            )
+        try:
+            output = await self._run_with_limits(definition, envelope, cancellation)
+            blocked = (
+                output.get("decision") in {"block", "deny"}
+                or output.get("continue") is False
+                or output.get("permission_decision") == "deny"
+            )
+            terminal = HookInvocationStatus.BLOCKED if blocked else HookInvocationStatus.SUCCEEDED
+            self._complete_terminal(
+                running,
+                terminal,
+                rewake=rewake,
+                outcome=dict(output),
+            )
+            return output, None
+        except asyncio.CancelledError:
+            try:
+                self._complete_terminal(
+                    running,
+                    HookInvocationStatus.CANCELLED,
+                    rewake=rewake,
+                    error={"category": "cancelled", "message": "hook dispatch cancelled"},
+                )
+            except RuntimeRecordRevisionConflict:
+                pass
+            raise
+        except _RunnerFailure as exc:
+            status = {
+                "timed_out": HookInvocationStatus.TIMED_OUT,
+                "cancelled": HookInvocationStatus.CANCELLED,
+                "blocking": HookInvocationStatus.BLOCKED,
+            }.get(exc.category, HookInvocationStatus.FAILED)
+            try:
+                self._complete_terminal(
+                    running,
+                    status,
+                    rewake=rewake,
+                    error={"category": exc.category, "message": str(exc)},
+                )
+            except RuntimeRecordRevisionConflict:
+                pass
+            return None, HookFailure(
+                definition.definition_id, exc.category, str(exc), exc.exit_code
+            )
+
+    async def _complete_async_invocation(
+        self,
+        definition: HookDefinitionRecord,
+        invocation: HookInvocationRecord,
+        envelope: Mapping[str, Any],
+        cancellation: CancellationToken,
+        *,
+        rewake: bool,
+    ) -> tuple[Mapping[str, Any] | None, HookFailure | None]:
+        result = await self._complete_invocation(
+            definition,
+            invocation,
+            envelope,
+            cancellation,
+            rewake=rewake,
+        )
+        if rewake:
+            await self._notify_rewake(invocation.invocation_id)
+        return result
+
+    def _complete_terminal(
+        self,
+        running: HookInvocationRecord,
+        status: HookInvocationStatus,
+        *,
+        rewake: bool,
+        outcome: Mapping[str, Any] | None = None,
+        error: Mapping[str, Any] | None = None,
+    ) -> HookInvocationRecord:
+        if rewake:
+            if self._hook_transactions is None:
+                raise RuntimeError("asyncRewake hooks require a durable hook transaction service")
+            return self._hook_transactions.complete_with_rewake(
+                running.invocation_id,
+                status,
+                running.revision,
+                outcome=outcome,
+                error=error,
+            )
+        return self._invocations.transition(
+            running.invocation_id,
+            status,
+            running.revision,
+            lease_owner=None,
+            lease_expires_at=None,
+            outcome=outcome,
+            error=error,
+        )
+
+    async def _run_with_limits(
+        self,
+        definition: HookDefinitionRecord,
+        envelope: Mapping[str, Any],
+        cancellation: CancellationToken,
+    ) -> Mapping[str, Any]:
+        if _HOOK_DEPTH.get() >= self._recursion_limit:
+            raise _RunnerFailure("recursion_guard", "hook recursion limit reached")
+        if self._budget_consumer is not None:
+            allowed = self._budget_consumer(definition)
+            allowed = await allowed if inspect.isawaitable(allowed) else allowed
+            if allowed is False:
+                raise _RunnerFailure("budget_exhausted", "hook budget exhausted")
+        depth_token = _HOOK_DEPTH.set(_HOOK_DEPTH.get() + 1)
+        event = str(envelope.get("hook_event_name") or envelope.get("event"))
+        events_token = _ACTIVE_HOOK_EVENTS.set(_ACTIVE_HOOK_EVENTS.get() | {event})
+        runner_task = asyncio.create_task(self._run_runner(definition, envelope, cancellation))
+        cancel_task = asyncio.create_task(cancellation.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {runner_task, cancel_task},
+                timeout=definition.timeout_ms / 1000,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_task in done:
+                runner_task.cancel()
+                await asyncio.gather(runner_task, return_exceptions=True)
+                raise _RunnerFailure("cancelled", "hook execution cancelled")
+            if runner_task not in done:
+                runner_task.cancel()
+                await asyncio.gather(runner_task, return_exceptions=True)
+                raise _RunnerFailure("timed_out", "hook execution timed out")
+            try:
+                result = await runner_task
+            except _RunnerFailure:
+                raise
+            except asyncio.CancelledError:
+                raise _RunnerFailure("cancelled", "hook execution cancelled") from None
+            except Exception as exc:
+                raise _RunnerFailure("runner_failed", str(exc)) from exc
+            if not isinstance(result, Mapping):
+                raise _RunnerFailure("malformed_output", "hook runner must return a JSON object")
+            result = self._normalize_output(_plain_json(result))
+            encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
+            limit = int(definition.runner_config.get("output_limit", self._output_limit))
+            if len(encoded) > limit:
+                raise _RunnerFailure("output_limit", "hook output exceeded configured limit")
+            return result
+        except asyncio.CancelledError:
+            runner_task.cancel()
+            await asyncio.gather(runner_task, return_exceptions=True)
+            raise
+        finally:
+            cancel_task.cancel()
+            await asyncio.gather(cancel_task, return_exceptions=True)
+            _ACTIVE_HOOK_EVENTS.reset(events_token)
+            _HOOK_DEPTH.reset(depth_token)
+
+    async def _run_runner(
+        self,
+        definition: HookDefinitionRecord,
+        envelope: Mapping[str, Any],
+        cancellation: CancellationToken,
+    ) -> Mapping[str, Any]:
+        kind = definition.runner_kind
+        config = definition.runner_config
+        if kind == "command":
+            return await self._run_command(envelope, config)
+        runner = {
+            "prompt": self._prompt_runner,
+            "http": self._http_runner,
+            "agent": self._agent_runner,
+        }.get(kind)
+        if runner is None:
+            raise _RunnerFailure("runner_unavailable", f"{kind} hook runner is not configured")
+        runner_scope: CancellationToken | RunnerContext = cancellation
+        if kind == "agent":
+            runner_scope = RunnerContext(
+                root_session_id=self._root_session_id,
+                agent_id=envelope.get("agent_id"),
+                cancellation=cancellation,
+                allowed_tools=self._agent_tool_allowlist,
+                permission_mode=self._agent_permission_mode,
+                budget=self._agent_budget,
+                recursion_depth=_HOOK_DEPTH.get(),
+                recursion_limit=self._recursion_limit,
+                active_events=_ACTIVE_HOOK_EVENTS.get(),
+            )
+        value = runner(envelope, config, runner_scope)
+        return await value if inspect.isawaitable(value) else value
+
+    async def _run_command(
+        self, envelope: Mapping[str, Any], config: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        command = config.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise _RunnerFailure("invalid_config", "command hook requires a command")
+        env = {key: value for key, value in os.environ.items() if key in _ENV_ALLOWLIST}
+        cwd = envelope.get("cwd")
+        process = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
+        assert process.stdin is not None
+        assert process.stdout is not None
+        assert process.stderr is not None
+        limit = int(config.get("output_limit", self._output_limit))
+        consumed = [0]
+        stdout_task = asyncio.create_task(_read_limited(process.stdout, limit, consumed))
+        stderr_task = asyncio.create_task(_read_limited(process.stderr, limit, consumed))
+        process_task = asyncio.create_task(process.wait())
+        try:
+            process.stdin.write(json.dumps(dict(envelope), ensure_ascii=False).encode("utf-8"))
+            await process.stdin.drain()
+            process.stdin.close()
+            pending = {stdout_task, stderr_task, process_task}
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in (stdout_task, stderr_task):
+                    if task in done and task.done():
+                        failure = task.exception()
+                        if isinstance(failure, _HookCommandFailure):
+                            raise _RunnerFailure(
+                                failure.category, str(failure), exit_code=failure.exit_code
+                            ) from failure
+                        if failure is not None:
+                            raise _RunnerFailure("io_failed", "hook output could not be read")
+            stdout = stdout_task.result()
+            stderr = stderr_task.result()
+            exit_code = process_task.result()
+        except asyncio.CancelledError:
+            await _terminate_process(process)
+            raise
+        finally:
+            if process.returncode is None:
+                await _terminate_process(process)
+            for task in (stdout_task, stderr_task, process_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stdout_task, stderr_task, process_task, return_exceptions=True)
+        if exit_code != 0:
+            category = "blocking" if exit_code == 2 else "nonzero_exit"
+            raise _RunnerFailure(
+                category,
+                stderr.decode("utf-8", "replace").strip() or f"hook exited {exit_code}",
+                exit_code=exit_code,
+            )
+        if not stdout.strip():
+            return {}
+        try:
+            return _parse_single_object(stdout)
+        except _HookCommandFailure as exc:
+            raise _RunnerFailure(exc.category, str(exc), exit_code=exc.exit_code) from exc
+
+    @staticmethod
+    def _normalize_output(output: Mapping[str, Any]) -> dict[str, Any]:
+        normalized = dict(output)
+        specific = normalized.get("hookSpecificOutput")
+        if not isinstance(specific, Mapping):
+            return normalized
+        event = specific.get("hookEventName")
+        if event == "PreToolUse":
+            normalized["permission_decision"] = specific.get("permissionDecision")
+            if isinstance(specific.get("updatedInput"), Mapping):
+                normalized["updated_input"] = specific["updatedInput"]
+        elif event == "PermissionRequest" and isinstance(specific.get("decision"), Mapping):
+            decision = specific["decision"]
+            normalized["permission_decision"] = decision.get("behavior")
+            if isinstance(decision.get("updatedInput"), Mapping):
+                normalized["updated_input"] = decision["updatedInput"]
+            if isinstance(decision.get("updatedPermissions"), list):
+                normalized["permission_updates"] = decision["updatedPermissions"]
+            if decision.get("message") is not None:
+                normalized["reason"] = decision["message"]
+        if specific.get("additionalContext") is not None:
+            normalized.setdefault("metadata", {})["additional_context"] = specific[
+                "additionalContext"
+            ]
+        return normalized
+
+    @staticmethod
+    def _aggregate(
+        outcomes: Iterable[
+            tuple[HookDefinitionRecord, Mapping[str, Any] | None, HookFailure | None]
+        ],
+        executed: tuple[str, ...],
+        async_ids: tuple[str, ...],
+    ) -> HookDispatchResult:
+        patch: dict[str, Any] = {}
+        metadata: dict[str, Any] = {}
+        failures: list[HookFailure] = []
+        decision = HookDecision.ALLOW
+        permission: str | None = None
+        updates: list[Mapping[str, Any]] = []
+        reason: str | None = None
+        rank = {None: 0, "allow": 1, "ask": 2, "deny": 3}
+        fail_closed = {event.value for event in _FAIL_CLOSED_EVENTS}
+        for definition, output, failure in outcomes:
+            if failure is not None:
+                failures.append(failure)
+                if failure.category == "blocking" or definition.event in fail_closed:
+                    decision = HookDecision.BLOCK
+                    reason = failure.message
+                continue
+            assert output is not None
+            current_patch = output.get("updated_input", output.get("input_patch"))
+            if isinstance(current_patch, Mapping):
+                patch.update(current_patch)
+            attached = output.get("metadata")
+            if isinstance(attached, Mapping):
+                metadata.update(attached)
+            candidate = output.get("permission_decision")
+            if candidate in rank and rank[candidate] > rank[permission]:
+                permission = candidate
+            candidate_updates = output.get("permission_updates", ())
+            if isinstance(candidate_updates, (list, tuple)):
+                updates.extend(item for item in candidate_updates if isinstance(item, Mapping))
+            if (
+                output.get("decision") in {"block", "deny"}
+                or output.get("continue") is False
+                or candidate == "deny"
+            ):
+                decision = HookDecision.BLOCK
+                reason = str(output.get("reason") or output.get("stop_reason") or "blocked by hook")
+        return HookDispatchResult(
+            decision=decision,
+            input_patch=patch,
+            metadata=metadata,
+            permission_decision=permission,
+            permission_updates=tuple(updates),
+            reason=reason,
+            failures=tuple(failures),
+            executed_hook_ids=executed,
+            async_invocation_ids=async_ids,
+        )
+
+    async def _notify_rewake(self, invocation_id: str) -> None:
+        if self._notification_sink is None:
+            return
+        notification = {
+            "type": "hook_async_rewake",
+            "root_session_id": self._root_session_id,
+            "invocation_id": invocation_id,
+        }
+        value = self._notification_sink(notification)
+        if inspect.isawaitable(value):
+            await value

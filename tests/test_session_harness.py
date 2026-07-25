@@ -12,13 +12,20 @@ from sqlalchemy.orm import sessionmaker
 import harness
 from harness import PermissionMode, RuntimeContext, SessionHarness, ToolRuntime
 from harness.agents import AgentScheduler
+from harness.execution_tasks import ExecutionTaskManager
 from models import Base
 from state_core import (
     AgentRecord,
     AgentStatus,
     EventType,
+    ExecutionTaskRecord,
+    ExecutionTaskStatus,
     SessionRuntimeFactory,
     SQLAlchemyStateStore,
+    TraceSpanRecord,
+    TraceSpanStatus,
+    WorktreeRecord,
+    WorktreeStatus,
 )
 from tools.base import Tool, ToolResult
 
@@ -67,9 +74,7 @@ def factory(tmp_path: Path, workspace: Path):
     return harness.SessionHarnessFactory(runtime_factory, workspace_root=workspace)
 
 
-def test_root_composes_authoritative_runtime_context_and_metadata(
-    factory, workspace: Path
-) -> None:
+def test_root_composes_authoritative_runtime_context_and_metadata(factory, workspace: Path) -> None:
     harness = factory.create("root", metadata={"request_id": "request-1"})
 
     assert harness.session_id == harness.root_session_id == "root"
@@ -153,9 +158,44 @@ def test_child_cwd_enforces_workspace_policy_without_changing_process_cwd(
     assert os.getcwd() == str(original_cwd)
 
 
-def test_root_metadata_cannot_expand_child_cwd_policy(
-    factory, tmp_path: Path
+def test_effective_cwd_change_rebuilds_skill_resolver_and_keeps_durable_state(
+    factory,
+    workspace: Path,
+    tmp_path: Path,
 ) -> None:
+    checkout = tmp_path / "checkout"
+    for root, name, body in (
+        (workspace, "base", "Base instructions."),
+        (checkout, "checkout", "Checkout instructions."),
+    ):
+        skill_dir = root / ".claude" / "skills" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name} skill\n---\n\n{body}",
+            encoding="utf-8",
+        )
+    scoped_factory = harness.SessionHarnessFactory(
+        factory.session_runtime_factory,
+        workspace_root=workspace,
+        allowed_workspaces=[checkout],
+    )
+    root = scoped_factory.create("skill-cwd")
+    original = root.skills
+    original.activate("base")
+    original.announcement_delta(context_window_tokens=200_000)
+    durable_history = original.announcement_history()
+
+    root._set_effective_cwd(checkout)
+    rebuilt = root.skills
+
+    assert rebuilt is not original
+    assert rebuilt.catalog.cwd == checkout.resolve()
+    assert [entry.name for entry in rebuilt.index()] == ["checkout"]
+    assert rebuilt.announcement_history() == durable_history
+    assert [snapshot.name for snapshot in rebuilt.active_snapshots()] == ["base"]
+
+
+def test_root_metadata_cannot_expand_child_cwd_policy(factory, tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     root = factory.create("protected", metadata={"_harness_root_workspace": outside})
@@ -164,9 +204,7 @@ def test_root_metadata_cannot_expand_child_cwd_policy(
         root.child("rejected", cwd=outside)
 
 
-def test_child_metadata_cannot_escalate_grandchild_workspace(
-    factory, tmp_path: Path
-) -> None:
+def test_child_metadata_cannot_escalate_grandchild_workspace(factory, tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     child = factory.create("capability").child("child")
@@ -202,9 +240,7 @@ def test_reserved_metadata_is_rejected_and_user_metadata_isolated(factory) -> No
         factory.create("non-copyable", metadata={"value": NonCopyableMetadata()})
 
 
-def test_invalid_factory_calls_do_not_mutate_durable_runtime(
-    factory, workspace: Path
-) -> None:
+def test_invalid_factory_calls_do_not_mutate_durable_runtime(factory, workspace: Path) -> None:
     with pytest.raises(harness.HarnessScopeError, match="permission_mode"):
         factory.create("ghost", permission_mode="invalid")
     assert factory.session_runtime_factory.store.states.load_session("ghost") is None
@@ -237,9 +273,7 @@ async def test_explicit_child_timeout_none_disables_shared_default(
     disabled = root.child("disabled", tool_timeout=None)
 
     timed_out = await root.tool_runtime.execute("slow_harness", {}, root.runtime_context)
-    completed = await disabled.tool_runtime.execute(
-        "slow_harness", {}, disabled.runtime_context
-    )
+    completed = await disabled.tool_runtime.execute("slow_harness", {}, disabled.runtime_context)
 
     assert timed_out.termination_reason.value == "timed_out"
     assert completed.result.success
@@ -305,11 +339,7 @@ async def test_immutable_metadata_cannot_redirect_todo_to_another_session(factor
 
     result = await first.tool_runtime.execute(
         "TodoWrite",
-        {
-            "todos": [
-                {"content": "first", "status": "pending", "activeForm": "First"}
-            ]
-        },
+        {"todos": [{"content": "first", "status": "pending", "activeForm": "First"}]},
         first.runtime_context,
     )
 
@@ -360,9 +390,9 @@ def test_resume_is_fresh_and_observes_durable_checkpoint_without_replaying_work(
     assert resumed_again is not resumed
     assert resumed.store is first.store
     assert resumed.session_runtime.state.transcript_cursor == 1
-    assert [
-        event.event_type for event in resumed.session_runtime.events()
-    ] == [EventType.USER_MESSAGE]
+    assert [event.event_type for event in resumed.session_runtime.events()] == [
+        EventType.USER_MESSAGE
+    ]
 
 
 def test_resume_reconciles_running_agents_through_runtime_recovery(
@@ -422,13 +452,183 @@ async def test_resume_reuses_scheduler_and_reconciles_durable_runtime_agents(
     await owner.shutdown()
 
 
-def test_factory_inherits_and_allows_scope_overrides(
-    tmp_path: Path, workspace: Path
+@pytest.mark.asyncio
+async def test_factory_cold_resume_interrupts_shell_tasks_and_preserves_output(
+    factory, workspace: Path
 ) -> None:
+    created = factory.create("cold-shells")
+    repository = created.store.execution_tasks
+    pending = repository.create(
+        ExecutionTaskRecord(
+            task_id="shell-cold-pending",
+            root_session_id=created.root_session_id,
+            agent_id="main",
+            kind="shell",
+            command="never-started",
+            description="pending",
+            canonical_cwd=str(workspace),
+            output_artifact_id="output-cold-pending",
+            timeout_ms=1000,
+            process_owner_token="dead-pending-owner",
+        )
+    )
+    running = repository.create(
+        ExecutionTaskRecord(
+            task_id="shell-cold-running",
+            root_session_id=created.root_session_id,
+            agent_id="main",
+            kind="shell",
+            command="old-process",
+            description="running",
+            canonical_cwd=str(workspace),
+            output_artifact_id="output-cold-running",
+            timeout_ms=1000,
+            process_owner_token="dead-running-owner",
+        )
+    )
+    running = repository.transition(
+        running.task_id,
+        ExecutionTaskStatus.RUNNING,
+        running.revision,
+        process_owner_token=running.process_owner_token,
+    )
+    repository.append_output(running.task_id, b"partial-output", running.revision)
+
+    resumed = factory.resume("cold-shells")
+    manager = ExecutionTaskManager.for_harness(resumed)
+    output = await manager.read(running.task_id)
+
+    assert repository.get(pending.task_id).status is ExecutionTaskStatus.INTERRUPTED
+    assert repository.get(running.task_id).status is ExecutionTaskStatus.INTERRUPTED
+    assert output.data == b"partial-output"
+
+
+@pytest.mark.asyncio
+async def test_factory_observer_is_read_only_and_resume_preserves_live_shell_owner(
+    factory, workspace: Path
+) -> None:
+    observed = factory.create("observed-shell")
+    pending = observed.store.execution_tasks.create(
+        ExecutionTaskRecord(
+            task_id="shell-observed-pending",
+            root_session_id=observed.root_session_id,
+            agent_id="main",
+            kind="shell",
+            command="never-started",
+            description="pending",
+            canonical_cwd=str(workspace),
+            output_artifact_id="output-observed-pending",
+            timeout_ms=1000,
+            process_owner_token="other-owner",
+        )
+    )
+
+    factory.resume_observer("observed-shell")
+
+    assert observed.store.execution_tasks.get(pending.task_id).status is ExecutionTaskStatus.PENDING
+
+    live_harness = factory.create("live-shell")
+    owner = ExecutionTaskManager.for_harness(live_harness)
+    live = await owner.launch("sleep 30", description="live", timeout=60)
+    try:
+        factory.resume("live-shell")
+        assert (
+            live_harness.store.execution_tasks.get(live.task_id).status
+            is ExecutionTaskStatus.RUNNING
+        )
+    finally:
+        await owner.stop(live.task_id)
+
+
+def test_factory_observer_does_not_mutate_any_durable_runtime_state(
+    factory, workspace: Path
+) -> None:
+    created = factory.create("strict-observer")
+    created.session_runtime.update_agent_lifecycle("state-worker", "running")
+    runtime_agent = created.store.agents.create(
+        AgentRecord(
+            "runtime-worker",
+            created.root_session_id,
+            "Explore",
+            "observe",
+            "running",
+            True,
+            str(workspace),
+            {},
+        )
+    )
+    runtime_agent = created.store.agents.transition(
+        runtime_agent.agent_id,
+        AgentStatus.RUNNING,
+        runtime_agent.revision,
+    )
+    shell = created.store.execution_tasks.create(
+        ExecutionTaskRecord(
+            task_id="shell-observer",
+            root_session_id=created.root_session_id,
+            agent_id=runtime_agent.agent_id,
+            kind="shell",
+            command="sleep 30",
+            description="observe",
+            canonical_cwd=str(workspace),
+            output_artifact_id="output-observer",
+            timeout_ms=30_000,
+            process_owner_token="live-observer-owner",
+        )
+    )
+    shell = created.store.execution_tasks.transition(
+        shell.task_id,
+        ExecutionTaskStatus.RUNNING,
+        shell.revision,
+        process_owner_token=shell.process_owner_token,
+    )
+    trace = created.store.traces.start(
+        TraceSpanRecord(
+            span_id="trace-observer",
+            root_session_id=created.root_session_id,
+            agent_id=runtime_agent.agent_id,
+            kind="agent",
+            name="observe",
+        )
+    )
+    worktree = created.store.worktrees.create(
+        WorktreeRecord(
+            worktree_id="worktree-observer",
+            root_session_id=created.root_session_id,
+            agent_id=runtime_agent.agent_id,
+            repository_root=str(workspace),
+            canonical_path=str(workspace / "observer-worktree"),
+            branch="observer",
+            base_commit="deadbeef",
+            status=WorktreeStatus.CREATING,
+        )
+    )
+    state_before = created.store.states.load_session(created.session_id)
+    events_before = created.store.states.list_events(created.session_id)
+
+    observed = factory.resume_observer(created.session_id)
+
+    assert observed.session_runtime.state == state_before
+    assert created.store.states.load_session(created.session_id) == state_before
+    assert created.store.states.list_events(created.session_id) == events_before
+    assert created.store.agents.get(runtime_agent.agent_id) == runtime_agent
+    assert created.store.execution_tasks.get(shell.task_id) == shell
+    assert created.store.traces.get(trace.span_id) == trace
+    assert created.store.worktrees.get(worktree.worktree_id) == worktree
+    assert observed.session_runtime.state.agents["state-worker"]["status"] == "running"
+    assert runtime_agent.status is AgentStatus.RUNNING
+    assert shell.status is ExecutionTaskStatus.RUNNING
+    assert trace.status is TraceSpanStatus.RUNNING
+    assert worktree.status is WorktreeStatus.CREATING
+
+
+def test_factory_inherits_and_allows_scope_overrides(tmp_path: Path, workspace: Path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'overrides.db'}")
     Base.metadata.create_all(engine)
+
     def callback(request) -> bool:
         return True
+
     factory = harness.SessionHarnessFactory(
         SessionRuntimeFactory(SQLAlchemyStateStore(sessionmaker(bind=engine))),
         workspace_root=workspace,

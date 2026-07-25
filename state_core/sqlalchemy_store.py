@@ -26,6 +26,23 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from models import Base
 
+from .outbox import (
+    SQLAlchemyApprovalTransactionService,
+    SQLAlchemyHookTransactionService,
+    SQLAlchemyOutboxRepository,
+)
+from .sqlalchemy_primitives import (
+    SQLAlchemyApprovedToolExecutionRepository,
+    SQLAlchemyExecutionTaskRepository,
+    SQLAlchemyHookDefinitionRepository,
+    SQLAlchemyHookInvocationRepository,
+    SQLAlchemyPermissionRequestRepository,
+    SQLAlchemyPermissionRuleRepository,
+    SQLAlchemySkillActivationRepository,
+    SQLAlchemyTeamMemberRepository,
+    SQLAlchemyTeamMessageRepository,
+    SQLAlchemyTeamRepository,
+)
 from .sqlalchemy_runtime import (
     SQLAlchemyAgentRepository,
     SQLAlchemyRuntimeMetadataRepository,
@@ -154,9 +171,7 @@ class SQLAlchemyStateRepository:
 
     def list_sessions(self) -> list[SessionState]:
         with self._session_factory() as db:
-            rows = db.scalars(
-                select(RuntimeSession).order_by(RuntimeSession.session_id)
-            ).all()
+            rows = db.scalars(select(RuntimeSession).order_by(RuntimeSession.session_id)).all()
             return [SessionState.from_dict(row.state) for row in rows]
 
     def delete_session(self, session_id: str) -> bool:
@@ -609,3 +624,16 @@ class SQLAlchemyStateStore:
         self.metadata = SQLAlchemyRuntimeMetadataRepository(session_factory)
         self.traces = SQLAlchemyTraceSpanRepository(session_factory)
         self.worktrees = SQLAlchemyWorktreeRepository(session_factory)
+        self.permission_requests = SQLAlchemyPermissionRequestRepository(session_factory)
+        self.approved_tool_executions = SQLAlchemyApprovedToolExecutionRepository(session_factory)
+        self.permission_rules = SQLAlchemyPermissionRuleRepository(session_factory)
+        self.hook_definitions = SQLAlchemyHookDefinitionRepository(session_factory)
+        self.hook_invocations = SQLAlchemyHookInvocationRepository(session_factory)
+        self.execution_tasks = SQLAlchemyExecutionTaskRepository(session_factory)
+        self.teams = SQLAlchemyTeamRepository(session_factory)
+        self.team_members = SQLAlchemyTeamMemberRepository(session_factory)
+        self.team_messages = SQLAlchemyTeamMessageRepository(session_factory)
+        self.skill_activations = SQLAlchemySkillActivationRepository(session_factory)
+        self.outbox = SQLAlchemyOutboxRepository(session_factory)
+        self.approval_transactions = SQLAlchemyApprovalTransactionService(session_factory)
+        self.hook_transactions = SQLAlchemyHookTransactionService(session_factory)

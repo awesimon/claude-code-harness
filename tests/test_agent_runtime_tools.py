@@ -1,4 +1,6 @@
 import asyncio
+import shlex
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,11 +10,18 @@ from sqlalchemy.orm import sessionmaker
 
 from agents import AgentExecutionResult, AgentIsolationMode, AgentRequest
 from harness import AgentScheduler, SessionHarnessFactory
+from harness.execution_tasks import ExecutionTaskManager
 from models import Base
-from state_core import SQLAlchemyStateStore, SessionRuntimeFactory
-from tools.agent_runtime_tools import AgentTool, TaskOutputTool, TaskStopTool
-from tools.agent_runtime_tools import AgentDestroyTool, AgentListTool
+from state_core import SessionRuntimeFactory, SQLAlchemyStateStore
+from tools.agent_runtime_tools import (
+    AgentDestroyTool,
+    AgentListTool,
+    AgentTool,
+    TaskOutputTool,
+    TaskStopTool,
+)
 from tools.base import ToolRegistry
+from tools.bash_tool import BashTool
 
 
 class BlockingRunner:
@@ -145,6 +154,216 @@ async def test_task_output_reports_blocking_timeout(harness) -> None:
 
 
 @pytest.mark.asyncio
+async def test_task_output_reads_and_task_stop_stops_real_background_shell(harness) -> None:
+    program = "import sys,time;" "sys.stdout.write('alpha');sys.stdout.flush();" "time.sleep(30)"
+    launched = await BashTool().run(
+        {
+            "command": f"{shlex.quote(sys.executable)} -c {shlex.quote(program)}",
+            "run_in_background": True,
+        },
+        {
+            "session_harness": harness,
+            "effective_cwd": str(harness.effective_cwd),
+        },
+    )
+    task_id = launched.data["task_id"]
+
+    try:
+        output = await TaskOutputTool().run(
+            {
+                "task_id": task_id,
+                "block": True,
+                "timeout": 1000,
+                "cursor": 0,
+                "max_bytes": 5,
+            },
+            {"session_harness": harness},
+        )
+        stopped = await TaskStopTool().run(
+            {"task_id": task_id},
+            {"session_harness": harness},
+        )
+
+        assert task_id.startswith("shell_")
+        assert output.success
+        assert output.data["retrieval_status"] == "success"
+        assert output.data["task"] == {
+            "task_id": task_id,
+            "status": "running",
+            "output": "alpha",
+            "next_cursor": 5,
+            "total_bytes": 5,
+            "exit_code": None,
+        }
+        assert stopped.success
+        assert stopped.data["task_id"] == task_id
+        assert stopped.data["status"] == "killed"
+    finally:
+        record = harness.store.execution_tasks.get(task_id)
+        if record is not None and record.status.value in {"pending", "running"}:
+            await ExecutionTaskManager.for_harness(harness).stop(task_id)
+
+
+@pytest.mark.asyncio
+async def test_task_output_reads_terminal_shell_and_task_stop_returns_clear_error(
+    harness,
+) -> None:
+    launched = await BashTool().run(
+        {"command": "printf completed", "run_in_background": True},
+        {
+            "session_harness": harness,
+            "effective_cwd": str(harness.effective_cwd),
+        },
+    )
+    task_id = launched.data["task_id"]
+    await ExecutionTaskManager.for_harness(harness).wait(task_id, timeout=2)
+
+    output = await TaskOutputTool().run(
+        {"task_id": task_id, "block": False, "tail": True, "max_bytes": 4},
+        {"session_harness": harness},
+    )
+    stopped = await TaskStopTool().run(
+        {"task_id": task_id},
+        {"session_harness": harness},
+    )
+
+    assert output.success
+    assert output.data["retrieval_status"] == "success"
+    assert output.data["task"]["status"] == "completed"
+    assert output.data["task"]["output"] == "eted"
+    assert output.data["task"]["next_cursor"] == 9
+    assert output.data["task"]["total_bytes"] == 9
+    assert output.data["task"]["exit_code"] == 0
+    assert not stopped.success
+    assert "completed" in stopped.message
+    assert "not running" in stopped.message
+
+
+@pytest.mark.asyncio
+async def test_task_output_shell_nonblocking_and_blocking_timeout(harness) -> None:
+    launched = await BashTool().run(
+        {"command": "sleep 30", "run_in_background": True},
+        {
+            "session_harness": harness,
+            "effective_cwd": str(harness.effective_cwd),
+        },
+    )
+    task_id = launched.data["task_id"]
+
+    try:
+        nonblocking = await TaskOutputTool().run(
+            {"task_id": task_id, "block": False},
+            {"session_harness": harness},
+        )
+        timed = await TaskOutputTool().run(
+            {"task_id": task_id, "block": True, "timeout": 0},
+            {"session_harness": harness},
+        )
+
+        assert nonblocking.success
+        assert nonblocking.data["retrieval_status"] == "not_ready"
+        assert nonblocking.data["task"]["output"] == ""
+        assert timed.success
+        assert timed.data["retrieval_status"] == "timeout"
+        assert timed.data["task"]["status"] == "running"
+    finally:
+        await ExecutionTaskManager.for_harness(harness).stop(task_id)
+
+
+@pytest.mark.asyncio
+async def test_task_stop_rejects_shell_owned_by_another_manager(harness) -> None:
+    owner = ExecutionTaskManager(
+        harness.store.execution_tasks,
+        root_session_id=harness.root_session_id,
+        agent_id="external-owner",
+        cwd=harness.effective_cwd,
+    )
+    task = await owner.launch("sleep 30", description="external", timeout=60)
+
+    try:
+        stopped = await TaskStopTool().run(
+            {"task_id": task.task_id},
+            {"session_harness": harness},
+        )
+
+        assert not stopped.success
+        assert "not owned by this runtime" in stopped.message
+    finally:
+        await owner.stop(task.task_id)
+
+
+@pytest.mark.asyncio
+async def test_task_output_rejects_shell_from_another_session(harness) -> None:
+    other = SessionHarnessFactory(
+        SessionRuntimeFactory(harness.store),
+        workspace_root=harness.effective_cwd,
+    ).create("other-session")
+    launched = await BashTool().run(
+        {"command": "printf private", "run_in_background": True},
+        {
+            "session_harness": harness,
+            "effective_cwd": str(harness.effective_cwd),
+        },
+    )
+    task_id = launched.data["task_id"]
+    await ExecutionTaskManager.for_harness(harness).wait(task_id, timeout=2)
+
+    output = await TaskOutputTool().run(
+        {"task_id": task_id, "block": False},
+        {"session_harness": other},
+    )
+
+    assert not output.success
+    assert "does not belong to the active session" in output.message
+    assert "private" not in output.message
+
+
+@pytest.mark.asyncio
+async def test_task_stop_rejects_shell_from_another_session(harness) -> None:
+    other = SessionHarnessFactory(
+        SessionRuntimeFactory(harness.store),
+        workspace_root=harness.effective_cwd,
+    ).create("other-session")
+    launched = await BashTool().run(
+        {"command": "sleep 30", "run_in_background": True},
+        {
+            "session_harness": harness,
+            "effective_cwd": str(harness.effective_cwd),
+        },
+    )
+    task_id = launched.data["task_id"]
+
+    try:
+        stopped = await TaskStopTool().run(
+            {"task_id": task_id},
+            {"session_harness": other},
+        )
+
+        assert not stopped.success
+        assert "does not belong to the active session" in stopped.message
+        assert harness.store.execution_tasks.get(task_id).status.value == "running"
+    finally:
+        await ExecutionTaskManager.for_harness(harness).stop(task_id)
+
+
+@pytest.mark.asyncio
+async def test_task_dispatchers_keep_unknown_ids_on_agent_path(harness) -> None:
+    output = await TaskOutputTool().run(
+        {"task_id": "unknown-task", "block": False},
+        {"session_harness": harness},
+    )
+    stopped = await TaskStopTool().run(
+        {"task_id": "unknown-task"},
+        {"session_harness": harness},
+    )
+
+    assert not output.success
+    assert not stopped.success
+    assert "unknown-task" in output.message
+    assert "unknown-task" in stopped.message
+
+
+@pytest.mark.asyncio
 async def test_task_stop_runs_through_harness_pipeline_without_approval(harness) -> None:
     runner = BlockingRunner()
     scheduler = AgentScheduler(harness, runner=runner)
@@ -273,7 +492,11 @@ def test_agent_runtime_tool_aliases_resolve_to_canonical_tools() -> None:
 def test_legacy_agent_tool_module_reexports_canonical_tools() -> None:
     from tools.agent_tool import (
         AgentDestroyTool as LegacyAgentDestroyTool,
+    )
+    from tools.agent_tool import (
         AgentListTool as LegacyAgentListTool,
+    )
+    from tools.agent_tool import (
         AgentTool as LegacyAgentTool,
     )
 

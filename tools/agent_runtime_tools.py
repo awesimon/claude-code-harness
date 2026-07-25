@@ -8,6 +8,10 @@ from typing import Any
 
 from agents.types import AgentIsolationMode, AgentRequest
 from state_core import AgentRecord, AgentStatus
+from state_core.runtime_primitives import (
+    EXECUTION_TASK_TERMINAL_STATUSES,
+    MAX_EXECUTION_READ_BYTES,
+)
 from state_core.runtime_records import AGENT_TERMINAL_STATUSES
 
 from .base import (
@@ -49,6 +53,13 @@ def _record_data(record: AgentRecord) -> dict[str, Any]:
         ),
         "error": dict(record.error) if record.error is not None else None,
     }
+
+
+def _execution_task_for_harness(harness: Any, task_id: str):
+    record = harness.store.execution_tasks.get(task_id)
+    if record is not None and record.root_session_id != harness.root_session_id:
+        raise ToolExecutionError(f"shell task {task_id} does not belong to the active session")
+    return record
 
 
 @dataclass(frozen=True)
@@ -142,6 +153,9 @@ class TaskOutputInput:
     task_id: str
     block: bool = True
     timeout: float = 30000
+    cursor: int = 0
+    max_bytes: int = MAX_EXECUTION_READ_BYTES
+    tail: bool = False
 
 
 @register_tool
@@ -163,6 +177,14 @@ class TaskOutputTool(Tool[TaskOutputInput, dict[str, Any]]):
                 "default": 30000,
                 "description": "Maximum wait in milliseconds",
             },
+            "cursor": {"type": "integer", "minimum": 0, "default": 0},
+            "max_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_EXECUTION_READ_BYTES,
+                "default": MAX_EXECUTION_READ_BYTES,
+            },
+            "tail": {"type": "boolean", "default": False},
         },
         "required": ["task_id"],
     }
@@ -180,10 +202,48 @@ class TaskOutputTool(Tool[TaskOutputInput, dict[str, Any]]):
             or input_data.timeout > 600000
         ):
             return ToolValidationError("timeout must be between 0 and 600000 ms")
+        if isinstance(input_data.cursor, bool) or not isinstance(input_data.cursor, int):
+            return ToolValidationError("cursor must be a non-negative integer")
+        if input_data.cursor < 0:
+            return ToolValidationError("cursor must be a non-negative integer")
+        if isinstance(input_data.max_bytes, bool) or not isinstance(input_data.max_bytes, int):
+            return ToolValidationError("max_bytes must be a positive integer")
+        if input_data.max_bytes <= 0 or input_data.max_bytes > MAX_EXECUTION_READ_BYTES:
+            return ToolValidationError(
+                f"max_bytes must be between 1 and {MAX_EXECUTION_READ_BYTES}"
+            )
+        if type(input_data.tail) is not bool:
+            return ToolValidationError("tail must be a boolean")
         return None
 
     async def execute(self, input_data: TaskOutputInput) -> ToolResult:
-        scheduler = _active_harness().agent_scheduler
+        harness = _active_harness()
+        execution_task = _execution_task_for_harness(harness, input_data.task_id)
+        if execution_task is not None:
+            from harness.execution_tasks import ExecutionTaskManager
+
+            read = await ExecutionTaskManager.for_harness(harness).read(
+                input_data.task_id,
+                cursor=input_data.cursor,
+                max_bytes=input_data.max_bytes,
+                block=input_data.block,
+                timeout=input_data.timeout / 1000,
+                tail=input_data.tail,
+            )
+            return ToolResult.ok(
+                {
+                    "retrieval_status": read.retrieval_status,
+                    "task": {
+                        "task_id": read.record.task_id,
+                        "status": read.record.status.value,
+                        "output": read.data.decode("utf-8", errors="replace"),
+                        "next_cursor": read.next_cursor,
+                        "total_bytes": read.total_bytes,
+                        "exit_code": read.record.exit_code,
+                    },
+                }
+            )
+        scheduler = harness.agent_scheduler
         record = scheduler.status(input_data.task_id)
         retrieval_status = "success" if record.status in AGENT_TERMINAL_STATUSES else "not_ready"
         if input_data.block and record.status not in AGENT_TERMINAL_STATUSES:
@@ -227,7 +287,37 @@ class TaskStopTool(Tool[TaskStopInput, dict[str, Any]]):
         return None
 
     async def execute(self, input_data: TaskStopInput) -> ToolResult:
-        record = await _active_harness().agent_scheduler.stop(input_data.task_id)
+        harness = _active_harness()
+        execution_task = _execution_task_for_harness(harness, input_data.task_id)
+        if execution_task is not None:
+            from harness.execution_tasks import (
+                ExecutionTaskManager,
+                ExecutionTaskNotRunning,
+            )
+
+            if execution_task.status in EXECUTION_TASK_TERMINAL_STATUSES:
+                raise ToolExecutionError(
+                    f"shell task {input_data.task_id} is not running "
+                    f"(status: {execution_task.status.value})"
+                )
+            manager = ExecutionTaskManager.for_harness(harness)
+            if input_data.task_id not in manager._owned:
+                raise ToolExecutionError(
+                    f"shell task {input_data.task_id} is not owned by this runtime"
+                )
+            try:
+                stopped = await manager.stop(input_data.task_id)
+            except ExecutionTaskNotRunning as exc:
+                raise ToolExecutionError(str(exc)) from exc
+            return ToolResult.ok(
+                {
+                    "task_id": stopped.task_id,
+                    "status": stopped.status.value,
+                    "exit_code": stopped.exit_code,
+                    "termination_reason": stopped.termination_reason,
+                }
+            )
+        record = await harness.agent_scheduler.stop(input_data.task_id)
         return ToolResult.ok(_record_data(record))
 
 
