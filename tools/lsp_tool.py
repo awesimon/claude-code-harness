@@ -1,8 +1,7 @@
 from typing import Any, Dict, Optional
 from dataclasses import dataclass
-import asyncio
 
-from .base import Tool, ToolResult, ToolError
+from .base import Tool, ToolExecutionError, ToolResult, ToolValidationError
 
 
 @dataclass
@@ -74,41 +73,36 @@ class LSPTool(Tool):
             }
         }
 
-    async def validate(self, input_data: LSPInput) -> Optional[ToolError]:
+    async def validate(self, input_data: LSPInput) -> Optional[ToolValidationError]:
         if input_data.operation not in self.SUPPORTED_OPERATIONS:
-            return ToolError(
+            return ToolValidationError(
                 f"Invalid operation: {input_data.operation}. "
                 f"Supported operations: {', '.join(self.SUPPORTED_OPERATIONS)}",
-                tool_name=self.name
+                details={"tool_name": self.name},
             )
         import os
         abs_path = os.path.abspath(input_data.file_path)
         if not os.path.exists(abs_path):
-            return ToolError(f"File does not exist: {input_data.file_path}", tool_name=self.name)
+            return ToolValidationError(
+                f"File does not exist: {input_data.file_path}",
+                details={"tool_name": self.name},
+            )
         if not os.path.isfile(abs_path):
-            return ToolError(f"Path is not a file: {input_data.file_path}", tool_name=self.name)
+            return ToolValidationError(
+                f"Path is not a file: {input_data.file_path}",
+                details={"tool_name": self.name},
+            )
         return None
 
     async def execute(self, input_data: LSPInput) -> ToolResult:
-        """Execute LSP operation (mock implementation)."""
-        import os
-        abs_path = os.path.abspath(input_data.file_path)
-
-        # This is a placeholder implementation
-        # Real implementation would connect to an LSP server
-        result_msg = f"LSP {input_data.operation} at {abs_path}:{input_data.line}:{input_data.character}\n\n"
-        result_msg += "Note: This is a mock implementation. Real LSP functionality requires LSP server connection."
-
-        return ToolResult(
-            success=True,
-            data={
-                "operation": input_data.operation,
-                "result": result_msg,
-                "file_path": input_data.file_path,
-                "result_count": 0,
-                "file_count": 1
-            },
-            message=result_msg
+        """Fail closed until a real language-server transport is configured."""
+        message = "LSP tool is unsupported because no language-server transport is configured"
+        return ToolResult.fail(
+            ToolExecutionError(
+                message,
+                details={"tool_name": self.name, "reason": "unsupported"},
+            ),
+            message=message,
         )
 
     def is_read_only(self) -> bool:

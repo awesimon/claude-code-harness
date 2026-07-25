@@ -8,13 +8,11 @@ import asyncio
 import random
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, TypeVar, Callable, Any, Awaitable
+from typing import Optional, TypeVar, Callable, Awaitable
 from functools import wraps
-import time
 
 from .error_types import (
     APIError,
-    RecoverableError,
     RateLimitError,
     ServerError,
     TimeoutError,

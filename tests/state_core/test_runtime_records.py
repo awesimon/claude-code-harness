@@ -132,6 +132,18 @@ def test_agent_listing_and_reconciliation_only_interrupts_non_live_open_agents(
     assert store.agents.get(other_root.agent_id).status is AgentStatus.PENDING  # type: ignore[union-attr]
 
 
+def test_agent_catalog_lists_all_roots_without_private_storage_access(
+    store: SQLAlchemyStateStore,
+) -> None:
+    store.agents.create(agent("agent-b", root_session_id="root-2"))
+    store.agents.create(agent("agent-a", root_session_id="root-1"))
+
+    assert [item.agent_id for item in store.agents.list_all()] == [
+        "agent-a",
+        "agent-b",
+    ]
+
+
 def test_metadata_put_get_uses_revision_checks_and_detaches_json(store: SQLAlchemyStateStore) -> None:
     value = {"config": {"attempt": 1}}
     created = store.metadata.put("root-1", "harness", value)

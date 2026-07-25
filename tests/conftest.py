@@ -6,7 +6,7 @@
 
 import pytest
 import asyncio
-from typing import Any, Callable, List, Optional
+from typing import Any, List
 from dataclasses import dataclass
 from unittest.mock import MagicMock, AsyncMock
 import sys

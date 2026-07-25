@@ -1,4 +1,8 @@
-"""WorkerPoolManager: 线程池/进程池风格的 Worker Agent 生命周期管理。"""
+"""Deprecated standalone worker-pool compatibility library.
+
+The application runtime does not instantiate this manager. Durable agent
+ownership belongs to ``harness.agents.AgentScheduler``.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +12,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from .agent import Agent, AgentConfig
 from .task import Task, TaskResult
-from .enums import AgentStatus, Result
+from .enums import Result
 
 
 class WorkerPoolManager:
@@ -361,7 +365,7 @@ class WorkerPoolManager:
         """Background monitoring loop."""
         while self._running:
             try:
-                stats = self.get_statistics()
+                self.get_statistics()
                 # Could log or report stats here
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:

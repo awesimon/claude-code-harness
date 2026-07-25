@@ -48,7 +48,7 @@ Existing modules rewritten or reduced to adapters:
 - Modify: `state_core/__init__.py`
 - Test: `tests/state_core/test_runtime_records.py`
 
-- [ ] **Step 1: Write failing agent lifecycle repository tests**
+- [x] **Step 1: Write failing agent lifecycle repository tests**
 
 ```python
 def test_agent_transition_is_durable(runtime_store):
@@ -68,13 +68,13 @@ def test_terminal_agent_cannot_restart(runtime_store):
         runtime_store.agents.transition("a1", record.revision, AgentStatus.RUNNING)
 ```
 
-- [ ] **Step 2: Run the tests and verify the missing record API fails**
+- [x] **Step 2: Run the tests and verify the missing record API fails**
 
 Run: `.venv/bin/pytest tests/state_core/test_runtime_records.py -q`
 
 Expected: collection fails because `AgentRecord` and runtime repositories do not exist.
 
-- [ ] **Step 3: Define stable records and protocols**
+- [x] **Step 3: Define stable records and protocols**
 
 ```python
 class AgentStatus(str, Enum):
@@ -113,21 +113,21 @@ class AgentRecord:
 
 Also define `RuntimeMetadataRecord`, `TraceSpanRecord`, `WorktreeRecord`, and storage-neutral repository protocols with revision-checked writes.
 
-- [ ] **Step 4: Implement SQLAlchemy tables and repositories**
+- [x] **Step 4: Implement SQLAlchemy tables and repositories**
 
 Use dedicated `runtime_agents`, `runtime_metadata`, `runtime_trace_spans`, and `runtime_worktrees` tables. Store JSON only after `to_json_value`-equivalent domain validation. Add repositories to `SQLAlchemyStateStore` as `agents`, `metadata`, `traces`, and `worktrees`.
 
-- [ ] **Step 5: Add transition, revision conflict, list, and reconciliation tests**
+- [x] **Step 5: Add transition, revision conflict, list, and reconciliation tests**
 
 Cover parent/root filtering, terminal transition rejection, stale revision rejection, metadata snapshots, open-span closure, and `pending`/`running` reconciliation to `interrupted`.
 
-- [ ] **Step 6: Run focused and state-core tests**
+- [x] **Step 6: Run focused and state-core tests**
 
 Run: `.venv/bin/pytest tests/state_core/test_runtime_records.py tests/state_core -q`
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add state_core tests/state_core/test_runtime_records.py
@@ -142,7 +142,7 @@ git commit -m "feat: persist harness runtime records"
 - Modify: `harness/__init__.py`
 - Test: `tests/test_session_harness.py`
 
-- [ ] **Step 1: Write failing root and child scope tests**
+- [x] **Step 1: Write failing root and child scope tests**
 
 ```python
 def test_child_scope_inherits_root_and_isolates_agent_state(harness_factory):
@@ -155,11 +155,11 @@ def test_child_scope_inherits_root_and_isolates_agent_state(harness_factory):
     assert child.effective_cwd == root.effective_cwd
 ```
 
-- [ ] **Step 2: Verify the test fails because SessionHarness is absent**
+- [x] **Step 2: Verify the test fails because SessionHarness is absent**
 
 Run: `.venv/bin/pytest tests/test_session_harness.py -q`
 
-- [ ] **Step 3: Implement the composition API**
+- [x] **Step 3: Implement the composition API**
 
 ```python
 @dataclass
@@ -193,13 +193,13 @@ class SessionHarnessFactory:
 
 The factory owns process-local caches only for live harness objects and transport handles. Durable identity always loads from `SessionRuntimeFactory`.
 
-- [ ] **Step 4: Test resume, cancellation propagation, explicit cwd, and Todo agent scope**
+- [x] **Step 4: Test resume, cancellation propagation, explicit cwd, and Todo agent scope**
 
 Run: `.venv/bin/pytest tests/test_session_harness.py tests/state_core/test_recovery.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add harness tests/test_session_harness.py
@@ -216,7 +216,7 @@ git commit -m "feat: add session harness composition root"
 - Test: `tests/test_agent_scheduler.py`
 - Modify: `tests/test_agent_runtime.py`
 
-- [ ] **Step 1: Write failing foreground/background scheduler tests**
+- [x] **Step 1: Write failing foreground/background scheduler tests**
 
 ```python
 @pytest.mark.asyncio
@@ -235,11 +235,11 @@ async def test_resume_marks_unowned_running_agent_interrupted(harness_factory, r
     assert resumed.agent_scheduler.status("a1").status is AgentStatus.INTERRUPTED
 ```
 
-- [ ] **Step 2: Run and verify scheduler tests fail**
+- [x] **Step 2: Run and verify scheduler tests fail**
 
 Run: `.venv/bin/pytest tests/test_agent_scheduler.py -q`
 
-- [ ] **Step 3: Implement scheduler operations**
+- [x] **Step 3: Implement scheduler operations**
 
 ```python
 class AgentScheduler:
@@ -274,17 +274,17 @@ class AgentScheduler:
 
 Use an asyncio semaphore for root concurrency and a child semaphore keyed by parent agent. Persist `pending` before queueing, `running` before calling the executor, and terminal output before releasing waiters.
 
-- [ ] **Step 4: Rewrite AgentExecutor as one execution loop**
+- [x] **Step 4: Rewrite AgentExecutor as one execution loop**
 
 Remove lifecycle dictionaries and global manager ownership from `agents/engine.py`. Keep definition/tool filtering and model loop behavior. Accept a child `SessionHarness`; return a terminal `AgentExecutionResult` without persisting lifecycle itself.
 
-- [ ] **Step 5: Test cancellation races, timeout, nested parent IDs, limits, and failures**
+- [x] **Step 5: Test cancellation races, timeout, nested parent IDs, limits, and failures**
 
 Run: `.venv/bin/pytest tests/test_agent_scheduler.py tests/test_agent_runtime.py -q`
 
 Expected: PASS with no pending asyncio task warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add harness/agents.py agents tests/test_agent_scheduler.py tests/test_agent_runtime.py
@@ -301,7 +301,7 @@ git commit -m "feat: add durable agent scheduler"
 - Test: `tests/test_agent_runtime_tools.py`
 - Modify: `tests/state_core/test_query_engine_state.py`
 
-- [ ] **Step 1: Write failing tool contract tests**
+- [x] **Step 1: Write failing tool contract tests**
 
 ```python
 @pytest.mark.asyncio
@@ -322,25 +322,25 @@ async def test_task_output_and_stop_share_scheduler(tool_context):
     assert stopped.data["status"] == "cancelled"
 ```
 
-- [ ] **Step 2: Verify failure against the current foreground-only Agent tool**
+- [x] **Step 2: Verify failure against the current foreground-only Agent tool**
 
 Run: `.venv/bin/pytest tests/test_agent_runtime_tools.py -q`
 
-- [ ] **Step 3: Implement compatible tool schemas and adapters**
+- [x] **Step 3: Implement compatible tool schemas and adapters**
 
 Agent accepts existing `prompt` and `subagent_type`, plus compatible `description`, `run_in_background`, `model`, `cwd`, and `isolation`. TaskOutput accepts task/agent ID, blocking mode, and timeout. TaskStop accepts task/agent ID. Legacy Agent list/destroy aliases delegate to scheduler list/stop.
 
-- [ ] **Step 4: Replace QueryEngine runtime dictionaries with SessionHarnessFactory**
+- [x] **Step 4: Replace QueryEngine runtime dictionaries with SessionHarnessFactory**
 
 `QueryEngine._session_harness(conversation_id)` becomes the only session runtime lookup. Its public `spawn_agent`, `get_agent_status`, and `abort_agent` methods delegate to the harness scheduler.
 
-- [ ] **Step 5: Run Agent, QueryEngine, and state-core regression suites**
+- [x] **Step 5: Run Agent, QueryEngine, and state-core regression suites**
 
 Run: `.venv/bin/pytest tests/test_agent_runtime_tools.py tests/test_agent_scheduler.py tests/test_agent_runtime.py tests/state_core/test_query_engine_state.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 6: Run Stage 1 gate and commit**
+- [x] **Step 6: Run Stage 1 gate and commit**
 
 Run: `.venv/bin/pytest tests/state_core tests/test_session_harness.py tests/test_agent_scheduler.py tests/test_agent_runtime.py tests/test_agent_runtime_tools.py tests/test_query_engine_runtime.py -q`
 
@@ -359,7 +359,7 @@ git commit -m "feat: route agents through session harness"
 - Modify: `harness/session.py`
 - Test: `tests/test_hook_runtime.py`
 
-- [ ] **Step 1: Write failing hook behavior tests**
+- [x] **Step 1: Write failing hook behavior tests**
 
 ```python
 @pytest.mark.asyncio
@@ -380,23 +380,23 @@ async def test_pre_tool_hook_blocks_and_post_hook_fails_open(blocking_hook, fail
     assert observed.failures[0].hook_id == failing_post_hook.hook_id
 ```
 
-- [ ] **Step 2: Verify tests fail because hooks only edit config**
+- [x] **Step 2: Verify tests fail because hooks only edit config**
 
 Run: `.venv/bin/pytest tests/test_hook_runtime.py -q`
 
-- [ ] **Step 3: Implement HookDefinition, HookDecision, matching, and command runner**
+- [x] **Step 3: Implement HookDefinition, HookDecision, matching, and command runner**
 
 Command hooks receive JSON stdin, an environment allowlist, explicit cwd, timeout, cancellation, and output-size limit. Parse stdout as one JSON object. Make Pre mutation gates fail closed and observational Post hooks fail open by default.
 
-- [ ] **Step 4: Rewrite hook tools as configuration adapters**
+- [x] **Step 4: Rewrite hook tools as configuration adapters**
 
 Keep current public list/add/remove/events shapes. Store normalized hook configuration in session metadata; user/project config import occurs once when the harness snapshot is created.
 
-- [ ] **Step 5: Test timeout, malformed output, cancellation, matchers, recursion guard, and durable events**
+- [x] **Step 5: Test timeout, malformed output, cancellation, matchers, recursion guard, and durable events**
 
 Run: `.venv/bin/pytest tests/test_hook_runtime.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add harness/hooks.py harness/session.py tools/hooks_tools.py tests/test_hook_runtime.py
@@ -413,7 +413,7 @@ git commit -m "feat: execute session hooks"
 - Modify: `agents/engine.py`
 - Test: `tests/test_skill_runtime.py`
 
-- [ ] **Step 1: Write failing discovery and snapshot tests**
+- [x] **Step 1: Write failing discovery and snapshot tests**
 
 ```python
 def test_skill_body_is_loaded_only_when_selected(skill_dir, harness):
@@ -428,27 +428,27 @@ def test_skill_reference_cannot_escape_base_directory(skill_dir):
         SkillResolver(skill_dir).read_resource("reviewing", "../secret")
 ```
 
-- [ ] **Step 2: Verify tests fail against eager global skill loading**
+- [x] **Step 2: Verify tests fail against eager global skill loading**
 
 Run: `.venv/bin/pytest tests/test_skill_runtime.py -q`
 
-- [ ] **Step 3: Implement index, digest, resolve, snapshot, and containment**
+- [x] **Step 3: Implement index, digest, resolve, snapshot, and containment**
 
 Index entries contain name, description, canonical base path, digest, and metadata only. Resolved snapshots include content, allowed tools, hooks, MCP requirements, and referenced resource manifest.
 
-- [ ] **Step 4: Integrate skills into child prompt and tool resolution**
+- [x] **Step 4: Integrate skills into child prompt and tool resolution**
 
 Resolve Agent definition skills before the first child model call. Append the snapshot content to the child system prompt, intersect allowed tools with Agent policy, register skill hooks, and initialize required MCP servers.
 
-- [ ] **Step 5: Remove unrestricted custom Python execution**
+- [x] **Step 5: Remove unrestricted custom Python execution**
 
 Delete or replace any dynamic `exec` path. Skill scripts return a normal Bash/subprocess tool request and therefore cross permission, hook, timeout, budget, cwd, cancellation, and transcript boundaries.
 
-- [ ] **Step 6: Test changed source on resume, tool isolation, hook registration, and script routing**
+- [x] **Step 6: Test changed source on resume, tool isolation, hook registration, and script routing**
 
 Run: `.venv/bin/pytest tests/test_skill_runtime.py tests/test_skill_loader.py tests/test_agent_runtime.py -q`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add harness/skills.py services/skill_loader.py services/skill_registry.py tools/skill_tool_v2.py agents/engine.py tests
@@ -464,7 +464,7 @@ git commit -m "feat: add progressive agent skills"
 - Test: `tests/test_tool_pipeline.py`
 - Modify: `tests/test_tool_runtime.py`
 
-- [ ] **Step 1: Write a failing order test**
+- [x] **Step 1: Write a failing order test**
 
 ```python
 @pytest.mark.asyncio
@@ -476,23 +476,23 @@ async def test_pipeline_order(pipeline, recorder):
     ]
 ```
 
-- [ ] **Step 2: Verify the current runtime skips deferred/hooks/budget/persistence**
+- [x] **Step 2: Verify the current runtime skips deferred/hooks/budget/persistence**
 
 Run: `.venv/bin/pytest tests/test_tool_pipeline.py -q`
 
-- [ ] **Step 3: Implement the pipeline with one terminal result**
+- [x] **Step 3: Implement the pipeline with one terminal result**
 
 Extend termination reasons to `timed_out`, `budget_exhausted`, `hook_blocked`, `mcp_unavailable`, `interrupted`, and `orphaned`. Ensure validation, permission denial, hook block, timeout, cancellation, exceptions, and JSON normalization each return one durable result.
 
-- [ ] **Step 4: Preserve legacy Tool.run compatibility through contextvars**
+- [x] **Step 4: Preserve legacy Tool.run compatibility through contextvars**
 
 Tool implementations may retain `execute(input)` but receive the active harness and runtime context via the existing contextvar. Remove tool-specific calls that bypass the pipeline.
 
-- [ ] **Step 5: Test every terminal path and exact transcript pairing**
+- [x] **Step 5: Test every terminal path and exact transcript pairing**
 
 Run: `.venv/bin/pytest tests/test_tool_pipeline.py tests/test_tool_runtime.py tests/test_tool_contract.py tests/state_core/test_query_engine_state.py -q`
 
-- [ ] **Step 6: Run Stage 2 gate and commit**
+- [x] **Step 6: Run Stage 2 gate and commit**
 
 Run: `.venv/bin/pytest tests/test_hook_runtime.py tests/test_skill_runtime.py tests/test_tool_pipeline.py tests/test_agent_runtime_tools.py -q`
 
@@ -514,7 +514,7 @@ git commit -m "feat: enforce controlled tool pipeline"
 - Test: `tests/test_budget_runtime.py`
 - Test: `tests/test_tracing_runtime.py`
 
-- [ ] **Step 1: Write failing reservation and trace tests**
+- [x] **Step 1: Write failing reservation and trace tests**
 
 ```python
 def test_concurrent_reservations_cannot_exceed_root_budget(budget):
@@ -531,15 +531,15 @@ def test_open_span_is_closed_as_interrupted_on_resume(trace_repo):
     assert trace_repo.get("span-1").status is SpanStatus.INTERRUPTED
 ```
 
-- [ ] **Step 2: Verify missing budget and tracing APIs fail**
+- [x] **Step 2: Verify missing budget and tracing APIs fail**
 
 Run: `.venv/bin/pytest tests/test_budget_runtime.py tests/test_tracing_runtime.py -q`
 
-- [ ] **Step 3: Implement budget limits, reservations, reconciliation, and roll-up**
+- [x] **Step 3: Implement budget limits, reservations, reconciliation, and roll-up**
 
 Support input/output/total tokens, cost, turns, tool calls, wall clock, and compaction tokens. Child usage consumes both child and root limits atomically. Persist limits, reservations, actual consumption, and exhaustion events.
 
-- [ ] **Step 4: Implement span context manager and durable summaries**
+- [x] **Step 4: Implement span context manager and durable summaries**
 
 ```python
 async with traces.span("tool", "read_file", agent_id=agent_id) as span:
@@ -549,11 +549,11 @@ async with traces.span("tool", "read_file", agent_id=agent_id) as span:
 
 Sanitize recorded errors and never store credentials, raw headers, or hook environments.
 
-- [ ] **Step 5: Integrate model, tool, agent, hook, and MCP reservation points**
+- [x] **Step 5: Integrate model, tool, agent, hook, and MCP reservation points**
 
 Root exhaustion cancels child scopes. Child exhaustion terminates only that child. Cleanup errors are recorded but do not overwrite the original termination reason.
 
-- [ ] **Step 6: Run focused tests and commit**
+- [x] **Step 6: Run focused tests and commit**
 
 Run: `.venv/bin/pytest tests/test_budget_runtime.py tests/test_tracing_runtime.py tests/test_tool_pipeline.py tests/test_agent_scheduler.py -q`
 
@@ -573,7 +573,7 @@ git commit -m "feat: add durable budgets and traces"
 - Modify: `tests/test_context_compaction.py`
 - Modify: `tests/state_core/test_recovery.py`
 
-- [ ] **Step 1: Write failing automatic compaction and recovery tests**
+- [x] **Step 1: Write failing automatic compaction and recovery tests**
 
 ```python
 @pytest.mark.asyncio
@@ -591,23 +591,23 @@ def test_resume_rebuilds_from_latest_valid_compact_boundary(runtime_factory):
     assert [message.content for message in messages] == ["summary", "new"]
 ```
 
-- [ ] **Step 2: Verify QueryEngine does not invoke compaction**
+- [x] **Step 2: Verify QueryEngine does not invoke compaction**
 
 Run: `.venv/bin/pytest tests/test_context_controller.py -q`
 
-- [ ] **Step 3: Implement ContextController**
+- [x] **Step 3: Implement ContextController**
 
 Micro-compact projected model messages without altering raw events. At the hard threshold, run PreCompact, reserve compaction budget, create a summary, atomically persist boundary plus summary, run PostCompact, and return rebuilt messages.
 
-- [ ] **Step 4: Integrate both streaming and non-streaming QueryEngine loops**
+- [x] **Step 4: Integrate both streaming and non-streaming QueryEngine loops**
 
 Use the same controller before every model call. Persist actual model usage into budgets and spans. A failed compaction keeps the last valid context and returns a classified recovery result.
 
-- [ ] **Step 5: Test hook ordering, budget exhaustion, invalid boundary fallback, and raw transcript retention**
+- [x] **Step 5: Test hook ordering, budget exhaustion, invalid boundary fallback, and raw transcript retention**
 
 Run: `.venv/bin/pytest tests/test_context_controller.py tests/test_context_compaction.py tests/state_core/test_recovery.py tests/state_core/test_query_engine_state.py -q`
 
-- [ ] **Step 6: Run Stage 3 gate and commit**
+- [x] **Step 6: Run Stage 3 gate and commit**
 
 ```bash
 git add harness/context_control.py services/compact query_engine.py state_core/types.py tests
@@ -629,11 +629,11 @@ git commit -m "feat: integrate durable context control"
 - Test: `tests/mcp_test_server.py`
 - Test: `tests/test_mcp_runtime.py`
 
-- [ ] **Step 1: Add the official MCP SDK dependency**
+- [x] **Step 1: Add the official MCP SDK dependency**
 
 Add `mcp>=1.9,<2` to project dependencies and run `uv sync` so stdio and streamable HTTP use the maintained protocol implementation.
 
-- [ ] **Step 2: Write failing real-server tests**
+- [x] **Step 2: Write failing real-server tests**
 
 ```python
 @pytest.mark.asyncio
@@ -645,23 +645,23 @@ async def test_stdio_server_discovery_call_and_resource(mcp_manager, stdio_serve
     assert (await mcp_manager.read_resource("test", "test://value")).text == "value"
 ```
 
-- [ ] **Step 3: Verify tests fail against mock results**
+- [x] **Step 3: Verify tests fail against mock results**
 
 Run: `.venv/bin/pytest tests/test_mcp_runtime.py -q`
 
-- [ ] **Step 4: Implement scoped connections and discovery**
+- [x] **Step 4: Implement scoped connections and discovery**
 
 `MCPConnectionManager` validates configs, lazily connects, registers discovered tools in the deferred registry, forwards structured content and metadata, reconnects transient failures once within budget, and closes sessions deterministically.
 
-- [ ] **Step 5: Rewrite public MCP tools as manager adapters**
+- [x] **Step 5: Rewrite public MCP tools as manager adapters**
 
 Preserve server list, tool list, execute, resource list/read, and auth response fields. Replace every mock branch. OAuth tools expose status and authorization URL/callback data supported by the SDK; credentials remain outside durable state.
 
-- [ ] **Step 6: Test HTTP transport, disconnect, cancellation, timeout, child-specific servers, and shutdown**
+- [x] **Step 6: Test HTTP transport, disconnect, cancellation, timeout, child-specific servers, and shutdown**
 
 Run: `.venv/bin/pytest tests/test_mcp_runtime.py tests/test_tool_pipeline.py -q`
 
-- [ ] **Step 7: Run Stage 4 gate and commit**
+- [x] **Step 7: Run Stage 4 gate and commit**
 
 ```bash
 git add pyproject.toml uv.lock harness/mcp.py harness/session.py tools/mcp_*.py tests/mcp_test_server.py tests/test_mcp_runtime.py
@@ -680,7 +680,7 @@ git commit -m "feat: add real MCP lifecycle"
 - Modify: path-aware tools in `tools/file_tools.py`, `tools/bash_tool.py`, `tools/search_tools.py`
 - Test: `tests/test_worktree_runtime.py`
 
-- [ ] **Step 1: Write failing temporary-repository tests**
+- [x] **Step 1: Write failing temporary-repository tests**
 
 ```python
 def test_enter_worktree_changes_only_effective_cwd(git_repo, harness):
@@ -697,23 +697,23 @@ def test_remove_fails_closed_for_uncommitted_changes(git_repo, harness):
     assert Path(record.path).exists()
 ```
 
-- [ ] **Step 2: Verify current `os.chdir` implementation fails isolation test**
+- [x] **Step 2: Verify current `os.chdir` implementation fails isolation test**
 
 Run: `.venv/bin/pytest tests/test_worktree_runtime.py -q`
 
-- [ ] **Step 3: Implement safe create, restore, keep, and remove**
+- [x] **Step 3: Implement safe create, restore, keep, and remove**
 
 Use `git -C <repo>` commands with no global cwd mutation. Validate slug segments, canonical containment, repository identity, branch, base commit, worktree metadata, and owner. Unknown state becomes `orphaned`.
 
-- [ ] **Step 4: Route effective cwd through all path-aware tools**
+- [x] **Step 4: Route effective cwd through all path-aware tools**
 
 Relative paths and shell working directories resolve from `SessionHarness.effective_cwd`. Child worktree isolation changes only that child harness unless the root explicitly enters a worktree.
 
-- [ ] **Step 5: Test resume, wrong owner, path traversal, existing branch, keep, discard confirmation, and cleanup failure**
+- [x] **Step 5: Test resume, wrong owner, path traversal, existing branch, keep, discard confirmation, and cleanup failure**
 
 Run: `.venv/bin/pytest tests/test_worktree_runtime.py tests/test_tool_pipeline.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add harness/worktrees.py harness/context.py harness/session.py tools/worktree_tool.py tools/file_tools.py tools/bash_tool.py tools/search_tools.py tests/test_worktree_runtime.py
@@ -730,7 +730,7 @@ git commit -m "feat: isolate session worktrees"
 - Modify: `harness/session.py`
 - Test: `tests/test_deferred_tools.py`
 
-- [ ] **Step 1: Write failing visibility and activation tests**
+- [x] **Step 1: Write failing visibility and activation tests**
 
 ```python
 def test_deferred_schema_requires_selection(harness):
@@ -746,23 +746,23 @@ def test_activation_is_restored(harness_factory):
     assert "worktree_enter" in resumed.deferred_tools.visible_names()
 ```
 
-- [ ] **Step 2: Verify static ToolSearch does not change visible schemas**
+- [x] **Step 2: Verify static ToolSearch does not change visible schemas**
 
 Run: `.venv/bin/pytest tests/test_deferred_tools.py -q`
 
-- [ ] **Step 3: Add explicit tool metadata and scoped activation**
+- [x] **Step 3: Add explicit tool metadata and scoped activation**
 
 Normalize `should_defer` whether implemented as bool or method. Initial model schemas include non-deferred tools plus ToolSearch. Search uses name, description, and search hint. Exact `select:<canonical>` persists activation for the current root or child agent.
 
-- [ ] **Step 4: Integrate dynamic schemas into every model turn**
+- [x] **Step 4: Integrate dynamic schemas into every model turn**
 
 QueryEngine and AgentExecutor fetch visible schemas from the current harness immediately before each model call. Direct unactivated calls return controlled validation errors. MCP connect/disconnect updates availability without deleting activation history.
 
-- [ ] **Step 5: Test aliases, child isolation, resume, missing MCP server, and exact selection**
+- [x] **Step 5: Test aliases, child isolation, resume, missing MCP server, and exact selection**
 
 Run: `.venv/bin/pytest tests/test_deferred_tools.py tests/test_query_engine_runtime.py tests/test_agent_runtime.py -q`
 
-- [ ] **Step 6: Run the complete core gate and commit**
+- [x] **Step 6: Run the complete core gate and commit**
 
 Run: `.venv/bin/pytest tests/state_core tests/test_session_harness.py tests/test_agent_scheduler.py tests/test_agent_runtime_tools.py tests/test_hook_runtime.py tests/test_skill_runtime.py tests/test_tool_pipeline.py tests/test_budget_runtime.py tests/test_tracing_runtime.py tests/test_context_controller.py tests/test_mcp_runtime.py tests/test_worktree_runtime.py tests/test_deferred_tools.py -q`
 
@@ -788,7 +788,7 @@ Do not begin Stage 6 until this complete core gate passes.
 - Modify: `main.py`
 - Test: `tests/state_core/test_api_compat.py`
 
-- [ ] **Step 1: Write failing HTTP recovery tests**
+- [x] **Step 1: Write failing HTTP recovery tests**
 
 ```python
 def test_agent_api_background_lifecycle_survives_new_factory(client, harness_factory):
@@ -818,23 +818,23 @@ def test_message_api_appends_one_authoritative_event(client, runtime_factory):
     assert user_events[0].payload["content"] == "hello"
 ```
 
-- [ ] **Step 2: Verify legacy dual writes and manager routes fail assertions**
+- [x] **Step 2: Verify legacy dual writes and manager routes fail assertions**
 
 Run: `.venv/bin/pytest tests/state_core/test_api_compat.py -q`
 
-- [ ] **Step 3: Rewrite services as SessionHarnessFactory adapters**
+- [x] **Step 3: Rewrite services as SessionHarnessFactory adapters**
 
 Preserve Pydantic request and response models. Conversation messages, Plan mutations, Task V2, Todo V1, Agent lifecycle, and chat streaming delegate to the harness/state-core. Legacy tables are read only through explicit migration.
 
-- [ ] **Step 4: Replace Plan and Agent router manager calls**
+- [x] **Step 4: Replace Plan and Agent router manager calls**
 
 Remove imports of `get_plan_mode_manager`, worker-pool managers, and global spawn managers from primary routes. Save/approve/reject/force-exit and spawn/status/stop all use the session harness.
 
-- [ ] **Step 5: Test all existing endpoints and new-factory recovery**
+- [x] **Step 5: Test all existing endpoints and new-factory recovery**
 
 Run: `.venv/bin/pytest tests/state_core/test_api_compat.py tests/state_core/test_service_adapters.py tests/test_query_engine_runtime.py -q`
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add services routers main.py tests/state_core/test_api_compat.py
@@ -849,7 +849,7 @@ git commit -m "feat: route APIs through durable harness"
 - Modify: `docs/superpowers/plans/2026-07-24-p1-harness-completion.md`
 - Test: entire suite
 
-- [ ] **Step 1: Audit forbidden primary imports**
+- [x] **Step 1: Audit forbidden primary imports**
 
 Run:
 
@@ -859,15 +859,15 @@ rg -n "get_plan_mode_manager|PlanModeManager|SpawnAgentManager|AgentManager\(|os
 
 Expected: only explicit migration tests, compatibility re-exports, or non-primary examples remain. Each remaining match is documented inline or removed.
 
-- [ ] **Step 2: Delete duplicate behavior, not compatibility names**
+- [x] **Step 2: Delete duplicate behavior, not compatibility names**
 
 Legacy modules become thin imports/adapters when external imports require them. Remove process-local state ownership, dynamic Python skill execution, MCP mock returns, worktree global cwd mutation, and old `ToolError` calls that pass the removed `tool_name` keyword.
 
-- [ ] **Step 3: Update README contracts**
+- [x] **Step 3: Update README contracts**
 
 Document SessionHarness, Agent foreground/background tools, Task/Todo modes, Plan approval, skill/hook execution, budgets, compaction, MCP configuration, deferred tools, worktree safety, recovery semantics, and non-replay guarantees.
 
-- [ ] **Step 4: Run complete verification**
+- [x] **Step 4: Run complete verification**
 
 ```bash
 .venv/bin/pytest -q
@@ -878,21 +878,25 @@ git diff --check
 
 Expected: all commands exit zero with no leaked asyncio tasks or test-modified tracked files.
 
-- [ ] **Step 5: Run smoke acceptance**
+- [x] **Step 5: Run smoke acceptance**
 
 Run cold resume with an interrupted background Agent, compact recovery, concurrent budget exhaustion, real stdio and HTTP MCP servers, temporary-repository worktree recovery/removal, deferred tool activation after resume, and API mutation recovery from a new factory.
 
-- [ ] **Step 6: Mark plan complete and commit**
+- [x] **Step 6: Mark plan complete and commit**
 
 ```bash
 git add README.md docs/superpowers/plans/2026-07-24-p1-harness-completion.md
 git commit -m "docs: complete durable harness delivery"
 ```
 
-- [ ] **Step 7: Push the completed branch**
+- [x] **Step 7: Push the completed branch**
 
 ```bash
 git push origin codex/p1-state-core
 ```
 
 Push only after all verification and acceptance checks pass.
+
+Delivery note: command-driven conversation clearing (`/clear`) is intentionally
+outside this delivery at the user's direction. The existing legacy HTTP clear
+compatibility endpoint is unchanged; no new harness context-clear primitive was added.

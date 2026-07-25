@@ -1,20 +1,21 @@
-"""
-Agent 路由
-提供 Agent 相关的API端点
-"""
-from typing import Optional, List
+"""Agent compatibility routes backed by the durable session harness."""
+
+from __future__ import annotations
+
+from typing import List, Optional
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from query_engine import query_engine
-from agents import get_agent_manager, get_built_in_agents, get_agent_by_type
-from agents.types import AgentExecutionConfig
+import app_context
+from agents import get_agent_by_type, get_built_in_agents
+from query_engine import API_AGENT_SURFACE
+from state_core import AgentRecord
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
 
 class AgentTypeResponse(BaseModel):
-    """Agent类型响应"""
     agent_type: str
     when_to_use: str
     tools: Optional[List[str]]
@@ -23,21 +24,18 @@ class AgentTypeResponse(BaseModel):
 
 
 class SpawnAgentRequest(BaseModel):
-    """创建Agent请求"""
     agent_type: str
     prompt: str
     is_async: bool = False
 
 
 class SpawnAgentResponse(BaseModel):
-    """创建Agent响应"""
     success: bool
     agent_id: str
     message: str
 
 
 class AgentStatusResponse(BaseModel):
-    """Agent状态响应"""
     agent_id: str
     agent_type: str
     status: str
@@ -47,7 +45,6 @@ class AgentStatusResponse(BaseModel):
 
 
 class AgentResultResponse(BaseModel):
-    """Agent结果响应"""
     agent_id: str
     content: List[dict]
     total_tool_use_count: int
@@ -55,33 +52,44 @@ class AgentResultResponse(BaseModel):
     total_tokens: int
 
 
+def _engine():
+    engine = app_context.query_engine
+    if engine is None:
+        raise RuntimeError("app_context.query_engine is not bound")
+    return engine
+
+
+def _status(record: AgentRecord) -> AgentStatusResponse:
+    output = record.output if isinstance(record.output, dict) else {}
+    return AgentStatusResponse(
+        agent_id=record.agent_id,
+        agent_type=record.agent_type,
+        status=record.status.value,
+        tool_use_count=int(output.get("tool_count", 0)),
+        started_at=record.started_at.isoformat() if record.started_at else None,
+        completed_at=record.finished_at.isoformat() if record.finished_at else None,
+    )
+
+
 @router.get("/types", response_model=List[AgentTypeResponse])
 async def list_agent_types():
-    """
-    获取所有可用的Agent类型
-    """
-    agents = get_built_in_agents()
     return [
         AgentTypeResponse(
-            agent_type=a.agent_type,
-            when_to_use=a.when_to_use,
-            tools=a.tools,
-            disallowed_tools=a.disallowed_tools,
-            model=a.model,
+            agent_type=agent.agent_type,
+            when_to_use=agent.when_to_use,
+            tools=agent.tools,
+            disallowed_tools=agent.disallowed_tools,
+            model=agent.model,
         )
-        for a in agents
+        for agent in get_built_in_agents()
     ]
 
 
 @router.get("/types/{agent_type}", response_model=AgentTypeResponse)
 async def get_agent_type(agent_type: str):
-    """
-    获取特定Agent类型的详细信息
-    """
     agent = get_agent_by_type(agent_type)
-    if not agent:
+    if agent is None:
         raise HTTPException(status_code=404, detail=f"Agent type '{agent_type}' not found")
-
     return AgentTypeResponse(
         agent_type=agent.agent_type,
         when_to_use=agent.when_to_use,
@@ -93,79 +101,71 @@ async def get_agent_type(agent_type: str):
 
 @router.post("/spawn", response_model=SpawnAgentResponse)
 async def spawn_agent(request: SpawnAgentRequest):
-    """
-    创建并启动Agent
-
-    - agent_type: Agent类型 (Explore, Plan, general-purpose, Code, Test)
-    - prompt: 任务描述
-    - is_async: 是否异步执行
-    """
-    # 验证Agent类型
-    agent_def = get_agent_by_type(request.agent_type)
-    if not agent_def:
-        raise HTTPException(status_code=400, detail=f"Unknown agent type: {request.agent_type}")
-
+    if get_agent_by_type(request.agent_type) is None:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown agent type: {request.agent_type}"
+        )
+    engine = _engine()
+    session_id = "standalone"
+    if engine.get_conversation(session_id) is None:
+        engine.create_conversation(session_id)
     try:
-        agent_id = await query_engine.spawn_agent(
-            conversation_id="standalone",  # 独立会话
-            agent_type=request.agent_type,
-            prompt=request.prompt,
-            is_async=request.is_async,
+        record = await engine.spawn_durable_agent(
+            session_id,
+            request.agent_type,
+            request.prompt,
+            background=request.is_async,
+            api_surface=API_AGENT_SURFACE,
+            api_metadata={"type": request.agent_type},
         )
-
-        return SpawnAgentResponse(
-            success=True,
-            agent_id=agent_id,
-            message=f"Agent {request.agent_type} spawned successfully",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return SpawnAgentResponse(
+        success=True,
+        agent_id=record.agent_id,
+        message=f"Agent {request.agent_type} spawned successfully",
+    )
 
 
 @router.get("/{agent_id}/status", response_model=AgentStatusResponse)
 async def get_agent_status(agent_id: str):
-    """
-    获取Agent状态
-    """
-    status = query_engine.get_agent_status(agent_id)
-    if not status:
+    record = _engine().get_durable_agent(
+        agent_id, api_surface=API_AGENT_SURFACE
+    )
+    if record is None:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
-
-    return AgentStatusResponse(**status)
+    return _status(record)
 
 
 @router.post("/{agent_id}/abort")
 async def abort_agent(agent_id: str):
-    """
-    中止Agent执行
-    """
-    status = query_engine.get_agent_status(agent_id)
-    if not status:
+    record = await _engine().stop_durable_agent(
+        agent_id, api_surface=API_AGENT_SURFACE
+    )
+    if record is None:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
-
-    query_engine.abort_agent(agent_id)
-
     return {
         "success": True,
         "message": f"Agent {agent_id} abort requested",
+        "status": record.status.value,
     }
 
 
 @router.get("/{agent_id}/result", response_model=AgentResultResponse)
 async def get_agent_result(agent_id: str):
-    """
-    获取Agent执行结果
-    """
-    manager = get_agent_manager()
-    result = manager._results.get(agent_id)
-
-    if not result:
+    record = _engine().get_durable_agent(
+        agent_id, api_surface=API_AGENT_SURFACE
+    )
+    if record is None or record.output is None:
         raise HTTPException(status_code=404, detail=f"Result for agent {agent_id} not found")
-
+    output = record.output if isinstance(record.output, dict) else {}
+    duration = 0
+    if record.started_at is not None and record.finished_at is not None:
+        duration = int((record.finished_at - record.started_at).total_seconds() * 1000)
     return AgentResultResponse(
-        agent_id=result.agent_id,
-        content=result.content,
-        total_tool_use_count=result.total_tool_use_count,
-        total_duration_ms=result.total_duration_ms,
-        total_tokens=result.total_tokens,
+        agent_id=record.agent_id,
+        content=list(output.get("content", [])),
+        total_tool_use_count=int(output.get("tool_count", 0)),
+        total_duration_ms=duration,
+        total_tokens=int(record.usage.get("total_tokens", 0)),
     )

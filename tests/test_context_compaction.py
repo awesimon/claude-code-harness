@@ -330,7 +330,7 @@ class TestResponsiveCompactor:
         assert responsive._consecutive_errors == 1
 
         # 其他错误类型
-        strategy = responsive.on_error(Exception("network error"))
+        responsive.on_error(Exception("network error"))
         assert responsive._consecutive_errors == 0
 
     def test_compact_with_response_error(self):

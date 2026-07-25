@@ -3,7 +3,6 @@
 支持 theme 和 vim mode 等用户偏好配置
 """
 
-from typing import Optional
 from pydantic import BaseModel, Field
 from pathlib import Path
 import json

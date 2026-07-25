@@ -2,11 +2,11 @@
 Agent 子系统（统一包）
 
 - **根模块**（本目录 `types` / `engine` / `built_in` / `fork` / `tool`）：对齐 Claude Code 的
-  内置 Agent 定义、`AgentExecutor`、`SpawnAgentManager`（spawn/abort 子会话）。
+  内置 Agent 定义和单次 `AgentExecutor` 执行。
 - **`worker_pool`**：线程池式 Worker、`Coordinator`、Plan/Explore Runner 等。
 
 导入建议：
-- 子 Agent 执行：`from agents import get_spawn_agent_manager, SpawnAgentManager`
+- 子 Agent 调度：使用 `harness.SessionHarness.agent_scheduler`
 - Worker 池：`from agents.worker_pool import WorkerPoolManager, Agent, Task`
 """
 
@@ -21,7 +21,7 @@ from .built_in import (
     get_built_in_agents,
 )
 
-# 兼容：旧代码 `from agents import AgentManager` 仍指向 SpawnAgentManager
+# 仅为旧导入保留；主路径通过 SessionHarness.agent_scheduler 调度。
 from .engine import (
     AgentExecutor,
     AgentManager,

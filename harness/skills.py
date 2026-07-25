@@ -10,11 +10,11 @@ from typing import Any, Callable, Iterable, Mapping
 
 from state_core import RuntimeMetadataRepository, RuntimeRecordRevisionConflict
 from utils.frontmatter_parser import extract_frontmatter_field, parse_frontmatter
+from utils.skill_paths import is_valid_skill_name
 
 from .hooks import HookDefinition, HookEvent, HookRuntime
 
 _SNAPSHOT_NAMESPACE = "skills.snapshots"
-_SKILL_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 _RESOURCE_DIRECTORIES = ("assets", "references", "scripts")
 _TOOL_ALIASES = {
     "Read": "read_file",
@@ -203,7 +203,7 @@ class SkillResolver:
         return tuple(entries)
 
     def resolve(self, name: str) -> SkillSnapshot:
-        if not isinstance(name, str) or not _SKILL_NAME.fullmatch(name) or "--" in name:
+        if not is_valid_skill_name(name):
             raise SkillNotFound(name)
         stored = self._stored_snapshot(name)
         if stored is not None:
@@ -288,9 +288,7 @@ class SkillResolver:
         name = frontmatter.get("name")
         description = frontmatter.get("description")
         if (
-            not isinstance(name, str)
-            or not _SKILL_NAME.fullmatch(name)
-            or "--" in name
+            not is_valid_skill_name(name)
             or name != skill_dir.name
         ):
             raise SkillError("skill name is invalid or does not match its directory")

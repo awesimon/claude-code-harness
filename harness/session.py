@@ -6,7 +6,7 @@ import copy
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from state_core import SessionRuntime, SessionRuntimeFactory
 
@@ -16,6 +16,13 @@ from .runtime import ToolRuntime
 
 _UNSET = object()
 _CAPABILITY_TOKEN = object()
+_SUPPORTED_AGENT_PROVIDERS = frozenset({"openai", "anthropic"})
+
+
+class _AgentRuntimeBindingToken:
+    """Opaque identity for one factory's child-agent runtime configuration."""
+
+
 _RESERVED_METADATA_KEYS = frozenset(
     {
         "agent_id",
@@ -118,6 +125,14 @@ def _validate_timeout(value: object) -> float:
     return timeout
 
 
+def _validate_agent_provider(value: object) -> str:
+    if not isinstance(value, str) or value not in _SUPPORTED_AGENT_PROVIDERS:
+        raise HarnessScopeError(
+            "agent_provider must be one of: anthropic, openai"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class _HarnessConfig:
     workspace_root: Path
@@ -217,6 +232,27 @@ class SessionHarness:
 
     @property
     def agent_scheduler(self):
+        from .agents import AgentScheduler
+
+        root = self
+        while root._parent_harness is not None:
+            root = root._parent_harness
+        if not root._services.get("agent_binding_explicit", False):
+            return AgentScheduler.for_harness(self)
+        options: dict[str, Any] = {
+            "agent_provider": root._services["agent_provider"],
+            "_binding_token": root._services["agent_binding_token"],
+            "_binding_explicit": True,
+        }
+        runner_factory = root._services.get("agent_runner_factory")
+        if runner_factory is not None:
+            options["runner_factory"] = runner_factory
+        return AgentScheduler.for_harness(self, **options)
+
+    @property
+    def observed_agent_scheduler(self):
+        """Return the current owner without requesting a runtime-binding change."""
+
         from .agents import AgentScheduler
 
         return AgentScheduler.for_harness(self)
@@ -386,6 +422,8 @@ class SessionHarnessFactory:
         approval_callback: ApprovalCallback | None = None,
         tool_timeout: float | None = None,
         allowed_workspaces: Iterable[Path | str] = (),
+        agent_runner_factory: Callable[[Any], Any] | None = None,
+        agent_provider: str | None = None,
     ) -> None:
         if tool_registry is None:
             from tools import ToolRegistry
@@ -401,6 +439,16 @@ class SessionHarnessFactory:
         self.approval_callback = _validate_approval_callback(approval_callback)
         self.tool_timeout = None if tool_timeout is None else _validate_timeout(tool_timeout)
         self.allowed_workspaces = _canonicalize_paths(allowed_workspaces)
+        if agent_runner_factory is not None and not callable(agent_runner_factory):
+            raise HarnessScopeError("agent_runner_factory must be callable or None")
+        self.agent_runner_factory = agent_runner_factory
+        self.agent_provider = _validate_agent_provider(
+            "openai" if agent_provider is None else agent_provider
+        )
+        self._agent_binding_explicit = (
+            agent_runner_factory is not None or agent_provider is not None
+        )
+        self._agent_binding_token = _AgentRuntimeBindingToken()
         self._agent_schedulers: dict[str, Any] = {}
 
     def create(
@@ -442,13 +490,41 @@ class SessionHarnessFactory:
         resumed = self._compose(
             self.session_runtime_factory.resume(session_id), config
         )
-        from .agents import AgentScheduler
-
-        scheduler = AgentScheduler.for_harness(resumed)
+        scheduler = resumed.agent_scheduler
         self._agent_schedulers[session_id] = scheduler
         scheduler.reconcile()
         resumed.traces.interrupt_open()
         resumed.worktrees.restore_active()
+        return resumed
+
+    def resume_observer(
+        self,
+        session_id: str,
+        *,
+        workspace_root: Path | str | None | object = _UNSET,
+        permission_mode: PermissionMode | object = _UNSET,
+        approval_callback: ApprovalCallback | None | object = _UNSET,
+        tool_timeout: float | None | object = _UNSET,
+        metadata: Mapping[str, Any] | object = _UNSET,
+        agent_id: str | None | object = _UNSET,
+        parent_agent_id: str | None | object = _UNSET,
+        allowed_workspaces: Iterable[Path | str] | object = _UNSET,
+    ) -> SessionHarness:
+        """Resume durable state while observing, rather than replacing, its agent owner."""
+
+        config = self._build_config(
+            workspace_root, permission_mode, approval_callback, tool_timeout, metadata,
+            agent_id, parent_agent_id, allowed_workspaces,
+        )
+        resumed = self._compose(
+            self.session_runtime_factory.resume(session_id), config
+        )
+        scheduler = resumed.observed_agent_scheduler
+        self._agent_schedulers[session_id] = scheduler
+        if not scheduler.live_agent_ids and not scheduler.is_degraded:
+            scheduler.reconcile()
+            resumed.traces.interrupt_open()
+            resumed.worktrees.restore_active()
         return resumed
 
     def _build_config(
@@ -543,4 +619,10 @@ class SessionHarnessFactory:
             allowed_workspaces=config.allowed_workspaces,
             _root_workspace=config.workspace_root,
             _capability_token=_CAPABILITY_TOKEN,
+            _services={
+                "agent_runner_factory": self.agent_runner_factory,
+                "agent_provider": self.agent_provider,
+                "agent_binding_explicit": self._agent_binding_explicit,
+                "agent_binding_token": self._agent_binding_token,
+            },
         )

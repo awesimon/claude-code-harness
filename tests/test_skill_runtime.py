@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 import pytest
@@ -239,3 +240,108 @@ async def test_compatibility_registry_is_progressive_and_rejects_custom_executor
     assert indexed.content is None
     with pytest.raises(RuntimeError, match="tool pipeline"):
         registry.register_executor("reviewing", lambda: None)
+
+
+def test_primary_skill_surface_is_session_scoped_without_dynamic_python() -> None:
+    import query_engine
+    import services.skill_manager as legacy_skill_manager
+    from tools import ToolRegistry
+    from tools.skill_tool_v2 import (
+        SkillInstallToolV2,
+        SkillListToolV2,
+        SkillUninstallToolV2,
+    )
+
+    assert isinstance(ToolRegistry.get("skill_install"), SkillInstallToolV2)
+    assert isinstance(ToolRegistry.get("skill_list"), SkillListToolV2)
+    assert isinstance(ToolRegistry.get("skill_uninstall"), SkillUninstallToolV2)
+
+    query_source = inspect.getsource(query_engine)
+    legacy_source = inspect.getsource(legacy_skill_manager)
+    assert "services.skill_manager" not in query_source
+    assert "load_all_skills()" not in query_source
+    assert "exec_module" not in legacy_source
+    assert '"pip", "install"' not in legacy_source
+    assert "ToolRegistry.register" not in legacy_source
+
+
+@pytest.mark.asyncio
+async def test_skill_mutation_tools_reject_path_names_before_execution() -> None:
+    from tools.skill_tool_v2 import (
+        SkillInstallInput,
+        SkillInstallToolV2,
+        SkillUninstallInput,
+        SkillUninstallToolV2,
+    )
+
+    install_error = await SkillInstallToolV2().validate(
+        SkillInstallInput(source="/tmp/reviewing", name="../outside")
+    )
+    uninstall_error = await SkillUninstallToolV2().validate(
+        SkillUninstallInput(skill="/tmp/outside")
+    )
+
+    assert install_error is not None
+    assert install_error.message == "Invalid skill name: ../outside"
+    assert uninstall_error is not None
+    assert uninstall_error.message == "Invalid skill name: /tmp/outside"
+
+
+@pytest.mark.asyncio
+async def test_skill_install_tool_rolls_back_when_resolver_rejects_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from harness.skills import SkillResolver
+    from tools.skill_tool_v2 import SkillInstallToolV2
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text(
+        "---\nname: reviewing\ndescription: valid source\n---\n\nReview",
+        encoding="utf-8",
+    )
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    resolver = SkillResolver(skills_dir)
+
+    def reject_published_skill(name: str):
+        raise ValueError(f"rejected after publish: {name}")
+
+    monkeypatch.setattr(resolver, "resolve", reject_published_skill)
+    harness = SimpleNamespace(skills=resolver)
+    target = skills_dir / "reviewing"
+
+    result = await SkillInstallToolV2().run(
+        {"source": str(source), "name": "reviewing"},
+        {"session_harness": harness},
+    )
+
+    assert result.success is False
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_compatibility_registry_does_not_report_invalid_install_as_success(
+    tmp_path: Path,
+) -> None:
+    from services.skill_registry import SkillRegistry
+
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text(
+        "---\nname: wrong-name\ndescription: mismatch\n---\n\nReview",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry()
+    registry.initialize(str(skills_dir))
+
+    with pytest.raises(ValueError):
+        await registry.install_skill(str(source), "reviewing")
+
+    assert registry.list_skills() == []
+    assert not (skills_dir / "reviewing").exists()

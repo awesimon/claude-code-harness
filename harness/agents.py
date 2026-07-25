@@ -12,6 +12,7 @@ import asyncio
 import copy
 import dataclasses
 import enum
+import logging
 import math
 import threading
 import uuid
@@ -25,10 +26,12 @@ from agents.types import (
     AgentDefinition,
     AgentDefinitionError,
     AgentExecutionResult,
+    AgentIsolationMode,
     AgentRequest,
     AgentRunner,
     CustomAgentDefinition,
     PluginAgentDefinition,
+    normalize_agent_messages,
     parse_agent_definition,
 )
 from state_core import (
@@ -44,6 +47,10 @@ from state_core.runtime_records import AGENT_TERMINAL_STATUSES
 
 from .context import PermissionMode
 from .session import SessionHarness
+from .worktrees import WorktreeNotClean
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentSchedulerError(RuntimeError):
@@ -80,7 +87,14 @@ class AgentShutdownReport:
 _SCHEDULER_OWNERS: dict[
     tuple[str, str], weakref.ReferenceType[AgentScheduler]
 ] = {}
+_REVOKED_BINDINGS: dict[tuple[str, str], weakref.WeakSet[Any]] = {}
 _SCHEDULER_OWNER_LOCK = threading.RLock()
+
+
+class _DirectSchedulerBindingToken:
+    """Weak-referenceable identity for schedulers not created by a factory."""
+
+
 def _repository_identity(
     repository: AgentRepository, harness_store: Any
 ) -> str:
@@ -120,6 +134,14 @@ def _registered_owner(key: tuple[str, str]) -> AgentScheduler | None:
     if reference is not None and owner is None:
         _SCHEDULER_OWNERS.pop(key, None)
     return owner
+
+
+def _revoked_bindings(key: tuple[str, str]) -> weakref.WeakSet[Any]:
+    revoked = _REVOKED_BINDINGS.get(key)
+    if revoked is None:
+        revoked = weakref.WeakSet()
+        _REVOKED_BINDINGS[key] = revoked
+    return revoked
 
 
 class _ConcurrencyLease:
@@ -162,7 +184,10 @@ def _json_value(value: Any) -> Any:
 
 
 def _definition_snapshot(
-    definition: AgentDefinition, request: AgentRequest
+    definition: AgentDefinition,
+    request: AgentRequest,
+    isolation: AgentIsolationMode | None,
+    provider: str,
 ) -> dict[str, Any]:
     snapshot = _json_value(definition)
     assert isinstance(snapshot, dict)
@@ -179,6 +204,9 @@ def _definition_snapshot(
         raise AgentDefinitionError("Agent system prompt must be a non-empty string")
     snapshot["system_prompt"] = system_prompt
     snapshot["metadata"] = _json_value(copy.deepcopy(request.definition_metadata))
+    snapshot["initial_messages"] = normalize_agent_messages(request.initial_messages)
+    snapshot["isolation"] = isolation.value if isolation is not None else None
+    snapshot["provider"] = provider
     if request.model is not None:
         snapshot["model"] = request.model
     snapshot["execution_timeout"] = _execution_timeout(request)
@@ -247,10 +275,13 @@ class AgentScheduler:
         *,
         runner: AgentRunner | Callable[[AgentRecord, SessionHarness], Any] | None = None,
         runner_factory: Callable[[AgentRecord], AgentRunner] | None = None,
+        agent_provider: str = "openai",
         root_concurrency: int = 4,
         per_parent_concurrency: int = 2,
         stop_grace: float = 0.25,
         force_grace: float = 0.25,
+        _binding_token: object | None = None,
+        _binding_explicit: bool = False,
     ) -> None:
         if root_concurrency < 1 or per_parent_concurrency < 1:
             raise ValueError("agent concurrency limits must be positive")
@@ -263,6 +294,8 @@ class AgentScheduler:
             raise ValueError("stop grace periods must be non-negative finite numbers")
         if runner is not None and runner_factory is not None:
             raise ValueError("provide runner or runner_factory, not both")
+        if agent_provider not in {"openai", "anthropic"}:
+            raise ValueError("agent_provider must be one of: anthropic, openai")
         resolved_repository = repository or harness.store.agents
         owner_key = _owner_key(harness, resolved_repository)
         with _SCHEDULER_OWNER_LOCK:
@@ -276,6 +309,20 @@ class AgentScheduler:
             self._owner_key = owner_key
             self._runner = runner
             self._runner_factory = runner_factory
+            self._agent_provider = agent_provider
+            self._binding_token = (
+                _DirectSchedulerBindingToken()
+                if _binding_token is None
+                else _binding_token
+            )
+            try:
+                weakref.ref(self._binding_token)
+            except TypeError as exc:
+                raise ValueError("scheduler binding token must support weak references") from exc
+            self._binding_explicit = bool(
+                _binding_explicit or runner is not None or runner_factory is not None
+            )
+            self._binding_valid = True
             self._root_semaphore = asyncio.BoundedSemaphore(root_concurrency)
             self._per_parent_concurrency = per_parent_concurrency
             self._parent_semaphores: dict[str, asyncio.Semaphore] = {}
@@ -298,15 +345,51 @@ class AgentScheduler:
         repository: AgentRepository | None = None,
         **options: Any,
     ) -> AgentScheduler:
-        """Return the process owner for a durable root, creating it if absent."""
+        """Resolve one runtime binding without silently changing its configuration."""
 
         resolved_repository = repository or harness.store.agents
         key = _owner_key(harness, resolved_repository)
         with _SCHEDULER_OWNER_LOCK:
+            requested_token = options.get("_binding_token")
+            revoked = _revoked_bindings(key)
+            if requested_token is not None and requested_token in revoked:
+                raise AgentSchedulerAlreadyActive(
+                    "This scheduler runtime binding has been superseded"
+                )
             owner = _registered_owner(key)
-            if owner is not None:
+            if owner is None:
+                return cls(harness, resolved_repository, **options)
+            if not options:
                 return owner
-            return cls(harness, resolved_repository, **options)
+            if requested_token is None:
+                raise AgentSchedulerAlreadyActive(
+                    "A configured AgentScheduler already owns this durable root"
+                )
+            if requested_token is owner._binding_token:
+                if (
+                    options.get("runner_factory") is not owner._runner_factory
+                    or options.get("agent_provider", "openai")
+                    != owner._agent_provider
+                ):
+                    raise AgentSchedulerAlreadyActive(
+                        "The scheduler binding configuration changed after ownership"
+                    )
+                return owner
+            if owner._tasks or owner._quarantined_tasks or owner._concurrency_leases:
+                raise AgentSchedulerAlreadyActive(
+                    "Cannot replace a scheduler runtime binding with live work"
+                )
+
+            owner._binding_valid = False
+            revoked.add(owner._binding_token)
+            _SCHEDULER_OWNERS.pop(key, None)
+            try:
+                return cls(harness, resolved_repository, **options)
+            except BaseException:
+                revoked.discard(owner._binding_token)
+                owner._binding_valid = True
+                _SCHEDULER_OWNERS[key] = weakref.ref(owner)
+                raise
 
     @property
     def live_agent_ids(self) -> frozenset[str]:
@@ -350,10 +433,14 @@ class AgentScheduler:
             )
         return record
 
-    @staticmethod
     def _validate_request(
+        self,
         request: AgentRequest,
-    ) -> tuple[AgentDefinition, dict[str, Any]]:
+    ) -> tuple[
+        AgentDefinition,
+        dict[str, Any],
+        AgentIsolationMode | None,
+    ]:
         if not isinstance(request.prompt, str) or not request.prompt:
             raise ValueError("Agent prompt must be non-empty")
         if not isinstance(request.description, str) or not request.description:
@@ -376,8 +463,64 @@ class AgentScheduler:
             raise AgentDefinitionError(f"Unknown agent type: {request.agent_type}")
         if request.model is not None and not isinstance(request.model, str):
             raise AgentDefinitionError("Agent model must be a string")
+        if request.isolation is not None and not isinstance(
+            request.isolation, AgentIsolationMode
+        ):
+            raise AgentDefinitionError(
+                "Agent isolation must be an AgentIsolationMode value or None"
+            )
+        isolation = (
+            request.isolation
+            if request.isolation is not None
+            else definition.isolation
+        )
+        if isolation is AgentIsolationMode.REMOTE:
+            raise AgentSchedulerError("Remote agent isolation is not supported")
         _execution_timeout(request)
-        return definition, _definition_snapshot(definition, request)
+        return (
+            definition,
+            _definition_snapshot(
+                definition, request, isolation, self._agent_provider
+            ),
+            isolation,
+        )
+
+    @staticmethod
+    def _cleanup_worktree(child: SessionHarness, worktree_id: str | None) -> None:
+        """Remove an unchanged child worktree or detach and keep changed work."""
+
+        if worktree_id is None:
+            return
+        try:
+            current = child.store.worktrees.get(worktree_id)
+            if (
+                current is None
+                or current.agent_id != child.agent_id
+                or current.details.get("attached") is not True
+            ):
+                return
+            isolated_cwd = Path(current.canonical_path)
+            try:
+                child.worktrees.remove(worktree_id)
+            except WorktreeNotClean:
+                try:
+                    child.worktrees.keep(worktree_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to keep changed agent worktree %s", worktree_id
+                    )
+            except Exception:
+                logger.exception("Failed to clean up agent worktree %s", worktree_id)
+            try:
+                # A force-cancelled coroutine may still be unwinding. Never let its
+                # child scope fall back to the parent repository after isolation ends.
+                child._set_effective_cwd(isolated_cwd)
+            except Exception:
+                logger.exception(
+                    "Failed to retain isolated cwd for agent worktree %s", worktree_id
+                )
+        except Exception:
+            logger.exception("Failed to inspect agent worktree %s", worktree_id)
 
     async def spawn(
         self,
@@ -385,6 +528,10 @@ class AgentScheduler:
         *,
         harness: SessionHarness | None = None,
     ) -> AgentRecord:
+        if not self._binding_valid:
+            raise AgentSchedulerAlreadyActive(
+                "This scheduler runtime binding has been superseded"
+            )
         if self.is_degraded:
             raise AgentSchedulerDegraded(
                 "Agent scheduler has unresolved quarantined runner work"
@@ -401,8 +548,9 @@ class AgentScheduler:
             if request.parent_agent_id is not None
             else scope.agent_id
         )
-        definition, definition_snapshot = self._validate_request(request)
+        definition, definition_snapshot, isolation = self._validate_request(request)
         agent_id = f"agent-{request.agent_type.lower()}-{uuid.uuid4().hex[:12]}"
+        parent_cwd = scope.effective_cwd
         child_options: dict[str, Any] = {
             "parent_agent_id": parent_agent_id,
             "cwd": request.cwd,
@@ -412,7 +560,25 @@ class AgentScheduler:
         if permission_mode is not None:
             child_options["permission_mode"] = permission_mode
         child = scope.child(agent_id, **child_options)
-        pending_record = AgentRecord(
+        worktree_id = request.worktree_id
+        if isolation is AgentIsolationMode.WORKTREE:
+            worktree = child.worktrees.create(agent_id)
+            worktree_id = worktree.worktree_id
+            metadata = definition_snapshot.get("metadata", {})
+            fork = metadata.get("fork") if isinstance(metadata, Mapping) else None
+            if isinstance(fork, Mapping) and fork.get("parent_session_id") is not None:
+                from agents.fork import build_worktree_notice
+
+                definition_snapshot["initial_messages"].append(
+                    {
+                        "role": "user",
+                        "content": build_worktree_notice(
+                            str(parent_cwd), str(child.effective_cwd)
+                        ),
+                    }
+                )
+        try:
+            pending_record = AgentRecord(
                 agent_id=agent_id,
                 root_session_id=self.harness.root_session_id,
                 parent_agent_id=parent_agent_id,
@@ -422,9 +588,8 @@ class AgentScheduler:
                 is_background=request.background,
                 effective_cwd=str(child.effective_cwd),
                 definition_snapshot=definition_snapshot,
-                worktree_id=request.worktree_id,
+                worktree_id=worktree_id,
             )
-        try:
             if parent_agent_id is None:
                 record = self.repository.create(pending_record)
             else:
@@ -434,10 +599,14 @@ class AgentScheduler:
                 if not callable(create_guarded):
                     raise InvalidAgentParent(parent_agent_id)
                 record = create_guarded(pending_record)
-        except InvalidAgentParent as exc:
-            raise AgentOwnershipError(
-                "Agent parent must be running in the same durable root"
-            ) from exc
+        except Exception as exc:
+            if isolation is AgentIsolationMode.WORKTREE:
+                self._cleanup_worktree(child, worktree_id)
+            if isinstance(exc, InvalidAgentParent):
+                raise AgentOwnershipError(
+                    "Agent parent must be running in the same durable root"
+                ) from exc
+            raise
         self._children[agent_id] = child
         ready = asyncio.Event()
         self._ready_events[agent_id] = ready
@@ -575,6 +744,8 @@ class AgentScheduler:
             self._signal_ready(record.agent_id)
             if lease is not None:
                 await self._release_concurrency_lease(record.agent_id, lease)
+            if record.definition_snapshot.get("isolation") == "worktree":
+                self._cleanup_worktree(child, record.worktree_id)
 
     def _persist_result(
         self, agent_id: str, result: AgentExecutionResult
@@ -703,6 +874,9 @@ class AgentScheduler:
             try:
                 await asyncio.wait_for(asyncio.shield(task), self._force_grace)
             except asyncio.TimeoutError:
+                current = self._owned(agent_id)
+                if child is not None and current.worktree_id is not None:
+                    self._cleanup_worktree(child, current.worktree_id)
                 cancelled = self._finish(agent_id, AgentStatus.CANCELLED)
                 await self._quarantine(agent_id, task)
                 return cancelled

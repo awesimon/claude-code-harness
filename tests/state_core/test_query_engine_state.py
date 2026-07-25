@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 from sqlalchemy import create_engine
@@ -12,7 +13,7 @@ from agents import AgentExecutionResult
 from harness import AgentScheduler, ToolRuntime
 from models import Base
 from query_engine import QueryEngine, ToolCall, ToolObservation
-from services.llm_service import ChatCompletionResponse
+from services.llm_service import ChatCompletionResponse, LLMProvider
 from state_core import EventType, SessionRuntimeFactory, SQLAlchemyStateStore, TaskMode
 from tools.base import Tool, ToolResult
 from tools.web_search_tool import WebSearchOutput
@@ -26,6 +27,25 @@ class StaticLLM:
             content="done",
             finish_reason="stop",
         )
+
+
+class RecordingChildLLM:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def chat_completion(self, request):
+        self.requests.append(request)
+        return ChatCompletionResponse(
+            id="child-response",
+            model=request.model or "child-model",
+            content="child done",
+            finish_reason="stop",
+        )
+
+
+def test_query_engine_side_effect_apis_are_annotated_as_returning_none() -> None:
+    assert get_type_hints(QueryEngine.__init__)["return"] is type(None)
+    assert get_type_hints(QueryEngine.on_state_change)["return"] is type(None)
 
 
 def tool_call_response() -> ChatCompletionResponse:
@@ -140,6 +160,33 @@ def runtime_factory(tmp_path: Path) -> SessionRuntimeFactory:
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     return SessionRuntimeFactory(SQLAlchemyStateStore(factory))
+
+
+@pytest.mark.asyncio
+async def test_child_agent_inherits_query_provider_and_injected_llm_service(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    llm = RecordingChildLLM()
+    engine = QueryEngine(
+        llm_service=llm,
+        provider=LLMProvider.ANTHROPIC,
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("provider-inheritance")
+
+    completed = await engine.spawn_durable_agent(
+        "provider-inheritance",
+        "general-purpose",
+        "inspect provider inheritance",
+        background=False,
+        api_surface="/agents",
+    )
+
+    assert completed.definition_snapshot["provider"] == "anthropic"
+    assert len(llm.requests) == 1
+    assert llm.requests[0].provider is LLMProvider.ANTHROPIC
 
 
 @pytest.mark.asyncio
@@ -274,23 +321,25 @@ async def test_query_engine_finds_agent_across_owned_session_roots(
 async def test_query_engine_abort_delegates_to_session_scheduler(
     runtime_factory: SessionRuntimeFactory, tmp_path: Path
 ) -> None:
-    class BlockingRunner:
+    class BlockingLLM:
         def __init__(self) -> None:
             self.release = asyncio.Event()
 
-        async def run(self, record, child_harness):
+        async def chat_completion(self, request):
             await self.release.wait()
-            return AgentExecutionResult(content="done")
+            return ChatCompletionResponse(
+                id="blocked", model="test", content="done", finish_reason="stop"
+            )
 
-    runner = BlockingRunner()
+    llm = BlockingLLM()
     engine = QueryEngine(
-        llm_service=StaticLLM(),
+        llm_service=llm,
         enable_error_recovery=False,
         workspace_root=tmp_path,
         session_runtime_factory=runtime_factory,
     )
     engine.create_conversation("abort-root")
-    scheduler = AgentScheduler(engine._session_harness("abort-root"), runner=runner)
+    scheduler = engine._session_harness("abort-root").agent_scheduler
     agent_id = await engine.spawn_agent(
         "abort-root", "Explore", "inspect", is_async=True
     )
@@ -300,7 +349,7 @@ async def test_query_engine_abort_delegates_to_session_scheduler(
     await abort
 
     assert engine.get_agent_status(agent_id)["status"] == "cancelled"
-    runner.release.set()
+    llm.release.set()
     await scheduler.shutdown()
 
 

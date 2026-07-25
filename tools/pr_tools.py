@@ -4,7 +4,6 @@ PR 审查工具
 """
 
 import subprocess
-from typing import Optional
 from pydantic import BaseModel, Field
 
 from .base import Tool, ToolResult, register_tool

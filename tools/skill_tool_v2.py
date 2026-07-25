@@ -7,6 +7,7 @@ from typing import Any
 
 from harness.skills import SkillError, SkillResolver
 from services.skill_loader import SkillLoader
+from utils.skill_paths import validate_skill_name
 
 from .base import (
     Tool,
@@ -131,6 +132,11 @@ class SkillInstallToolV2(Tool[SkillInstallInput, dict[str, str]]):
     async def validate(self, input_data: SkillInstallInput):
         if not input_data.source or not input_data.source.strip():
             return ToolValidationError("source path is required")
+        if input_data.name is not None:
+            try:
+                validate_skill_name(input_data.name.strip())
+            except ValueError as exc:
+                return ToolValidationError(str(exc))
         return None
 
     async def execute(self, input_data: SkillInstallInput) -> ToolResult:
@@ -138,14 +144,25 @@ class SkillInstallToolV2(Tool[SkillInstallInput, dict[str, str]]):
         if resolver is None:
             return ToolResult.fail("session_harness is required for skill installation")
         loader = SkillLoader(str(resolver.skills_dir))
+        installed_name: str | None = None
         try:
-            name = await loader.install_skill(
+            installed_name = await loader.install_skill(
                 input_data.source.strip(), input_data.name.strip() if input_data.name else None
             )
-            resolver.resolve(name)
+            resolver.resolve(installed_name)
         except Exception as exc:
+            if installed_name is not None:
+                try:
+                    await loader.uninstall_skill(installed_name)
+                except Exception as rollback_exc:
+                    return ToolResult.fail(
+                        ToolExecutionError(f"{exc}; rollback failed: {rollback_exc}")
+                    )
             return ToolResult.fail(ToolExecutionError(str(exc)))
-        return ToolResult.ok({"skill": name}, f"Successfully installed skill: {name}")
+        return ToolResult.ok(
+            {"skill": installed_name},
+            f"Successfully installed skill: {installed_name}",
+        )
 
     def is_destructive(self) -> bool:
         return True
@@ -161,6 +178,10 @@ class SkillUninstallToolV2(Tool[SkillUninstallInput, bool]):
     async def validate(self, input_data: SkillUninstallInput):
         if not input_data.skill or not input_data.skill.strip():
             return ToolValidationError("skill name is required")
+        try:
+            validate_skill_name(input_data.skill.strip())
+        except ValueError as exc:
+            return ToolValidationError(str(exc))
         return None
 
     async def execute(self, input_data: SkillUninstallInput) -> ToolResult:

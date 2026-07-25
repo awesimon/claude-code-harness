@@ -5,13 +5,16 @@ FastAPI主应用模块
 
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 # 加载环境变量（必须在其他导入之前）
 load_dotenv()
@@ -30,20 +33,20 @@ from tools import (
 )
 from tools.file_tools import ReadFileInput, WriteFileInput, EditFileInput
 from tools.search_tools import GlobInput, GrepInput
-from agents.worker_pool import (
-    AgentManager,
-)
+from agents import get_agent_by_type
 from services import LLMService, LLMProvider, Message, ChatCompletionRequest
 from services.config_service import config_service
-from query_engine import QueryEngine
+from services.task_service import TaskService
+from query_engine import LEGACY_AGENT_SURFACE, QueryEngine
 import app_context
 from routers import models_router, plan_router, agents_router, chat_legacy_router
 from routers.data_router import (
     conversations_router, tasks_router, plans_router, ws_router
 )
 from routers.team_router import teams_router
-from models import init_db
-from schemas import APIResponse
+from models import get_db, init_db
+from schemas import APIResponse, TaskCreate
+from state_core import AgentRecord
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -64,7 +67,6 @@ uvicorn_access_logger = logging.getLogger("uvicorn.access")
 uvicorn_access_logger.addFilter(HealthCheckFilter())
 
 # 全局实例
-agent_manager = AgentManager()
 llm_service = LLMService()
 query_engine = QueryEngine()
 app_context.bind(query_engine, llm_service)
@@ -115,10 +117,17 @@ class CreateAgentRequest(BaseModel):
     name: Optional[str] = None
     capabilities: Optional[List[str]] = None
     max_concurrent_tasks: int = 1
+    description: Optional[str] = None
+    prompt: Optional[str] = None
+    subagent_type: Optional[str] = None
+    run_in_background: bool = True
+    session_id: Optional[str] = None
 
 
 class CreateTaskRequest(BaseModel):
     description: str
+    subject: Optional[str] = None
+    conversation_id: Optional[str] = None
     task_type: str = "local_bash"
     input_data: Dict[str, Any] = Field(default_factory=dict)
     priority: str = "normal"
@@ -144,19 +153,12 @@ class ChatCompletionRequestModel(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    # 启动
-    logger.info("启动Agent管理器...")
-    await agent_manager.start()
-
     # 初始化数据库
     logger.info("初始化数据库...")
     init_db()
 
     yield
 
-    # 关闭
-    logger.info("停止Agent管理器...")
-    await agent_manager.stop()
     await llm_service.close()
 
 
@@ -285,29 +287,114 @@ async def list_tools():
 
 # ========== Agent API ==========
 
+def _legacy_agent_status(record: AgentRecord) -> str:
+    if record.status.value == "pending":
+        return "idle"
+    if record.status.value == "running":
+        return "busy"
+    if record.status.value == "completed":
+        return "completed"
+    return "error"
+
+
+def _agent_data(record: AgentRecord) -> Dict[str, Any]:
+    output = record.output if isinstance(record.output, dict) else {}
+    metadata = record.definition_snapshot.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    compat = metadata.get("api_compat")
+    compat = compat if isinstance(compat, dict) else {}
+    name = str(compat.get("name") or record.description)
+    agent_type = str(compat.get("type") or "worker")
+    capabilities = list(compat.get("capabilities") or [])
+    max_concurrent_tasks = int(compat.get("max_concurrent_tasks", 1))
+    legacy_status = _legacy_agent_status(record)
+    created_at = record.created_at.timestamp()
+    statistics = {
+        "id": record.agent_id,
+        "name": name,
+        "type": agent_type,
+        "status": legacy_status,
+        "tools": capabilities,
+        "current_tasks": 0 if record.finished_at else 1,
+        "completed_tasks": int(record.status.value == "completed"),
+        "failed_tasks": int(legacy_status == "error"),
+        "total_tasks_executed": int(record.finished_at is not None),
+        "created_at": created_at,
+        "last_active_at": (
+            record.updated_at.timestamp() if record.updated_at else None
+        ),
+    }
+    return {
+        "id": record.agent_id,
+        "name": name,
+        "type": agent_type,
+        "status": legacy_status,
+        "agent_status": record.status.value,
+        "config": {
+            "description": compat.get("description"),
+            "tools": capabilities,
+            "max_concurrent_tasks": max_concurrent_tasks,
+        },
+        "statistics": statistics,
+        "agent_id": record.agent_id,
+        "session_id": record.root_session_id,
+        "agent_type": record.agent_type,
+        "capabilities": capabilities,
+        "max_concurrent_tasks": max_concurrent_tasks,
+        "tool_use_count": int(output.get("tool_count", 0)),
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+    }
+
+
+def _all_agent_records() -> List[AgentRecord]:
+    return query_engine.list_durable_agents(api_surface=LEGACY_AGENT_SURFACE)
+
+
 @app.post("/agents", response_model=APIResponse)
 async def create_agent(request: CreateAgentRequest):
-    """创建新Agent"""
-    from agents.worker_pool import AgentConfig
-
-    config = AgentConfig(
-        name=request.name,
-        max_concurrent_tasks=request.max_concurrent_tasks,
-    )
-    if request.capabilities:
-        for cap in request.capabilities:
-            config.tools.add(cap)
-
-    result = await agent_manager.create_agent(config=config, agent_type="worker")
-
-    if result.is_err():
-        raise HTTPException(status_code=400, detail=result.error)
-
-    agent = result.data
+    """创建由 durable session harness 管理的 Agent。"""
+    agent_type = request.subagent_type or "general-purpose"
+    if get_agent_by_type(agent_type) is None:
+        raise HTTPException(status_code=400, detail=f"Unknown agent type: {agent_type}")
+    if request.max_concurrent_tasks < 1:
+        raise HTTPException(
+            status_code=400, detail="max_concurrent_tasks must be positive"
+        )
+    prompt = request.prompt or request.description or request.name or "Agent task"
+    session_id = request.session_id or f"agent-session-{uuid.uuid4().hex}"
+    name = request.name or f"worker-{session_id[-8:]}"
+    description = request.description
+    compat = {
+        "name": name,
+        "type": "worker",
+        "description": description,
+        "capabilities": list(request.capabilities or []),
+        "max_concurrent_tasks": request.max_concurrent_tasks,
+    }
+    definition = get_agent_by_type(agent_type)
+    assert definition is not None
+    if request.capabilities is not None:
+        definition = replace(definition, tools=list(request.capabilities))
+    if query_engine.get_conversation(session_id) is None:
+        query_engine.create_conversation(session_id)
+    try:
+        record = await query_engine.spawn_durable_agent(
+            session_id,
+            agent_type,
+            prompt,
+            background=request.run_in_background,
+            api_surface=LEGACY_AGENT_SURFACE,
+            description=description or name,
+            definition=definition,
+            api_metadata=compat,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return APIResponse(
         success=True,
-        data=agent.to_dict(),
-        message=f"Agent {agent.name} 创建成功",
+        data=_agent_data(record),
+        message=f"Agent {name} 创建成功",
     )
 
 
@@ -315,13 +402,13 @@ async def create_agent(request: CreateAgentRequest):
 async def list_agents(
     status: Optional[str] = Query(None, description="按状态过滤: idle, busy, completed, error"),
 ):
-    """列出所有Agent"""
-    agents = list(agent_manager._agents.values())
+    """列出 durable Agent。"""
+    agents = _all_agent_records()
     if status:
-        agents = [a for a in agents if a.status.value == status]
+        agents = [agent for agent in agents if _legacy_agent_status(agent) == status]
     return APIResponse(
         success=True,
-        data=[a.to_dict() for a in agents],
+        data=[_agent_data(agent) for agent in agents],
         message=f"共 {len(agents)} 个Agent",
     )
 
@@ -329,21 +416,25 @@ async def list_agents(
 @app.get("/agents/{agent_id}", response_model=APIResponse)
 async def get_agent(agent_id: str):
     """获取Agent详情"""
-    agent = agent_manager._agents.get(agent_id)
-    if not agent:
+    agent = query_engine.get_durable_agent(
+        agent_id, api_surface=LEGACY_AGENT_SURFACE
+    )
+    if agent is None:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} 不存在")
     return APIResponse(
         success=True,
-        data=agent.to_dict(),
+        data=_agent_data(agent),
     )
 
 
 @app.delete("/agents/{agent_id}", response_model=APIResponse)
 async def remove_agent(agent_id: str):
-    """移除Agent"""
-    result = await agent_manager.destroy_agent(agent_id)
-    if result.is_err():
-        raise HTTPException(status_code=400, detail=result.error)
+    """停止Agent；durable lifecycle record 保留用于恢复。"""
+    record = await query_engine.stop_durable_agent(
+        agent_id, api_surface=LEGACY_AGENT_SURFACE
+    )
+    if record is None:
+        raise HTTPException(status_code=400, detail=f"Agent {agent_id} 不存在")
     return APIResponse(
         success=True,
         message=f"Agent {agent_id} 已移除",
@@ -353,12 +444,22 @@ async def remove_agent(agent_id: str):
 # ========== 任务API ==========
 
 @app.post("/tasks", response_model=APIResponse)
-async def create_task(request: CreateTaskRequest):
-    """创建新任务"""
+async def create_task(
+    request: CreateTaskRequest, db: Session = Depends(get_db)
+):
+    """创建 durable Task V2 任务。"""
+    task = TaskService(db).create_task(
+        TaskCreate(
+            conversation_id=request.conversation_id,
+            subject=request.subject or request.description,
+            description=request.description,
+            meta={"task_type": request.task_type, "input_data": request.input_data},
+        )
+    )
     return APIResponse(
         success=True,
-        data={"message": "Task creation endpoint - to be implemented with Coordinator"},
-        message="任务创建接口（需要Coordinator实现）",
+        data=task.__dict__,
+        message="任务创建成功",
     )
 
 
@@ -366,19 +467,24 @@ async def create_task(request: CreateTaskRequest):
 async def list_tasks(
     status: Optional[str] = Query(None, description="按状态过滤"),
     agent_id: Optional[str] = Query(None, description="按Agent过滤"),
+    db: Session = Depends(get_db),
 ):
-    """列出所有任务"""
+    """列出 durable Task V2 任务。"""
+    tasks = TaskService(db).list_tasks(status=status, owner=agent_id)
     return APIResponse(
         success=True,
-        data=[],
-        message="任务列表接口（需要Coordinator实现）",
+        data=[task.__dict__ for task in tasks],
+        message=f"共 {len(tasks)} 个任务",
     )
 
 
 @app.get("/tasks/{task_id}", response_model=APIResponse)
-async def get_task(task_id: str):
+async def get_task(task_id: str, db: Session = Depends(get_db)):
     """获取任务详情"""
-    raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+    task = TaskService(db).get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"任务 {task_id} 不存在")
+    return APIResponse(success=True, data=task.__dict__)
 
 
 # ========== 统计API ==========
@@ -388,7 +494,7 @@ async def get_stats():
     """获取系统统计信息"""
     stats = {
         "agents": {
-            "total": len(agent_manager._agents),
+            "total": len(_all_agent_records()),
         },
         "tools": len(ToolRegistry.list_tools()),
     }

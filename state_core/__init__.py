@@ -1,6 +1,6 @@
 """Public domain contract for durable session state."""
 
-from .migration import migrate_legacy_session
+from .migration import migrate_legacy_global_tasks, migrate_legacy_session
 from .repository import StateRepository, TaskRepository
 from .runtime import SessionRuntime, SessionRuntimeFactory
 from .runtime_records import (
@@ -65,6 +65,7 @@ __all__ = [
     "InvalidTraceSpanTransition",
     "InvalidWorktreeTransition",
     "InvalidTransition",
+    "migrate_legacy_global_tasks",
     "migrate_legacy_session",
     "NewTask",
     "PendingEventBatch",

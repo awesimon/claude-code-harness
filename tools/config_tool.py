@@ -4,13 +4,12 @@
 支持settings.json管理和环境变量配置
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 import json
 import os
 import asyncio
-from datetime import datetime
 
 from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
 
@@ -265,7 +264,7 @@ class ConfigManager:
                     key=key,
                     value=value,
                     scope="settings",
-                    source=f"settings.json"
+                    source="settings.json"
                 )
 
         return None

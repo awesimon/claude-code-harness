@@ -6,7 +6,6 @@
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 import time
-import re
 from urllib.parse import urlparse
 
 import httpx

@@ -63,6 +63,7 @@ def record(tmp_path: Path) -> AgentRecord:
         ({"system_prompt": 42}, "snapshot"),
         ({"metadata": []}, "snapshot"),
         ({"execution_timeout": True}, "snapshot"),
+        ({"provider": "unsupported"}, "snapshot"),
         ({"unexpected": "field"}, "snapshot"),
         ({}, "other-type"),
     ],

@@ -12,7 +12,7 @@ from agents.worker_pool import (
     TaskStatus,
     TaskPriority,
     ExecutionPlan,
-    AgentManager,
+    WorkerPoolManager,
 )
 
 
@@ -26,7 +26,7 @@ async def coordinator():
 @pytest.mark.asyncio
 async def test_agent_creation():
     """Test agent creation."""
-    manager = AgentManager()
+    manager = WorkerPoolManager()
 
     config = AgentConfig(name="test-agent", max_concurrent_tasks=2)
     result = await manager.create_agent(config)

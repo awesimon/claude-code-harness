@@ -3,7 +3,7 @@
 提供团队创建、删除、成员管理和状态查询等功能
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 import json
@@ -113,7 +113,6 @@ class TeamCreateTool(Tool[TeamCreateInput, Dict[str, Any]]):
         return None
 
     async def execute(self, input_data: TeamCreateInput) -> ToolResult:
-        import datetime
         from models import SessionLocal, Team
 
         db = SessionLocal()
@@ -216,7 +215,7 @@ class TeamDeleteTool(Tool[TeamDeleteInput, Dict[str, Any]]):
         return None
 
     async def execute(self, input_data: TeamDeleteInput) -> ToolResult:
-        from models import SessionLocal, Team, TeamMember, Task, TaskStatus
+        from models import SessionLocal, Team, Task, TaskStatus
 
         db = SessionLocal()
         try:

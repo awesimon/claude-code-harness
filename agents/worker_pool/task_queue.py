@@ -8,7 +8,6 @@ from typing import Dict, List, Optional, Set, Callable, Awaitable
 from collections import defaultdict
 
 from .task import Task
-from .enums import TaskStatus
 
 
 class TaskQueue:

@@ -11,9 +11,9 @@ import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional
 
-from agents import AgentRequest
+from agents import AgentExecutor, AgentRequest
 from harness import (
     CompactionSummary,
     ContextControlConfig,
@@ -32,9 +32,9 @@ from services.error_recovery import (
     classify_for_user,
 )
 
-# 启动时加载所有已安装的 skills
-from services.skill_manager import skill_manager
 from state_core import (
+    AgentRecord,
+    AgentStatus,
     EventType,
     SessionRuntime,
     SessionRuntimeFactory,
@@ -45,8 +45,6 @@ from state_core import (
 )
 from tools import ToolRegistry
 from tools.base import ToolResult, tool_flag
-
-skill_manager.load_all_skills()
 
 # 系统提示词 - 定义AI助手的行为和能力
 SYSTEM_PROMPT = """You are Claude Code, a powerful AI coding assistant created by Anthropic.
@@ -93,10 +91,9 @@ You have access to a wide range of tools including:
 - pr_diff - 查看 PR 代码差异
 
 **Skill Management**
-- skill_install - 从 Git/本地安装 Skill（动态添加工具）
+- skill_install - 将声明式 Agent Skill 安装到当前会话的 skill 目录
 - skill_list - 列出已安装的 Skills
 - skill_uninstall - 卸载 Skill
-- skill_enable/skill_disable - 启用/禁用 Skill
 
 **Hooks Configuration**
 - hooks_list - 列出已配置的 hooks
@@ -179,6 +176,46 @@ For complex tasks, you can spawn specialized agents:
 Always respond in a helpful, clear, and professional manner."""
 
 logger = logging.getLogger(__name__)
+
+LEGACY_AGENT_SURFACE = "legacy_agents"
+API_AGENT_SURFACE = "api_agents"
+_AGENT_SURFACE_ALIASES = {
+    LEGACY_AGENT_SURFACE: LEGACY_AGENT_SURFACE,
+    "/agents": LEGACY_AGENT_SURFACE,
+    API_AGENT_SURFACE: API_AGENT_SURFACE,
+    "/api/agents": API_AGENT_SURFACE,
+}
+
+
+def _canonical_agent_surface(surface: str) -> str:
+    try:
+        return _AGENT_SURFACE_ALIASES[surface]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Unknown durable agent API surface: {surface!r}") from exc
+
+
+def _agent_api_compat(record: AgentRecord) -> Mapping[str, Any] | None:
+    metadata = record.definition_snapshot.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    compat = metadata.get("api_compat")
+    return compat if isinstance(compat, Mapping) else None
+
+
+def _agent_belongs_to_surface(record: AgentRecord, surface: str | None) -> bool:
+    if surface is None:
+        return True
+    canonical = _canonical_agent_surface(surface)
+    compat = _agent_api_compat(record)
+    if compat is None:
+        return False
+    recorded = compat.get("surface")
+    if recorded is None:
+        return canonical == LEGACY_AGENT_SURFACE
+    try:
+        return _canonical_agent_surface(str(recorded)) == canonical
+    except ValueError:
+        return False
 
 
 class ConversationState(Enum):
@@ -354,7 +391,7 @@ class QueryEngine:
         session_runtime_factory: Optional[SessionRuntimeFactory] = None,
         context_control_config: Optional[ContextControlConfig] = None,
         context_summary_callback: Optional[Callable[[List[Message]], Any]] = None,
-    ):
+    ) -> None:
         self.llm_service = llm_service or LLMService()
         self.max_iterations = max_iterations
         # 从环境变量读取默认 provider
@@ -376,7 +413,12 @@ class QueryEngine:
             workspace_root=self.workspace_root,
             approval_callback=approval_callback,
             tool_timeout=tool_timeout,
+            agent_runner_factory=lambda record: AgentExecutor.from_record(
+                record, llm_service=self.llm_service
+            ),
+            agent_provider=self.provider.value,
         )
+        self._agent_repository = session_runtime_factory.store.agents
         self._session_harnesses: Dict[str, SessionHarness] = {}
         self._context_control_config = context_control_config or ContextControlConfig()
         self._context_summary_callback = context_summary_callback
@@ -417,7 +459,7 @@ class QueryEngine:
     def on_state_change(
         self,
         callback: Callable[[str, ConversationState, ConversationState], None]
-    ):
+    ) -> None:
         """注册状态变更回调"""
         self._state_callbacks.append(callback)
 
@@ -458,6 +500,11 @@ class QueryEngine:
     def get_conversation(self, conversation_id: str) -> Optional[ConversationContext]:
         """获取对话上下文"""
         return self._conversations.get(conversation_id)
+
+    def has_durable_conversation(self, conversation_id: str) -> bool:
+        """Return whether durable state exists without exposing the harness factory."""
+        store = self._harness_factory.session_runtime_factory.store
+        return store.states.load_session(conversation_id) is not None
 
     def delete_conversation(self, conversation_id: str):
         """删除对话"""
@@ -1264,56 +1311,137 @@ class QueryEngine:
         runtime.reject_plan()
         return {"success": True, "state": "planning", "reason": reason}
 
+    async def _spawn_agent_record(
+        self,
+        conversation_id: str,
+        agent_type: str,
+        prompt: str,
+        *,
+        background: bool,
+        description: str | None = None,
+        definition: Any = None,
+        definition_metadata: Mapping[str, Any] | None = None,
+    ) -> AgentRecord:
+        harness = self._session_harness(conversation_id)
+        return await harness.agent_scheduler.spawn(
+            AgentRequest(
+                prompt=prompt,
+                agent_type=agent_type,
+                description=description or prompt,
+                background=background,
+                cwd=self.workspace_root,
+                definition=definition,
+                definition_metadata=definition_metadata or {},
+            ),
+            harness=harness,
+        )
+
+    async def spawn_durable_agent(
+        self,
+        conversation_id: str,
+        agent_type: str,
+        prompt: str,
+        *,
+        background: bool = False,
+        api_surface: str,
+        description: str | None = None,
+        definition: Any = None,
+        api_metadata: Mapping[str, Any] | None = None,
+    ) -> AgentRecord:
+        """Spawn an agent owned by one explicit HTTP compatibility surface."""
+
+        compat = dict(api_metadata or {})
+        compat["surface"] = _canonical_agent_surface(api_surface)
+        return await self._spawn_agent_record(
+            conversation_id,
+            agent_type,
+            prompt,
+            background=background,
+            description=description,
+            definition=definition,
+            definition_metadata={"api_compat": compat},
+        )
+
+    def list_durable_agents(
+        self, *, api_surface: str | None = None
+    ) -> list[AgentRecord]:
+        """List durable agents, optionally constrained to an owning API surface."""
+
+        return [
+            record
+            for record in self._agent_repository.list_all()
+            if _agent_belongs_to_surface(record, api_surface)
+        ]
+
+    def get_durable_agent(
+        self,
+        agent_id: str,
+        *,
+        api_surface: str | None = None,
+    ) -> AgentRecord | None:
+        """Read one durable agent without requiring an in-process scheduler cache."""
+
+        record = self._agent_repository.get(agent_id)
+        if record is None or not _agent_belongs_to_surface(record, api_surface):
+            return None
+        return record
+
+    async def stop_durable_agent(
+        self,
+        agent_id: str,
+        *,
+        api_surface: str | None = None,
+    ) -> AgentRecord | None:
+        """Route a durable stop through the scheduler owning the agent's root."""
+
+        record = self.get_durable_agent(agent_id, api_surface=api_surface)
+        if record is None:
+            return None
+        if record.status not in {AgentStatus.PENDING, AgentStatus.RUNNING}:
+            return record
+        harness = self._session_harnesses.get(record.root_session_id)
+        if harness is None:
+            harness = self._harness_factory.resume_observer(
+                record.root_session_id, tool_timeout=self.tool_timeout
+            )
+            self._session_harnesses[record.root_session_id] = harness
+        scheduler = harness.observed_agent_scheduler
+        return await scheduler.stop(agent_id)
+
     async def spawn_agent(
         self,
         conversation_id: str,
         agent_type: str,
         prompt: str,
-        is_async: bool = False
+        is_async: bool = False,
     ) -> str:
-        """
-        在对话中创建 Agent
+        """Spawn an internal conversation agent without HTTP ownership metadata."""
 
-        Args:
-            conversation_id: 对话ID
-            agent_type: Agent 类型
-            prompt: 任务描述
-            is_async: 是否异步执行
-
-        Returns:
-            Agent ID
-        """
-        harness = self._session_harness(conversation_id)
-        record = await harness.agent_scheduler.spawn(
-            AgentRequest(
-                prompt=prompt,
-                agent_type=agent_type,
-                description=prompt,
-                background=is_async,
-                cwd=self.workspace_root,
-            ),
-            harness=harness,
+        record = await self._spawn_agent_record(
+            conversation_id,
+            agent_type,
+            prompt,
+            background=is_async,
         )
         return record.agent_id
 
     def _find_agent_scheduler(self, agent_id: str):
-        from harness.agents import AgentNotFound, AgentOwnershipError
-
-        for harness in self._session_harnesses.values():
-            scheduler = harness.agent_scheduler
-            try:
-                scheduler.status(agent_id)
-            except (AgentNotFound, AgentOwnershipError):
-                continue
-            return scheduler
-        return None
+        record = self.get_durable_agent(agent_id)
+        if record is None:
+            return None
+        harness = self._session_harnesses.get(record.root_session_id)
+        if harness is None:
+            harness = self._harness_factory.resume_observer(
+                record.root_session_id, tool_timeout=self.tool_timeout
+            )
+            self._session_harnesses[record.root_session_id] = harness
+        return harness.observed_agent_scheduler
 
     def get_agent_status(self, agent_id: str) -> Optional[Dict]:
         """获取 Agent 状态"""
-        scheduler = self._find_agent_scheduler(agent_id)
-        if scheduler is None:
+        record = self.get_durable_agent(agent_id)
+        if record is None:
             return None
-        record = scheduler.status(agent_id)
         output = record.output if isinstance(record.output, dict) else {}
         return {
             "agent_id": record.agent_id,
@@ -1326,10 +1454,9 @@ class QueryEngine:
 
     def abort_agent(self, agent_id: str):
         """中止 Agent"""
-        scheduler = self._find_agent_scheduler(agent_id)
-        if scheduler is None:
+        if self.get_durable_agent(agent_id) is None:
             return None
-        task = asyncio.create_task(scheduler.stop(agent_id))
+        task = asyncio.create_task(self.stop_durable_agent(agent_id))
 
         def consume(completed: asyncio.Task[Any]) -> None:
             try:

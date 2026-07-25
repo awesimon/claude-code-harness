@@ -1,11 +1,12 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from agents import AgentExecutionResult, AgentRequest
+from agents import AgentExecutionResult, AgentIsolationMode, AgentRequest
 from harness import AgentScheduler, SessionHarnessFactory
 from models import Base
 from state_core import SQLAlchemyStateStore, SessionRuntimeFactory
@@ -189,6 +190,45 @@ async def test_agent_tool_rejects_non_boolean_background_flag(harness) -> None:
     for record in scheduler.list():
         await scheduler.stop(record.agent_id)
     await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_passes_isolation_as_typed_request_field(
+    harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CapturingScheduler:
+        def __init__(self) -> None:
+            self.request = None
+
+        async def spawn(self, request, *, harness):
+            self.request = request
+            return SimpleNamespace(
+                agent_id="isolated",
+                agent_type=request.agent_type,
+                description=request.description,
+                prompt=request.prompt,
+                status=SimpleNamespace(value="completed"),
+                output={},
+                usage={},
+                termination_reason=None,
+                error=None,
+            )
+
+    scheduler = CapturingScheduler()
+    monkeypatch.setattr(
+        AgentScheduler,
+        "for_harness",
+        classmethod(lambda cls, target: scheduler),
+    )
+
+    result = await AgentTool().run(
+        {"prompt": "inspect", "isolation": "worktree"},
+        {"session_harness": harness},
+    )
+
+    assert result.success
+    assert scheduler.request.isolation is AgentIsolationMode.WORKTREE
+    assert scheduler.request.definition_metadata == {}
 
 
 @pytest.mark.asyncio

@@ -5,8 +5,8 @@ This module provides a Python implementation of the Agent coordination system
 inspired by Claude Code's TypeScript coordinator mode.
 """
 
-from enum import Enum, auto
-from typing import Any, Optional, TypeVar, Generic
+from enum import Enum
+from typing import Optional, TypeVar, Generic
 
 
 class AgentStatus(Enum):

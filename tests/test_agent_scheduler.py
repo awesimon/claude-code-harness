@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -14,20 +17,23 @@ from sqlalchemy.orm import sessionmaker
 import harness.agents as scheduler_module
 from agents.built_in import EXPLORE_AGENT
 from agents.engine import AgentExecutor
+from agents.fork import build_child_message, build_forked_messages, build_worktree_notice
 from agents.types import (
     AgentDefinitionError,
     AgentExecutionResult,
     AgentHooks,
+    AgentIsolationMode,
     AgentRequest,
     CustomAgentDefinition,
 )
-from harness import SessionHarnessFactory
+from harness import PermissionMode, SessionHarnessFactory
 from harness.agents import (
     AgentNotFound,
     AgentOwnershipError,
     AgentScheduler,
     AgentSchedulerAlreadyActive,
     AgentSchedulerDegraded,
+    AgentSchedulerError,
     AgentWaitTimeout,
 )
 from models import Base
@@ -38,6 +44,7 @@ from state_core import (
     AgentTerminationReason,
     SessionRuntimeFactory,
     SQLAlchemyStateStore,
+    WorktreeStatus,
 )
 
 
@@ -76,6 +83,37 @@ def make_harness(tmp_path: Path, session_id: str = "root"):
     store = SQLAlchemyStateStore(session_factory)
     factory = SessionHarnessFactory(
         SessionRuntimeFactory(store), workspace_root=workspace
+    )
+    return factory.create(session_id), session_factory
+
+
+def git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def make_git_harness(tmp_path: Path, session_id: str = "root"):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "tests@example.com")
+    git(repo, "config", "user.name", "Agent Scheduler Tests")
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    git(repo, "add", "tracked.txt")
+    git(repo, "commit", "-m", "initial")
+    engine = create_engine(f"sqlite:///{tmp_path / 'agents.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    store = SQLAlchemyStateStore(session_factory)
+    factory = SessionHarnessFactory(
+        SessionRuntimeFactory(store),
+        workspace_root=repo.resolve(),
+        permission_mode=PermissionMode.BYPASS,
     )
     return factory.create(session_id), session_factory
 
@@ -195,9 +233,7 @@ async def test_fresh_scheduler_waits_for_other_live_scheduler(tmp_path: Path) ->
     record = await owner.spawn(AgentRequest("live", "Explore", "d", background=True))
     await runner.started.wait()
     fresh_repository = SQLAlchemyStateStore(session_factory).agents
-    observer = AgentScheduler.for_harness(
-        harness, fresh_repository, runner=ControlledRunner()
-    )
+    observer = AgentScheduler.for_harness(harness, fresh_repository)
     assert observer is owner
 
     waiter = asyncio.create_task(observer.wait(record.agent_id, timeout=1))
@@ -225,9 +261,11 @@ async def test_single_scheduler_owner_rejects_direct_duplicate_and_routes_factor
 
     with pytest.raises(AgentSchedulerAlreadyActive):
         AgentScheduler(harness, repository, runner=duplicate_runner)
-    routed = AgentScheduler.for_harness(
-        harness, repository, runner=duplicate_runner, root_concurrency=99
-    )
+    with pytest.raises(AgentSchedulerAlreadyActive):
+        AgentScheduler.for_harness(
+            harness, repository, runner=duplicate_runner, root_concurrency=99
+        )
+    routed = AgentScheduler.for_harness(harness, repository)
     assert routed is owner
 
     first = await routed.spawn(
@@ -246,6 +284,123 @@ async def test_single_scheduler_owner_rejects_direct_duplicate_and_routes_factor
     second = await second_spawn
     owner_runner.release.set()
     await routed.wait(second.agent_id)
+    await owner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_idle_factory_binding_is_replaced_without_using_stale_runtime(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "binding-workspace"
+    workspace.mkdir()
+    engine = create_engine(f"sqlite:///{tmp_path / 'binding.db'}")
+    Base.metadata.create_all(engine)
+    store = SQLAlchemyStateStore(sessionmaker(bind=engine, expire_on_commit=False))
+    runner_a = ControlledRunner()
+    runner_a.release.set()
+    runner_b = ControlledRunner()
+    runner_b.release.set()
+    factory_a = SessionHarnessFactory(
+        SessionRuntimeFactory(store),
+        workspace_root=workspace,
+        agent_runner_factory=lambda _record: runner_a,
+        agent_provider="openai",
+    )
+    harness_a = factory_a.create("binding-root")
+    owner_a = harness_a.agent_scheduler
+    factory_b = SessionHarnessFactory(
+        SessionRuntimeFactory(store),
+        workspace_root=workspace,
+        agent_runner_factory=lambda _record: runner_b,
+        agent_provider="anthropic",
+    )
+
+    harness_b = factory_b.resume("binding-root")
+    owner_b = harness_b.agent_scheduler
+    completed = await owner_b.spawn(
+        AgentRequest("new runtime", "Explore", "binding"), harness=harness_b
+    )
+
+    assert owner_b is not owner_a
+    assert completed.definition_snapshot["provider"] == "anthropic"
+    assert [record.prompt for record, _child in runner_b.calls] == ["new runtime"]
+    assert runner_a.calls == []
+    with pytest.raises(AgentSchedulerAlreadyActive):
+        _ = harness_a.agent_scheduler
+    with pytest.raises(AgentSchedulerAlreadyActive):
+        await owner_a.spawn(AgentRequest("stale", "Explore", "binding"))
+    await owner_a.shutdown()
+    assert harness_b.agent_scheduler is owner_b
+    await owner_b.shutdown()
+    with pytest.raises(AgentSchedulerAlreadyActive):
+        _ = harness_a.agent_scheduler
+
+
+@pytest.mark.asyncio
+async def test_active_factory_binding_rejects_takeover_without_switching_provider(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "active-binding-workspace"
+    workspace.mkdir()
+    engine = create_engine(f"sqlite:///{tmp_path / 'active-binding.db'}")
+    Base.metadata.create_all(engine)
+    store = SQLAlchemyStateStore(sessionmaker(bind=engine, expire_on_commit=False))
+    runner_a = ControlledRunner()
+    factory_a = SessionHarnessFactory(
+        SessionRuntimeFactory(store),
+        workspace_root=workspace,
+        agent_runner_factory=lambda _record: runner_a,
+        agent_provider="openai",
+    )
+    harness_a = factory_a.create("active-binding-root")
+    owner_a = harness_a.agent_scheduler
+    active = await owner_a.spawn(
+        AgentRequest("active runtime", "Explore", "binding", background=True),
+        harness=harness_a,
+    )
+    await runner_a.started.wait()
+    factory_b = SessionHarnessFactory(
+        SessionRuntimeFactory(store),
+        workspace_root=workspace,
+        agent_runner_factory=lambda _record: ControlledRunner(),
+        agent_provider="anthropic",
+    )
+
+    with pytest.raises(AgentSchedulerAlreadyActive):
+        factory_b.resume("active-binding-root")
+
+    assert harness_a.agent_scheduler is owner_a
+    assert owner_a.status(active.agent_id).definition_snapshot["provider"] == "openai"
+    runner_a.release.set()
+    await owner_a.wait(active.agent_id)
+    await owner_a.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_observer_factory_does_not_replace_configured_owner(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "observer-workspace"
+    workspace.mkdir()
+    engine = create_engine(f"sqlite:///{tmp_path / 'observer.db'}")
+    Base.metadata.create_all(engine)
+    store = SQLAlchemyStateStore(sessionmaker(bind=engine, expire_on_commit=False))
+    runner = ControlledRunner()
+    factory = SessionHarnessFactory(
+        SessionRuntimeFactory(store),
+        workspace_root=workspace,
+        agent_runner_factory=lambda _record: runner,
+        agent_provider="anthropic",
+    )
+    configured = factory.create("observer-root")
+    owner = configured.agent_scheduler
+    observer_factory = SessionHarnessFactory(
+        SessionRuntimeFactory(store), workspace_root=workspace
+    )
+
+    observer = observer_factory.resume("observer-root")
+
+    assert observer.agent_scheduler is owner
     await owner.shutdown()
 
 
@@ -673,6 +828,477 @@ async def test_definition_snapshot_detached_and_shutdown_cleans_maps(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_executor_replays_durable_initial_messages_once_in_order(
+    tmp_path: Path,
+) -> None:
+    root, _ = make_harness(tmp_path)
+
+    class CapturingLLM:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def chat_completion(self, request):
+            self.requests.append(copy.deepcopy(request))
+            return ChatCompletionResponse(
+                id="fork", model="test", content="done", finish_reason="stop"
+            )
+
+    llm = CapturingLLM()
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner_factory=lambda record: AgentExecutor.from_record(
+            record, llm_service=llm
+        ),
+    )
+    directive = build_child_message("Inspect the code")
+    initial_messages = [
+        {"role": "user", "content": "Parent question"},
+        {"role": "assistant", "content": "Parent answer"},
+        directive,
+    ]
+
+    completed = await scheduler.spawn(
+        AgentRequest(
+            prompt="Inspect the code",
+            agent_type="general-purpose",
+            description="fork",
+            initial_messages=initial_messages,
+        )
+    )
+    initial_messages[0]["content"] = "mutated"
+
+    assert completed.status is AgentStatus.COMPLETED
+    assert completed.definition_snapshot["initial_messages"][0]["content"] == (
+        "Parent question"
+    )
+    request = llm.requests[0]
+    assert [message.role for message in request.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    serialized = [message.to_openai() for message in request.messages]
+    assert serialized[1:] == completed.definition_snapshot["initial_messages"]
+    assert str(serialized).count("FORK DIRECTIVE: Inspect the code") == 1
+
+
+@pytest.mark.asyncio
+async def test_executor_converts_anthropic_fork_tool_context_for_openai(
+    tmp_path: Path,
+) -> None:
+    root, _ = make_harness(tmp_path)
+
+    class CapturingLLM:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def chat_completion(self, request):
+            self.requests.append(copy.deepcopy(request))
+            return ChatCompletionResponse(
+                id="fork-tools", model="test", content="done", finish_reason="stop"
+            )
+
+    llm = CapturingLLM()
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner_factory=lambda record: AgentExecutor.from_record(
+            record, llm_service=llm
+        ),
+    )
+    initial_messages = [
+        {"role": "user", "content": "Inspect the repository"},
+        *build_forked_messages(
+            "Inspect the code",
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I will inspect it."},
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read_file",
+                        "input": {"file_path": "agents/fork.py"},
+                    },
+                ],
+            },
+            [],
+        ),
+    ]
+
+    completed = await scheduler.spawn(
+        AgentRequest(
+            "Inspect the code",
+            "general-purpose",
+            "fork tool context",
+            initial_messages=initial_messages,
+        )
+    )
+
+    assert completed.status is AgentStatus.COMPLETED
+    wire = [message.to_openai() for message in llm.requests[0].messages]
+    assert [message["role"] for message in wire] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert wire[2]["content"] == "I will inspect it."
+    assert wire[2]["tool_calls"][0]["id"] == "tool-1"
+    assert wire[2]["tool_calls"][0]["function"]["name"] == "read_file"
+    assert json.loads(wire[2]["tool_calls"][0]["function"]["arguments"]) == {
+        "file_path": "agents/fork.py"
+    }
+    assert wire[3] == {
+        "role": "tool",
+        "content": "Fork started — processing in background",
+        "tool_call_id": "tool-1",
+    }
+    assert "FORK DIRECTIVE: Inspect the code" in wire[4]["content"]
+    assert str(wire).count("FORK DIRECTIVE: Inspect the code") == 1
+    for message in wire:
+        content = message.get("content")
+        if isinstance(content, list):
+            assert all(
+                block.get("type") not in {"tool_use", "tool_result"}
+                for block in content
+                if isinstance(block, dict)
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "initial_messages",
+    [
+        [{"role": "user", "content": 42}],
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "name": "read_file", "input": {}}
+                ],
+            }
+        ],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-nan",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"value":NaN}',
+                        },
+                    }
+                ],
+            }
+        ],
+        [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "tool-1", "input": {}}
+                ],
+            }
+        ],
+        [
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "content": "done"}],
+            }
+        ],
+        [{"role": "tool", "content": "done"}],
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "not-json",
+                        },
+                    }
+                ],
+            }
+        ],
+    ],
+)
+async def test_invalid_initial_message_shapes_fail_before_durable_writes(
+    tmp_path: Path,
+    initial_messages,
+) -> None:
+    root, _ = make_harness(tmp_path)
+    runner = ControlledRunner()
+    runner.release.set()
+    scheduler = AgentScheduler(root, root.store.agents, runner=runner)
+
+    with pytest.raises(AgentDefinitionError, match="initial_messages"):
+        await scheduler.spawn(
+            AgentRequest(
+                "invalid context",
+                "general-purpose",
+                "invalid",
+                initial_messages=initial_messages,
+            )
+        )
+
+    assert scheduler.list() == []
+
+
+@pytest.mark.asyncio
+async def test_executor_strips_thinking_and_canonicalizes_openai_arguments(
+    tmp_path: Path,
+) -> None:
+    root, _ = make_harness(tmp_path)
+
+    class CapturingLLM:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def chat_completion(self, request):
+            self.requests.append(copy.deepcopy(request))
+            return ChatCompletionResponse(
+                id="normalized", model="test", content="done", finish_reason="stop"
+            )
+
+    llm = CapturingLLM()
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner_factory=lambda record: AgentExecutor.from_record(
+            record, llm_service=llm
+        ),
+    )
+
+    completed = await scheduler.spawn(
+        AgentRequest(
+            "normalize",
+            "general-purpose",
+            "normalize messages",
+            initial_messages=[
+                {"role": "user", "content": "Parent"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private"},
+                        {"type": "text", "text": "Visible"},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": {"file_path": "README.md"},
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "done", "tool_call_id": "call-1"},
+            ],
+        )
+    )
+
+    assert completed.status is AgentStatus.COMPLETED
+    snapshot_call = completed.definition_snapshot["initial_messages"][2][
+        "tool_calls"
+    ][0]
+    assert isinstance(snapshot_call["function"]["arguments"], str)
+    wire = [message.to_openai() for message in llm.requests[0].messages]
+    assert wire[2] == {"role": "assistant", "content": "Visible"}
+    assert json.loads(wire[3]["tool_calls"][0]["function"]["arguments"]) == {
+        "file_path": "README.md"
+    }
+
+
+class WorktreeRunner:
+    def __init__(self, *, dirty: bool = False, fail: bool = False) -> None:
+        self.dirty = dirty
+        self.fail = fail
+        self.child = None
+        self.shell_cwd: str | None = None
+        self.effective_cwd: Path | None = None
+
+    async def run(self, record: AgentRecord, child_harness: Any) -> AgentExecutionResult:
+        self.child = child_harness
+        self.effective_cwd = child_harness.effective_cwd
+        shell = await child_harness.tool_runtime.execute(
+            "bash", {"command": "pwd"}, child_harness.runtime_context
+        )
+        self.shell_cwd = shell.result.data["stdout"].strip()
+        if self.dirty:
+            (child_harness.effective_cwd / "changed.txt").write_text(
+                "changed\n", encoding="utf-8"
+            )
+        if self.fail:
+            raise RuntimeError("runner failed")
+        return AgentExecutionResult(content="done", termination_reason="completed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dirty", "fail", "expected_status", "expected_worktree_status"),
+    [
+        (False, False, AgentStatus.COMPLETED, WorktreeStatus.REMOVED),
+        (True, False, AgentStatus.COMPLETED, WorktreeStatus.READY),
+        (False, True, AgentStatus.FAILED, WorktreeStatus.REMOVED),
+    ],
+)
+async def test_worktree_isolation_uses_child_scope_and_cleans_by_changes(
+    tmp_path: Path,
+    dirty: bool,
+    fail: bool,
+    expected_status: AgentStatus,
+    expected_worktree_status: WorktreeStatus,
+) -> None:
+    root, _ = make_git_harness(tmp_path)
+    parent_cwd = root.effective_cwd
+    process_cwd = Path.cwd()
+    runner = WorktreeRunner(dirty=dirty, fail=fail)
+    scheduler = AgentScheduler(root, root.store.agents, runner=runner)
+
+    result = await scheduler.spawn(
+        AgentRequest(
+            "isolated",
+            "general-purpose",
+            "isolated child",
+            isolation=AgentIsolationMode.WORKTREE,
+            initial_messages=[build_child_message("isolated")],
+            definition_metadata={"fork": {"parent_session_id": "parent"}},
+        )
+    )
+
+    assert result.status is expected_status
+    assert result.worktree_id is not None
+    worktree = root.store.worktrees.get(result.worktree_id)
+    assert worktree is not None
+    assert worktree.agent_id == result.agent_id
+    assert worktree.status is expected_worktree_status
+    assert runner.child is not None
+    assert result.effective_cwd == worktree.canonical_path
+    assert runner.effective_cwd == Path(worktree.canonical_path)
+    assert runner.shell_cwd == worktree.canonical_path
+    assert root.effective_cwd == parent_cwd
+    assert Path.cwd() == process_cwd
+    assert result.definition_snapshot["initial_messages"][-1] == {
+        "role": "user",
+        "content": build_worktree_notice(str(parent_cwd), worktree.canonical_path),
+    }
+    if dirty:
+        assert Path(worktree.canonical_path).exists()
+        assert worktree.details["attached"] is False
+    else:
+        assert not Path(worktree.canonical_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_storage_failure_does_not_override_completed_result(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, _ = make_git_harness(tmp_path)
+    worktrees = root.store.worktrees
+    original_get = worktrees.get
+    fail_cleanup = False
+
+    def flaky_get(worktree_id):
+        if fail_cleanup:
+            raise RuntimeError("cleanup store unavailable")
+        return original_get(worktree_id)
+
+    monkeypatch.setattr(worktrees, "get", flaky_get)
+
+    class CompleteThenFailCleanup:
+        async def run(self, record, child):
+            nonlocal fail_cleanup
+            fail_cleanup = True
+            return AgentExecutionResult(content="done", termination_reason="completed")
+
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner=CompleteThenFailCleanup(),
+    )
+
+    result = await scheduler.spawn(
+        AgentRequest(
+            "cleanup failure",
+            "general-purpose",
+            "cleanup failure",
+            isolation=AgentIsolationMode.WORKTREE,
+        )
+    )
+
+    assert result.status is AgentStatus.COMPLETED
+    fail_cleanup = False
+    worktree = original_get(result.worktree_id)
+    assert worktree is not None
+    assert worktree.status is WorktreeStatus.READY
+    assert worktree.details["attached"] is True
+
+
+@pytest.mark.asyncio
+async def test_request_isolation_overrides_definition_isolation(tmp_path: Path) -> None:
+    root, _ = make_git_harness(tmp_path)
+    runner = WorktreeRunner()
+    scheduler = AgentScheduler(root, root.store.agents, runner=runner)
+    definition = CustomAgentDefinition(
+        agent_type="isolated-custom",
+        when_to_use="test isolation",
+        isolation=AgentIsolationMode.REMOTE,
+        get_system_prompt=lambda: "custom",
+    )
+
+    result = await scheduler.spawn(
+        AgentRequest(
+            "override",
+            "isolated-custom",
+            "override isolation",
+            definition=definition,
+            isolation=AgentIsolationMode.WORKTREE,
+        )
+    )
+
+    assert result.status is AgentStatus.COMPLETED
+    assert result.definition_snapshot["isolation"] == "worktree"
+    assert result.worktree_id is not None
+
+
+@pytest.mark.asyncio
+async def test_remote_isolation_fails_before_agent_or_worktree_writes(
+    tmp_path: Path,
+) -> None:
+    root, _ = make_git_harness(tmp_path)
+    scheduler = AgentScheduler(root, root.store.agents, runner=ControlledRunner())
+
+    with pytest.raises(AgentSchedulerError, match="Remote.*not supported"):
+        await scheduler.spawn(
+            AgentRequest(
+                "remote",
+                "general-purpose",
+                "unsupported remote",
+                isolation=AgentIsolationMode.REMOTE,
+            )
+        )
+
+    assert scheduler.list() == []
+    assert root.store.worktrees.list(root.root_session_id) == []
+    assert not (root.effective_cwd / ".claude" / "worktrees").exists()
+
+
+@pytest.mark.asyncio
 async def test_invalid_type_and_cwd_fail_before_durable_mutation(tmp_path: Path) -> None:
     root, _ = make_harness(tmp_path)
     scheduler = AgentScheduler(root, root.store.agents, runner=ControlledRunner())
@@ -881,6 +1507,82 @@ async def test_force_stop_is_bounded_and_quarantines_cancel_suppressing_runner(
     else:
         replacement = AgentScheduler(root, root.store.agents, runner=ControlledRunner())
         await replacement.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dirty", "expected_worktree_status"),
+    [
+        (False, WorktreeStatus.REMOVED),
+        (True, WorktreeStatus.READY),
+    ],
+)
+async def test_force_stop_cleans_worktree_before_stubborn_runner_exits(
+    tmp_path: Path,
+    dirty: bool,
+    expected_worktree_status: WorktreeStatus,
+) -> None:
+    root, _ = make_git_harness(tmp_path)
+
+    class StubbornWorktreeRunner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancel_seen = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def run(self, record, child):
+            if dirty:
+                (child.effective_cwd / "changed.txt").write_text(
+                    "changed\n", encoding="utf-8"
+                )
+            self.started.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.cancel_seen.set()
+                await self.release.wait()
+            return AgentExecutionResult(content="late", termination_reason="completed")
+
+    runner = StubbornWorktreeRunner()
+    scheduler = AgentScheduler(
+        root,
+        root.store.agents,
+        runner=runner,
+        stop_grace=0.01,
+        force_grace=0.01,
+    )
+    record = await scheduler.spawn(
+        AgentRequest(
+            "stubborn worktree",
+            "general-purpose",
+            "stubborn",
+            background=True,
+            isolation=AgentIsolationMode.WORKTREE,
+        )
+    )
+    await runner.started.wait()
+    assert record.worktree_id is not None
+
+    cancelled = await asyncio.wait_for(scheduler.stop(record.agent_id), 0.2)
+
+    assert cancelled.status is AgentStatus.CANCELLED
+    assert runner.cancel_seen.is_set()
+    assert scheduler.quarantined_task_count == 1
+    worktree = root.store.worktrees.get(record.worktree_id)
+    assert worktree is not None
+    assert worktree.status is expected_worktree_status
+    assert worktree.details.get("attached") is False
+    if dirty:
+        assert Path(worktree.canonical_path).exists()
+    else:
+        assert not Path(worktree.canonical_path).exists()
+
+    cancelled_revision = cancelled.revision
+    runner.release.set()
+    await wait_until(lambda: scheduler.quarantined_task_count == 0)
+    final = scheduler.status(record.agent_id)
+    assert final.status is AgentStatus.CANCELLED
+    assert final.revision == cancelled_revision
 
 
 @pytest.mark.asyncio

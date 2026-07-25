@@ -1,4 +1,4 @@
-"""Legacy manager API adapted to the authoritative SessionRuntime."""
+"""Import-compatible plan adapter; SessionRuntime owns every mutation."""
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ class PlanModeManager:
         self, session_id: str, content: str, is_edited: bool = False
     ) -> dict[str, Any]:
         path = await self._storage.save_plan(session_id, content)
+        self._runtime(session_id).save_plan_draft(content, path)
         return {"success": True, "file_path": path, "content_length": len(content)}
 
     async def submit_plan_for_approval(
@@ -61,7 +62,7 @@ class PlanModeManager:
         self, session_id: str, edited_content: str | None = None
     ) -> dict[str, Any]:
         if edited_content is not None:
-            await self._storage.save_plan(session_id, edited_content)
+            await self.save_plan(session_id, edited_content, is_edited=True)
         runtime = self._runtime(session_id)
         runtime.approve_plan()
         return {"success": True, "state": "approved"}

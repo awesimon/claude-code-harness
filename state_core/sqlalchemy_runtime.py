@@ -261,6 +261,17 @@ class SQLAlchemyAgentRepository:
             row = db.get(RuntimeAgent, agent_id)
             return self._record(row) if row is not None else None
 
+    def list_all(self) -> builtins.list[AgentRecord]:
+        with self._session_factory() as db:
+            rows = db.scalars(
+                select(RuntimeAgent).order_by(
+                    RuntimeAgent.root_session_id,
+                    RuntimeAgent.created_at,
+                    RuntimeAgent.agent_id,
+                )
+            ).all()
+            return [self._record(row) for row in rows]
+
     def list(
         self,
         root_session_id: str,

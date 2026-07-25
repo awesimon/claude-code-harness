@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from agents.types import (
@@ -17,16 +17,114 @@ from agents.types import (
     AgentExecutionConfig,
     AgentExecutionResult,
     AgentToolResult,
+    normalize_agent_messages,
     parse_agent_definition,
 )
 from harness.budget import BudgetKind
-from services import ChatCompletionRequest, LLMService, Message
+from services import ChatCompletionRequest, LLMProvider, LLMService, Message
 from state_core import AgentRecord
 from tools import ToolRegistry
 from tools.base import Tool, canonical_tool_name, to_json_value
 
 if TYPE_CHECKING:
     from harness.session import SessionHarness
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        if all(
+            isinstance(block, Mapping) and block.get("type") == "text"
+            for block in content
+        ):
+            return "\n".join(str(block.get("text", "")) for block in content)
+        return json.dumps(content, ensure_ascii=False)
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _assistant_message(message: Mapping[str, Any]) -> Message:
+    content = message["content"]
+    if not isinstance(content, list):
+        return Message(
+            role="assistant",
+            content=content,
+            name=message.get("name"),
+            tool_calls=message.get("tool_calls"),
+        )
+    text_blocks = [
+        str(block.get("text", ""))
+        for block in content
+        if isinstance(block, Mapping) and block.get("type") == "text"
+    ]
+    tool_calls = list(message.get("tool_calls") or ())
+    tool_calls.extend(
+        {
+            "id": str(block.get("id", "")),
+            "type": "function",
+            "function": {
+                "name": str(block.get("name", "")),
+                "arguments": json.dumps(
+                    block.get("input", {}), ensure_ascii=False, separators=(",", ":")
+                ),
+            },
+        }
+        for block in content
+        if isinstance(block, Mapping) and block.get("type") == "tool_use"
+    )
+    return Message(
+        role="assistant",
+        content="\n".join(text_blocks),
+        name=message.get("name"),
+        tool_calls=tool_calls,
+    )
+
+
+def _restored_initial_messages(message: Mapping[str, Any]) -> list[Message]:
+    role = message["role"]
+    content = message["content"]
+    if role == "assistant":
+        return [_assistant_message(message)]
+    if role != "user" or not isinstance(content, list) or not any(
+        isinstance(block, Mapping) and block.get("type") == "tool_result"
+        for block in content
+    ):
+        return [
+            Message(
+                role=role,
+                content=content,
+                name=message.get("name"),
+                tool_calls=message.get("tool_calls"),
+                tool_call_id=message.get("tool_call_id"),
+            )
+        ]
+
+    restored: list[Message] = []
+    pending_text: list[str] = []
+
+    def flush_text() -> None:
+        if pending_text:
+            restored.append(Message(role="user", content="\n".join(pending_text)))
+            pending_text.clear()
+
+    for block in content:
+        if isinstance(block, Mapping) and block.get("type") == "tool_result":
+            flush_text()
+            restored.append(
+                Message(
+                    role="tool",
+                    content=_message_content_text(block.get("content")),
+                    tool_call_id=str(block.get("tool_use_id", "")),
+                )
+            )
+        elif isinstance(block, Mapping) and block.get("type") == "text":
+            pending_text.append(str(block.get("text", "")))
+        else:
+            pending_text.append(_message_content_text(block))
+    flush_text()
+    return restored
 
 
 class AgentExecutor:
@@ -38,10 +136,14 @@ class AgentExecutor:
         *,
         config: AgentExecutionConfig | None = None,
         llm_service: LLMService | None = None,
+        initial_messages: Sequence[Mapping[str, Any]] = (),
+        provider: LLMProvider = LLMProvider.OPENAI,
     ) -> None:
         self.agent_definition = agent_definition
         self.config = config or AgentExecutionConfig()
         self.llm_service = llm_service or LLMService()
+        self.initial_messages = normalize_agent_messages(initial_messages)
+        self.provider = provider
 
     @classmethod
     def from_record(
@@ -58,6 +160,8 @@ class AgentExecutor:
             ),
             config=config,
             llm_service=llm_service,
+            initial_messages=record.definition_snapshot.get("initial_messages", ()),
+            provider=LLMProvider(record.definition_snapshot.get("provider", "openai")),
         )
 
     def _resolve_tools(
@@ -182,7 +286,11 @@ class AgentExecutor:
             llm_messages.append(
                 Message(role="user", content=self.agent_definition.initial_prompt)
             )
-        llm_messages.append(Message(role="user", content=record.prompt))
+        if self.initial_messages:
+            for message in self.initial_messages:
+                llm_messages.extend(_restored_initial_messages(message))
+        else:
+            llm_messages.append(Message(role="user", content=record.prompt))
         messages: list[dict[str, Any]] = []
         usage: dict[str, int] = {}
         tool_count = 0
@@ -212,6 +320,7 @@ class AgentExecutor:
                                 temperature=self.config.temperature,
                                 tools=schemas or None,
                                 tool_choice="auto" if schemas else None,
+                                provider=self.provider,
                             )
                         )
                     )

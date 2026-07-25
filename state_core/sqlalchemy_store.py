@@ -152,6 +152,13 @@ class SQLAlchemyStateRepository:
             row = db.get(RuntimeSession, session_id)
             return SessionState.from_dict(row.state) if row is not None else None
 
+    def list_sessions(self) -> list[SessionState]:
+        with self._session_factory() as db:
+            rows = db.scalars(
+                select(RuntimeSession).order_by(RuntimeSession.session_id)
+            ).all()
+            return [SessionState.from_dict(row.state) for row in rows]
+
     def delete_session(self, session_id: str) -> bool:
         with self._session_factory() as db, db.begin():
             db.execute(delete(RuntimeSnapshot).where(RuntimeSnapshot.session_id == session_id))

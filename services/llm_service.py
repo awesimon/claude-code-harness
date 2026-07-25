@@ -3,21 +3,78 @@ LLM服务模块
 支持OpenAI和Anthropic API调用
 """
 
-import logging
-import os
 import json
+import logging
+import math
+import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, AsyncIterator, Union
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from anthropic import (
-    APIStatusError as AnthropicAPIStatusError,
-    AsyncAnthropic,
     NOT_GIVEN,
+    AsyncAnthropic,
+)
+from anthropic import (
+    APIStatusError as AnthropicAPIStatusError,
 )
 from openai import APIStatusError, AsyncOpenAI
 
 logger = logging.getLogger(__name__)
+
+_INVALID_TOOL_ARGUMENTS = "tool call arguments must be a finite JSON object"
+
+
+def _parse_anthropic_tool_input(arguments: Any) -> Dict[str, Any]:
+    if not isinstance(arguments, str):
+        raise ValueError(_INVALID_TOOL_ARGUMENTS)
+
+    def reject_constant(_value: str) -> None:
+        raise ValueError(_INVALID_TOOL_ARGUMENTS)
+
+    try:
+        value = json.loads(arguments, parse_constant=reject_constant)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(_INVALID_TOOL_ARGUMENTS) from exc
+
+    if not isinstance(value, dict) or not _has_only_finite_numbers(value):
+        raise ValueError(_INVALID_TOOL_ARGUMENTS)
+    return value
+
+
+def _has_only_finite_numbers(value: Any) -> bool:
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, dict):
+        return all(_has_only_finite_numbers(item) for item in value.values())
+    if isinstance(value, list):
+        return all(_has_only_finite_numbers(item) for item in value)
+    return True
+
+
+def _anthropic_content_blocks(content: Any) -> List[Dict[str, Any]]:
+    if isinstance(content, list):
+        return [dict(block) for block in content]
+    if content is None or content == "":
+        return []
+    return [{"type": "text", "text": content}]
+
+
+def _merge_anthropic_user_turns(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    for message in messages:
+        if message["role"] != "user" or not merged or merged[-1]["role"] != "user":
+            merged.append(message)
+            continue
+
+        blocks = _anthropic_content_blocks(merged[-1]["content"])
+        blocks.extend(_anthropic_content_blocks(message["content"]))
+        tool_results = [block for block in blocks if block.get("type") == "tool_result"]
+        other_blocks = [block for block in blocks if block.get("type") != "tool_result"]
+        merged[-1] = {"role": "user", "content": tool_results + other_blocks}
+    return merged
 
 
 class LLMProvider(Enum):
@@ -59,10 +116,57 @@ class Message:
 
     def to_anthropic(self) -> Dict[str, Any]:
         """转换为Anthropic格式"""
-        return {
-            "role": self.role if self.role in ["user", "assistant"] else "user",
-            "content": self.content,
-        }
+        if self.role in {"system", "user"}:
+            return {
+                "role": self.role,
+                "content": self.content if self.content is not None else "",
+            }
+
+        if self.role == "tool":
+            if not isinstance(self.tool_call_id, str) or not self.tool_call_id:
+                raise ValueError("tool message requires a tool_call_id")
+            return {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": self.tool_call_id,
+                        "content": self.content if self.content is not None else "",
+                    }
+                ],
+            }
+
+        if self.role != "assistant":
+            raise ValueError(f"Unsupported Anthropic message role: {self.role}")
+
+        if not self.tool_calls:
+            return {
+                "role": "assistant",
+                "content": self.content if self.content is not None else "",
+            }
+
+        content: List[Dict[str, Any]] = []
+        if self.content:
+            content.append({"type": "text", "text": self.content})
+        for tool_call in self.tool_calls:
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                raise ValueError("assistant tool call requires a function object")
+            tool_call_id = tool_call.get("id")
+            name = function.get("name")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise ValueError("assistant tool call requires an id")
+            if not isinstance(name, str) or not name:
+                raise ValueError("assistant tool call requires a function name")
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_call_id,
+                    "name": name,
+                    "input": _parse_anthropic_tool_input(function.get("arguments")),
+                }
+            )
+        return {"role": "assistant", "content": content}
 
 
 @dataclass
@@ -182,14 +286,15 @@ class LLMService:
         model = request.model or os.getenv(
             "ANTHROPIC_DEFAULT_MODEL", "claude-3-5-sonnet-20241022"
         )
-        raw_messages = [m.to_anthropic() for m in request.messages]
-        system_message: Optional[str] = None
+        raw_messages = [message.to_anthropic() for message in request.messages]
+        system_messages: List[str] = []
         chat_messages: List[Dict[str, Any]] = []
         for msg in raw_messages:
             if msg["role"] == "system":
-                system_message = msg["content"]
+                system_messages.append(msg["content"])
             else:
                 chat_messages.append(msg)
+        chat_messages = _merge_anthropic_user_turns(chat_messages)
 
         max_tokens = request.max_tokens or self._default_max_tokens
         kwargs: Dict[str, Any] = {
@@ -198,8 +303,8 @@ class LLMService:
             "messages": chat_messages,
             "temperature": self._get_temperature(request.temperature),
         }
-        if system_message:
-            kwargs["system"] = system_message
+        if system_messages:
+            kwargs["system"] = "\n\n".join(system_messages)
 
         if (
             request.tools
@@ -386,7 +491,6 @@ class LLMService:
         """Anthropic 聊天完成（官方 SDK）"""
         client = self._get_anthropic_client()
         kwargs = self._build_anthropic_create_kwargs(request)
-        model = kwargs["model"]
 
         try:
             msg = await client.messages.create(**kwargs, timeout=60.0)

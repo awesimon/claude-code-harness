@@ -2,6 +2,7 @@
 Agent 系统核心类型定义
 全面对齐 Claude Code 源码架构
 """
+import json
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,6 +18,7 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    Sequence,
     Union,
     runtime_checkable,
 )
@@ -192,11 +194,201 @@ _SNAPSHOT_FIELDS = {
     "system_prompt",
     "metadata",
     "execution_timeout",
+    "initial_messages",
+    "provider",
 }
 
 
 def _definition_error(field_name: str, expected: str) -> AgentDefinitionError:
     return AgentDefinitionError(f"Agent definition {field_name} must be {expected}")
+
+
+def _reject_non_finite_json(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is not allowed: {value}")
+
+
+def normalize_agent_messages(
+    messages: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Validate and detach a JSON-safe child conversation snapshot."""
+
+    if isinstance(messages, (str, bytes)) or type(messages) not in (list, tuple):
+        raise AgentDefinitionError("Agent initial_messages must be a list or tuple")
+    normalized: List[Dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, Mapping):
+            raise AgentDefinitionError(
+                f"Agent initial_messages[{index}] must be a mapping"
+            )
+        role = message.get("role")
+        if role not in {"system", "user", "assistant", "tool"}:
+            raise AgentDefinitionError(
+                f"Agent initial_messages[{index}].role must be supported"
+            )
+        if "content" not in message:
+            raise AgentDefinitionError(
+                f"Agent initial_messages[{index}] must include content"
+            )
+        content = message["content"]
+        if role in {"system", "tool"} and not isinstance(content, str):
+            raise AgentDefinitionError(
+                f"Agent initial_messages[{index}].content must be a string"
+            )
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id:
+                raise AgentDefinitionError(
+                    f"Agent initial_messages[{index}].tool_call_id must be non-empty"
+                )
+        if role in {"user", "assistant"} and not (
+            isinstance(content, str)
+            or isinstance(content, list)
+            or (role == "assistant" and content is None)
+        ):
+            raise AgentDefinitionError(
+                f"Agent initial_messages[{index}].content has an unsupported shape"
+            )
+        if isinstance(content, list):
+            allowed_blocks = (
+                {"text", "tool_result"}
+                if role == "user"
+                else {"text", "tool_use", "thinking", "redacted_thinking"}
+            )
+            if role not in {"user", "assistant"}:
+                allowed_blocks = set()
+            for block_index, block in enumerate(content):
+                if not isinstance(block, Mapping):
+                    raise AgentDefinitionError(
+                        f"Agent initial_messages[{index}].content[{block_index}] "
+                        "must be a mapping"
+                    )
+                block_type = block.get("type")
+                if block_type not in allowed_blocks:
+                    raise AgentDefinitionError(
+                        f"Agent initial_messages[{index}].content[{block_index}] "
+                        "has an unsupported type"
+                    )
+                if block_type == "text" and not isinstance(block.get("text"), str):
+                    raise AgentDefinitionError(
+                        f"Agent initial_messages[{index}].content[{block_index}].text "
+                        "must be a string"
+                    )
+                if block_type == "tool_use":
+                    tool_id = block.get("id")
+                    name = block.get("name")
+                    arguments = block.get("input", {})
+                    if not isinstance(tool_id, str) or not tool_id:
+                        raise AgentDefinitionError(
+                            f"Agent initial_messages[{index}].content[{block_index}].id "
+                            "must be non-empty"
+                        )
+                    if not isinstance(name, str) or not name:
+                        raise AgentDefinitionError(
+                            f"Agent initial_messages[{index}].content[{block_index}].name "
+                            "must be non-empty"
+                        )
+                    if not isinstance(arguments, Mapping):
+                        raise AgentDefinitionError(
+                            f"Agent initial_messages[{index}].content[{block_index}].input "
+                            "must be a mapping"
+                        )
+                if block_type == "tool_result":
+                    tool_id = block.get("tool_use_id")
+                    result_content = block.get("content", "")
+                    if not isinstance(tool_id, str) or not tool_id:
+                        raise AgentDefinitionError(
+                            f"Agent initial_messages[{index}].content[{block_index}].tool_use_id "
+                            "must be non-empty"
+                        )
+                    if not isinstance(result_content, (str, list)):
+                        raise AgentDefinitionError(
+                            f"Agent initial_messages[{index}].content[{block_index}].content "
+                            "must be a string or text block list"
+                        )
+                    if isinstance(result_content, list) and not all(
+                        isinstance(item, Mapping)
+                        and item.get("type") == "text"
+                        and isinstance(item.get("text"), str)
+                        for item in result_content
+                    ):
+                        raise AgentDefinitionError(
+                            f"Agent initial_messages[{index}].content[{block_index}].content "
+                            "must contain text blocks"
+                        )
+                    if "is_error" in block and not isinstance(block["is_error"], bool):
+                        raise AgentDefinitionError(
+                            f"Agent initial_messages[{index}].content[{block_index}].is_error "
+                            "must be a boolean"
+                        )
+        tool_calls = message.get("tool_calls")
+        if tool_calls is not None:
+            if role != "assistant" or not isinstance(tool_calls, list):
+                raise AgentDefinitionError(
+                    f"Agent initial_messages[{index}].tool_calls has an unsupported shape"
+                )
+            for call_index, call in enumerate(tool_calls):
+                function = call.get("function") if isinstance(call, Mapping) else None
+                call_id = call.get("id") if isinstance(call, Mapping) else None
+                name = function.get("name") if isinstance(function, Mapping) else None
+                arguments = (
+                    function.get("arguments", "{}")
+                    if isinstance(function, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id
+                    or not isinstance(name, str)
+                    or not name
+                    or not isinstance(arguments, (str, Mapping))
+                ):
+                    raise AgentDefinitionError(
+                        f"Agent initial_messages[{index}].tool_calls[{call_index}] "
+                        "must contain an id, function name, and JSON arguments"
+                    )
+                if isinstance(arguments, str):
+                    try:
+                        parsed_arguments = json.loads(
+                            arguments,
+                            parse_constant=_reject_non_finite_json,
+                        )
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        raise AgentDefinitionError(
+                            f"Agent initial_messages[{index}].tool_calls[{call_index}] "
+                            "arguments must be valid JSON"
+                        ) from exc
+                else:
+                    parsed_arguments = arguments
+                if not isinstance(parsed_arguments, Mapping):
+                    raise AgentDefinitionError(
+                        f"Agent initial_messages[{index}].tool_calls[{call_index}] "
+                        "arguments must encode an object"
+                    )
+        try:
+            detached = json.loads(json.dumps(dict(message), allow_nan=False))
+        except (TypeError, ValueError) as exc:
+            raise AgentDefinitionError(
+                f"Agent initial_messages[{index}] must contain JSON values"
+            ) from exc
+        if not isinstance(detached, dict):
+            raise AgentDefinitionError(
+                f"Agent initial_messages[{index}] must normalize to an object"
+            )
+        for call in detached.get("tool_calls") or ():
+            arguments = call["function"]["arguments"]
+            parsed_arguments = (
+                json.loads(arguments, parse_constant=_reject_non_finite_json)
+                if isinstance(arguments, str)
+                else arguments
+            )
+            call["function"]["arguments"] = json.dumps(
+                parsed_arguments,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        normalized.append(detached)
+    return normalized
 
 
 def _validate_string(value: Any, field_name: str, *, required: bool = False) -> None:
@@ -397,6 +589,11 @@ def _definition_from_mapping(
         )
     if "metadata" in snapshot and not isinstance(snapshot["metadata"], Mapping):
         raise _definition_error("metadata", "a mapping")
+    if "initial_messages" in snapshot:
+        normalize_agent_messages(snapshot["initial_messages"])
+    provider = snapshot.get("provider", "openai")
+    if provider not in {"openai", "anthropic"}:
+        raise _definition_error("provider", "one of: anthropic, openai")
     timeout = snapshot.get("execution_timeout")
     if timeout is not None and (
         isinstance(timeout, bool)
@@ -493,6 +690,8 @@ class AgentRequest:
     definition: Optional[AgentDefinition] = None
     definition_metadata: Mapping[str, Any] = field(default_factory=dict)
     timeout: Optional[float] = None
+    initial_messages: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
+    isolation: Optional[AgentIsolationMode] = None
 
 
 @dataclass(frozen=True)

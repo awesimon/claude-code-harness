@@ -1,24 +1,32 @@
 """
 FastAPI routers for the new API endpoints
 """
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from models import get_db, init_db
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from sqlalchemy.orm import Session
+
+from models import get_db
 from schemas import (
-    TaskCreate, TaskUpdate, TaskResponse, TaskClaimRequest, TaskClaimResponse,
-    ConversationCreate, ConversationUpdate, ConversationResponse, ConversationDetailResponse,
-    MessageCreate, MessageResponse,
-    PlanCreate, PlanUpdate, PlanResponse,
+    ConversationCreate,
+    ConversationDetailResponse,
+    ConversationResponse,
+    ConversationUpdate,
+    MessageCreate,
+    MessageResponse,
+    PlanCreate,
+    PlanResponse,
+    PlanUpdate,
+    TaskClaimRequest,
+    TaskClaimResponse,
+    TaskCreate,
+    TaskResponse,
+    TaskUpdate,
 )
-from services.task_service import TaskService
 from services.conversation_service import ConversationService
 from services.plan_service import PlanService
-from websocket.manager import manager, WSEventType
-
-# Initialize database on module load
-init_db()
+from services.task_service import TaskService
+from websocket.manager import WSEventType, manager
 
 # Create routers
 conversations_router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -177,7 +185,7 @@ async def delete_message(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     # Delete the message
-    success = service.delete_message(message_id)
+    success = service.delete_message(conversation_id, message_id)
 
     if not success:
         raise HTTPException(status_code=404, detail="Message not found")

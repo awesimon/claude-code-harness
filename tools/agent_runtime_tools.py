@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from agents.types import AgentRequest
+from agents.types import AgentIsolationMode, AgentRequest
 from state_core import AgentRecord, AgentStatus
 from state_core.runtime_records import AGENT_TERMINAL_STATUSES
 
@@ -115,8 +115,10 @@ class AgentTool(Tool[AgentToolInput, dict[str, Any]]):
                 background=input_data.run_in_background,
                 model=input_data.model,
                 cwd=input_data.cwd,
-                definition_metadata=(
-                    {"isolation": input_data.isolation} if input_data.isolation is not None else {}
+                isolation=(
+                    AgentIsolationMode(input_data.isolation)
+                    if input_data.isolation is not None
+                    else None
                 ),
             ),
             harness=harness,

@@ -1,19 +1,21 @@
-"""
-Plan Mode 路由
-提供计划模式相关的API端点
-"""
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+"""Plan-mode compatibility routes backed only by durable state-core."""
 
-from query_engine import query_engine
-from plan import PlanModeState, get_plan_mode_manager
+from __future__ import annotations
+
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from models import get_db
+from schemas import PlanCreate
+from services.plan_service import PlanService
 
 router = APIRouter(prefix="/api/plan", tags=["plan"])
 
 
 class PlanModeStatusResponse(BaseModel):
-    """计划模式状态响应"""
     session_id: str
     is_in_plan_mode: bool
     state: str
@@ -22,7 +24,6 @@ class PlanModeStatusResponse(BaseModel):
 
 
 class PlanContentResponse(BaseModel):
-    """计划内容响应"""
     session_id: str
     plan_content: Optional[str]
     file_path: Optional[str]
@@ -32,12 +33,10 @@ class PlanContentResponse(BaseModel):
 
 
 class ApprovePlanRequest(BaseModel):
-    """批准计划请求"""
     edited_content: Optional[str] = None
 
 
 class ApprovePlanResponse(BaseModel):
-    """批准计划响应"""
     success: bool
     message: str
     plan_content: Optional[str]
@@ -45,152 +44,113 @@ class ApprovePlanResponse(BaseModel):
 
 
 class RejectPlanRequest(BaseModel):
-    """拒绝计划请求"""
     reason: Optional[str] = None
 
 
 class RejectPlanResponse(BaseModel):
-    """拒绝计划响应"""
     success: bool
     message: str
     can_continue_planning: bool
 
 
 class SavePlanRequest(BaseModel):
-    """保存计划请求"""
     content: str
 
 
 class SavePlanResponse(BaseModel):
-    """保存计划响应"""
     success: bool
     file_path: str
     content_length: int
 
 
 @router.get("/{session_id}/status", response_model=PlanModeStatusResponse)
-async def get_plan_mode_status(session_id: str):
-    """
-    获取计划模式状态
-    """
-    state = query_engine.get_plan_mode_state(session_id)
-    plan_context = query_engine.get_plan_mode_info(session_id)
-
+async def get_plan_mode_status(
+    session_id: str, db: Session = Depends(get_db)
+):
+    service = PlanService(db)
+    snapshot = service.get_mode_snapshot(session_id)
+    plan = service.get_plan_by_conversation(session_id)
     return PlanModeStatusResponse(
         session_id=session_id,
-        is_in_plan_mode=state == PlanModeState.PLANNING,
-        state=state.value,
-        plan_file_path=plan_context.get("plan_context", {}).get("plan_file_path") if plan_context else None,
-        has_plan_content=bool(plan_context.get("plan_context", {}).get("plan_content")) if plan_context else False,
+        is_in_plan_mode=service.is_in_plan_mode(session_id),
+        state=str(snapshot["state"]),
+        plan_file_path=snapshot.get("filePath"),
+        has_plan_content=bool(plan and plan.content),
     )
 
 
 @router.get("/{session_id}/content", response_model=PlanContentResponse)
-async def get_plan_content(session_id: str):
-    """
-    获取计划内容
-    """
-    plan_context = query_engine.get_plan_mode_info(session_id)
-
-    if not plan_context:
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-
-    ctx = plan_context.get("plan_context", {})
-
+async def get_plan_content(session_id: str, db: Session = Depends(get_db)):
+    plan = PlanService(db).get_plan_by_conversation(session_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} has no plan")
+    snapshot = PlanService(db).get_mode_snapshot(session_id)
     return PlanContentResponse(
         session_id=session_id,
-        plan_content=ctx.get("plan_content"),
-        file_path=ctx.get("plan_file_path"),
-        is_edited=ctx.get("is_edited", False),
-        created_at=ctx.get("created_at"),
-        updated_at=ctx.get("updated_at"),
+        plan_content=plan.content,
+        file_path=snapshot.get("filePath"),
+        is_edited=plan.version > 1,
+        created_at=plan.created_at.isoformat(),
+        updated_at=plan.updated_at.isoformat(),
     )
 
 
 @router.post("/{session_id}/save", response_model=SavePlanResponse)
-async def save_plan(session_id: str, request: SavePlanRequest):
-    """
-    保存计划内容
-    """
-    manager = get_plan_mode_manager()
-
+async def save_plan(
+    session_id: str, request: SavePlanRequest, db: Session = Depends(get_db)
+):
     try:
-        result = await manager.save_plan(session_id, request.content)
-        return SavePlanResponse(
-            success=result["success"],
-            file_path=result["file_path"],
-            content_length=result["content_length"],
+        service = PlanService(db)
+        plan = service.create_or_update_plan(
+            PlanCreate(conversation_id=session_id, content=request.content)
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        path = service.get_mode_snapshot(session_id).get("filePath")
+        assert path is not None
+        return SavePlanResponse(
+            success=True, file_path=path, content_length=len(plan.content)
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/{session_id}/approve", response_model=ApprovePlanResponse)
-async def approve_plan(session_id: str, request: ApprovePlanRequest):
-    """
-    批准计划
-
-    用户在查看计划后调用此端点批准计划，允许LLM开始实施。
-    可选地提供编辑后的计划内容。
-    """
+async def approve_plan(
+    session_id: str, request: ApprovePlanRequest, db: Session = Depends(get_db)
+):
     try:
-        result = await query_engine.approve_plan(session_id, request.edited_content)
         return ApprovePlanResponse(
-            success=result["success"],
-            message=result["message"],
-            plan_content=result.get("plan_content"),
-            is_edited=result.get("is_edited", False),
+            **PlanService(db).approve_plan(session_id, request.edited_content)
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/{session_id}/reject", response_model=RejectPlanResponse)
-async def reject_plan(session_id: str, request: RejectPlanRequest):
-    """
-    拒绝计划
-
-    用户调用此端点拒绝计划，LLM将返回计划模式继续编辑。
-    """
+async def reject_plan(
+    session_id: str, request: RejectPlanRequest, db: Session = Depends(get_db)
+):
     try:
-        result = await query_engine.reject_plan(session_id, request.reason)
         return RejectPlanResponse(
-            success=result["success"],
-            message=result["message"],
-            can_continue_planning=result.get("can_continue_planning", True),
+            **PlanService(db).reject_plan(session_id, request.reason)
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{session_id}/info")
-async def get_plan_mode_info(session_id: str):
-    """
-    获取完整的计划模式信息
-    """
-    info = query_engine.get_plan_mode_info(session_id)
-
-    if not info:
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-
-    return info
+async def get_plan_mode_info(session_id: str, db: Session = Depends(get_db)):
+    service = PlanService(db)
+    snapshot = service.get_mode_snapshot(session_id)
+    plan = service.get_plan_by_conversation(session_id)
+    return {
+        **snapshot,
+        "content": plan.content if plan is not None else None,
+    }
 
 
 @router.post("/{session_id}/force-exit")
-async def force_exit_plan_mode(session_id: str):
-    """
-    强制退出计划模式（管理员功能）
-
-    用于紧急情况或测试，直接退出计划模式而不需要审批。
-    """
-    manager = get_plan_mode_manager()
-
+async def force_exit_plan_mode(session_id: str, db: Session = Depends(get_db)):
     try:
-        result = await manager.exit_plan_mode(session_id, skip_approval=True)
-        return {
-            "success": result["success"],
-            "message": result["message"],
-            "previous_mode": result.get("previous_mode"),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return PlanService(db).force_exit_plan_mode(session_id)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
