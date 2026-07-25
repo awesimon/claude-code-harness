@@ -163,6 +163,10 @@ class SkillListToolV2(Tool[SkillListInput, list[dict[str, Any]]]):
         return True
 
 
+SkillExecuteInputV2 = SkillExecuteInput
+SkillListInputV2 = SkillListInput
+
+
 @register_tool
 class SkillInstallToolV2(Tool[SkillInstallInput, dict[str, str]]):
     name = "skill_install"

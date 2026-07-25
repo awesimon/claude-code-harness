@@ -10,6 +10,7 @@ import json
 import asyncio
 
 from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
+from core.config_paths import ConfigPaths
 
 
 @dataclass
@@ -89,7 +90,7 @@ class TeamCreateTool(Tool[TeamCreateInput, Dict[str, Any]]):
     """
     创建团队工具
 
-    在数据库中创建新团队，并创建团队配置文件在 ~/.claude/teams/{team-name}/config.json
+    在数据库中创建新团队，并创建团队配置文件在 .claude/teams/{team-name}/config.json
     """
 
     name = "team_create"
@@ -98,9 +99,8 @@ class TeamCreateTool(Tool[TeamCreateInput, Dict[str, Any]]):
 
     def __init__(self):
         super().__init__()
-        self.claude_dir = Path.home() / ".claude"
-        self.teams_dir = self.claude_dir / "teams"
-        self.tasks_dir = self.claude_dir / "tasks"
+        self.teams_dir = ConfigPaths.teams_dir()
+        self.tasks_dir = ConfigPaths.tasks_dir()
 
     async def validate(self, input_data: TeamCreateInput) -> Optional[ToolError]:
         if not input_data.team_name:
@@ -196,7 +196,7 @@ class TeamDeleteTool(Tool[TeamDeleteInput, Dict[str, Any]]):
     """
     删除团队工具
 
-    从数据库中删除团队，并清理团队目录 ~/.claude/teams/{team-name}/
+    从数据库中删除团队，并清理团队目录 .claude/teams/{team-name}/
     """
 
     name = "team_delete"
@@ -205,9 +205,8 @@ class TeamDeleteTool(Tool[TeamDeleteInput, Dict[str, Any]]):
 
     def __init__(self):
         super().__init__()
-        self.claude_dir = Path.home() / ".claude"
-        self.teams_dir = self.claude_dir / "teams"
-        self.tasks_dir = self.claude_dir / "tasks"
+        self.teams_dir = ConfigPaths.teams_dir()
+        self.tasks_dir = ConfigPaths.tasks_dir()
 
     async def validate(self, input_data: TeamDeleteInput) -> Optional[ToolError]:
         if not input_data.team_id:
@@ -305,8 +304,7 @@ class TeamAddMemberTool(Tool[TeamAddMemberInput, Dict[str, Any]]):
 
     def __init__(self):
         super().__init__()
-        self.claude_dir = Path.home() / ".claude"
-        self.teams_dir = self.claude_dir / "teams"
+        self.teams_dir = ConfigPaths.teams_dir()
 
     async def validate(self, input_data: TeamAddMemberInput) -> Optional[ToolError]:
         if not input_data.team_id:
@@ -423,8 +421,7 @@ class TeamRemoveMemberTool(Tool[TeamRemoveMemberInput, Dict[str, Any]]):
 
     def __init__(self):
         super().__init__()
-        self.claude_dir = Path.home() / ".claude"
-        self.teams_dir = self.claude_dir / "teams"
+        self.teams_dir = ConfigPaths.teams_dir()
 
     async def validate(self, input_data: TeamRemoveMemberInput) -> Optional[ToolError]:
         if not input_data.team_id:

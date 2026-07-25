@@ -13,6 +13,7 @@ from typing import Awaitable, Callable, Dict, Iterator, Optional
 from datetime import datetime
 import asyncio
 
+from core.config_paths import ConfigPaths
 from models.skill import SkillDefinition, SkillMetadata
 from utils.frontmatter_parser import parse_frontmatter, extract_frontmatter_field
 from utils.skill_paths import (
@@ -40,10 +41,10 @@ class SkillLoader:
         初始化加载器
 
         Args:
-            skills_dir: Skill 目录路径，默认 ~/.claude/skills
+            skills_dir: Skill 目录路径，默认使用项目目录下的 .claude/skills
         """
         if skills_dir is None:
-            skills_dir = os.path.expanduser("~/.claude/skills")
+            skills_dir = str(ConfigPaths.skills_dir())
         self.skills_dir = Path(skills_dir).expanduser().resolve(strict=False)
         self._root_identity: tuple[int, int] | None = None
         self.ensure_skills_dir()

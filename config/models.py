@@ -9,6 +9,8 @@ from enum import Enum
 import json
 import os
 
+from core.config_paths import ConfigPaths
+
 
 class ModelProvider(Enum):
     """模型提供商"""
@@ -225,7 +227,7 @@ class ModelManager:
         self._initialized = True
         self._models: Dict[str, ModelConfig] = {}
         self._default_model_id: str = "gpt-4o"
-        self._config_file = os.path.expanduser("~/.claude_python_api/models.json")
+        self._config_file = str(ConfigPaths.models_config_file())
         self._load_config()
 
     def _load_config(self):

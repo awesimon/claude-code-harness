@@ -168,17 +168,15 @@ __all__ = [
     "DoctorInput",
     "HelpInput",
     "VersionInput",
-    # Skill 管理工具
-    "SkillInstallTool",
-    "SkillUninstallTool",
-    "SkillListTool",
-    "SkillEnableTool",
-    "SkillDisableTool",
+    # Skill 管理工具 (agentskills.io 标准协议)
+    "SkillExecuteToolV2",
+    "SkillListToolV2",
+    "SkillInstallToolV2",
+    "SkillUninstallToolV2",
+    "SkillExecuteInputV2",
+    "SkillListInputV2",
     "SkillInstallInput",
     "SkillUninstallInput",
-    "SkillListInput",
-    "SkillEnableInput",
-    "SkillDisableInput",
     # Hooks 工具
     "HooksListTool",
     "HooksAddTool",
@@ -334,10 +332,10 @@ from .system_tools import (
     StatsInput, DoctorInput, HelpInput, VersionInput,
 )
 
-# Skill 管理工具
-from .skill_manager_tools import (
-    SkillInstallTool, SkillUninstallTool, SkillListTool, SkillEnableTool, SkillDisableTool,
-    SkillInstallInput, SkillUninstallInput, SkillListInput, SkillEnableInput, SkillDisableInput,
+# Skill 管理工具 (agentskills.io 标准协议)
+from .skill_tool_v2 import (
+    SkillExecuteToolV2, SkillListToolV2, SkillInstallToolV2, SkillUninstallToolV2,
+    SkillExecuteInputV2, SkillListInputV2, SkillInstallInput, SkillUninstallInput,
 )
 
 # Hooks 工具

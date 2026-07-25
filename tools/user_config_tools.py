@@ -9,11 +9,11 @@ import json
 import os
 
 from tools.base import Tool, ToolResult, register_tool
+from core.config_paths import ConfigPaths
 
 
 # 用户配置目录
-USER_CONFIG_DIR = Path(os.path.expanduser("~/.claude_code"))
-USER_CONFIG_FILE = USER_CONFIG_DIR / "user_config.json"
+USER_CONFIG_FILE = ConfigPaths.user_config_file()
 
 # 支持的 theme 列表
 THEMES = [
@@ -52,6 +52,7 @@ class UserConfig:
     def _save_config(self):
         """保存配置"""
         try:
+            self.config_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self._config, f, indent=2, ensure_ascii=False)
         except Exception as e:
