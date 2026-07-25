@@ -9,10 +9,8 @@
 """
 
 import pytest
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import List
 
 import sys
 import os
@@ -27,11 +25,7 @@ from services.error_recovery.error_types import (
     PromptTooLongError,
     RateLimitError,
     ServerError,
-    TimeoutError,
-    NetworkError,
     AuthenticationError,
-    PermissionError,
-    ContentFilterError,
     classify_error,
     is_retryable,
 )

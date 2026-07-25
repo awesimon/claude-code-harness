@@ -4,15 +4,15 @@
 支持settings.json管理和环境变量配置
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 import json
 import os
 import asyncio
-from datetime import datetime
 
 from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
+from core.config_paths import ConfigPaths
 
 
 @dataclass
@@ -95,14 +95,13 @@ class ConfigManager:
     """配置管理器 - 管理settings.json和环境变量"""
 
     def __init__(self):
-        self.claude_dir = Path.home() / ".claude"
-        self.config_file = self.claude_dir / "settings.json"
+        self.config_file = ConfigPaths.settings_file()
         self._settings_cache: Optional[Dict[str, Any]] = None
         self._cache_timestamp: Optional[float] = None
 
     def ensure_config_dir(self) -> None:
         """确保配置目录存在"""
-        self.claude_dir.mkdir(parents=True, exist_ok=True)
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
 
     async def load_settings(self, use_cache: bool = True) -> Dict[str, Any]:
         """
@@ -265,7 +264,7 @@ class ConfigManager:
                     key=key,
                     value=value,
                     scope="settings",
-                    source=f"settings.json"
+                    source="settings.json"
                 )
 
         return None
@@ -554,7 +553,7 @@ class ConfigSetTool(Tool[ConfigSetInput, ConfigSetOutput]):
     - 设置模型默认参数
 
     注意：
-    - settings.json保存在 ~/.claude/settings.json
+    - settings.json保存在 .claude/settings.json
     - 环境变量设置仅影响当前进程
     """
 

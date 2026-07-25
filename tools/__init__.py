@@ -3,8 +3,6 @@ Python API工具模块
 为FastAPI提供文件操作、命令执行等核心工具功能
 """
 
-from typing import Any
-
 __version__ = "0.2.0"
 
 __all__ = [
@@ -13,6 +11,14 @@ __all__ = [
     "ToolResult",
     "ToolError",
     "ToolRegistry",
+    "AgentTool",
+    "AgentToolInput",
+    "TaskOutputTool",
+    "TaskOutputInput",
+    "TaskStopTool",
+    "TaskStopInput",
+    "AgentListTool",
+    "AgentDestroyTool",
     # 文件工具
     "ReadFileTool",
     "WriteFileTool",
@@ -162,17 +168,15 @@ __all__ = [
     "DoctorInput",
     "HelpInput",
     "VersionInput",
-    # Skill 管理工具
-    "SkillInstallTool",
-    "SkillUninstallTool",
-    "SkillListTool",
-    "SkillEnableTool",
-    "SkillDisableTool",
+    # Skill 管理工具 (agentskills.io 标准协议)
+    "SkillExecuteToolV2",
+    "SkillListToolV2",
+    "SkillInstallToolV2",
+    "SkillUninstallToolV2",
+    "SkillExecuteInputV2",
+    "SkillListInputV2",
     "SkillInstallInput",
     "SkillUninstallInput",
-    "SkillListInput",
-    "SkillEnableInput",
-    "SkillDisableInput",
     # Hooks 工具
     "HooksListTool",
     "HooksAddTool",
@@ -198,6 +202,16 @@ __all__ = [
 
 # 重新导出基类
 from .base import Tool, ToolResult, ToolError, ToolRegistry
+from .agent_runtime_tools import (
+    AgentDestroyTool,
+    AgentListTool,
+    AgentTool,
+    AgentToolInput,
+    TaskOutputInput,
+    TaskOutputTool,
+    TaskStopInput,
+    TaskStopTool,
+)
 
 # 文件工具
 from .file_tools import (
@@ -236,7 +250,7 @@ from .plan_mode_tools import EnterPlanModeTool, ExitPlanModeTool
 from .ask_user_tool import AskUserQuestionTool, AskUserQuestionInput
 
 # 技能工具
-from .skill_tool import SkillExecuteTool, SkillListTool, SkillExecuteInput, SkillListInput
+from .skill_tool import SkillExecuteInput, SkillExecuteTool
 
 # Agent通信工具
 from .send_message_tool import SendMessageTool, MessageHistoryTool, SendMessageInput, MessageHistoryInput
@@ -318,10 +332,10 @@ from .system_tools import (
     StatsInput, DoctorInput, HelpInput, VersionInput,
 )
 
-# Skill 管理工具
-from .skill_manager_tools import (
-    SkillInstallTool, SkillUninstallTool, SkillListTool, SkillEnableTool, SkillDisableTool,
-    SkillInstallInput, SkillUninstallInput, SkillListInput, SkillEnableInput, SkillDisableInput,
+# Skill 管理工具 (agentskills.io 标准协议)
+from .skill_tool_v2 import (
+    SkillExecuteToolV2, SkillListToolV2, SkillInstallToolV2, SkillUninstallToolV2,
+    SkillExecuteInputV2, SkillListInputV2, SkillInstallInput, SkillUninstallInput,
 )
 
 # Hooks 工具

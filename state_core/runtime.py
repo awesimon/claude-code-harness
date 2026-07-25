@@ -19,6 +19,8 @@ from .types import (
     TaskItem,
     TaskMode,
     TaskMutation,
+    _permission_scope_snapshots,
+    _validated_permission_scope_snapshots,
 )
 
 
@@ -126,6 +128,27 @@ class SessionRuntime:
         return runtime
 
     @classmethod
+    def observe(cls, session_id: str, store: SQLAlchemyStateStore) -> "SessionRuntime":
+        """Load state without creating, migrating, or recovering durable session data.
+
+        Historical agent records may predate their root ``SessionState``.  They
+        still need a read-only harness so their durable agent lifecycle can be
+        inspected or stopped.  Represent that missing session only in memory;
+        ``RECOVERY_REQUIRED`` keeps every session-state mutation fail closed.
+        """
+
+        state = store.states.load_session(session_id)
+        if state is None:
+            state = SessionState.new(session_id)
+            state.task_list_id = session_id
+            state.health = SessionHealth.RECOVERY_REQUIRED
+        runtime = cls.__new__(cls)
+        runtime.session_id = session_id
+        runtime.store = store
+        runtime.state = state
+        return runtime
+
+    @classmethod
     def from_session_factory(cls, session_id: str, session_factory: Any) -> "SessionRuntime":
         return cls(session_id, SQLAlchemyStateStore(session_factory))
 
@@ -191,6 +214,29 @@ class SessionRuntime:
 
     def events(self, after_id: int = 0):
         return self.store.states.list_events(self.session_id, after_id=after_id)
+
+    def replace_permission_scope_snapshot(
+        self,
+        scope: str,
+        rules: list[Mapping[str, Any]],
+    ) -> None:
+        if scope not in {"session", "cliArg"}:
+            raise ValueError("permission snapshot scope must be session or cliArg")
+        candidate = _permission_scope_snapshots(self.state.permission_scope_snapshots)
+        candidate[scope] = [dict(rule) for rule in rules]
+        validated = _validated_permission_scope_snapshots(candidate)
+        event_rules = _permission_scope_snapshots(validated)[scope]
+
+        previous = self.state.permission_scope_snapshots
+        self.state.permission_scope_snapshots = validated
+        try:
+            self._persist(
+                EventType.PERMISSION_SCOPE_SNAPSHOT,
+                {"scope": scope, "rules": event_rules},
+            )
+        except BaseException:
+            self.state.permission_scope_snapshots = previous
+            raise
 
     def enable_task_v2(self) -> None:
         if self.state.task_mode is TaskMode.TASK_V2:
@@ -377,3 +423,6 @@ class SessionRuntimeFactory:
 
     def resume(self, session_id: str) -> SessionRuntime:
         return SessionRuntime.recover(session_id, self.store)
+
+    def observe(self, session_id: str) -> SessionRuntime:
+        return SessionRuntime.observe(session_id, self.store)

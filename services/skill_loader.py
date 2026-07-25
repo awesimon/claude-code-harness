@@ -4,15 +4,23 @@ Agent Skills 加载器
 """
 import os
 import re
+import shutil
+import stat
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Awaitable, Callable, Dict, Iterator, Optional
 from datetime import datetime
 import asyncio
-import urllib.parse
 
+from core.config_paths import ConfigPaths
 from models.skill import SkillDefinition, SkillMetadata
 from utils.frontmatter_parser import parse_frontmatter, extract_frontmatter_field
+from utils.skill_paths import (
+    is_valid_skill_name,
+    resolve_skill_path,
+    validate_skill_name,
+)
 
 
 class SkillLoader:
@@ -33,15 +41,60 @@ class SkillLoader:
         初始化加载器
 
         Args:
-            skills_dir: Skill 目录路径，默认 ~/.claude/skills
+            skills_dir: Skill 目录路径，默认使用项目目录下的 .claude/skills
         """
         if skills_dir is None:
-            skills_dir = os.path.expanduser("~/.claude/skills")
-        self.skills_dir = Path(skills_dir)
+            skills_dir = str(ConfigPaths.skills_dir())
+        self.skills_dir = Path(skills_dir).expanduser().resolve(strict=False)
+        self._root_identity: tuple[int, int] | None = None
+        self.ensure_skills_dir()
 
     def ensure_skills_dir(self) -> None:
         """确保 skills 目录存在"""
+        if self._root_identity is not None:
+            self._verify_root()
+            return
         self.skills_dir.mkdir(parents=True, exist_ok=True)
+        info = self.skills_dir.lstat()
+        if not stat.S_ISDIR(info.st_mode) or self.skills_dir.resolve(strict=True) != self.skills_dir:
+            raise ValueError("skills root must be a canonical directory")
+        self._root_identity = (info.st_dev, info.st_ino)
+
+    def _verify_root(self) -> Path:
+        try:
+            info = self.skills_dir.lstat()
+        except OSError as exc:
+            raise ValueError("skills root changed after loader initialization") from exc
+        identity = (info.st_dev, info.st_ino)
+        if (
+            self._root_identity is None
+            or identity != self._root_identity
+            or not stat.S_ISDIR(info.st_mode)
+            or self.skills_dir.resolve(strict=True) != self.skills_dir
+        ):
+            raise ValueError("skills root changed after loader initialization")
+        return self.skills_dir
+
+    @contextmanager
+    def _open_root(self) -> Iterator[int]:
+        root = self._verify_root()
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(root, flags)
+        try:
+            info = os.fstat(descriptor)
+            if (info.st_dev, info.st_ino) != self._root_identity:
+                raise ValueError("skills root changed after loader initialization")
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _entry_exists(root_fd: int, name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
 
     async def load_all_skills(self) -> Dict[str, SkillDefinition]:
         """
@@ -52,12 +105,11 @@ class SkillLoader:
         """
         skills = {}
 
-        if not self.skills_dir.exists():
-            return skills
+        root = self._verify_root()
 
         # 遍历所有子目录
-        for skill_dir in self.skills_dir.iterdir():
-            if not skill_dir.is_dir():
+        for skill_dir in root.iterdir():
+            if skill_dir.is_symlink() or not skill_dir.is_dir():
                 continue
 
             try:
@@ -79,15 +131,33 @@ class SkillLoader:
         Returns:
             SkillDefinition 或 None（如果不是有效的 skill 目录）
         """
-        skill_md_path = skill_dir / "SKILL.md"
-
-        if not skill_md_path.exists():
+        root = self._verify_root()
+        canonical = skill_dir.resolve(strict=True)
+        try:
+            relative = canonical.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("skill directory escapes skills root") from exc
+        if len(relative.parts) != 1 or canonical.name != skill_dir.name:
+            raise ValueError("skill directory escapes skills root")
+        skill_md_entry = canonical / "SKILL.md"
+        try:
+            skill_md_path = skill_md_entry.resolve(strict=True)
+        except FileNotFoundError:
             return None
+        try:
+            skill_md_path.relative_to(canonical)
+            skill_md_path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("SKILL.md escapes skill directory") from exc
+        file_info = skill_md_path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(file_info.st_mode):
+            raise ValueError("SKILL.md must be a regular file")
+        self._verify_root()
 
         # 异步读取文件
         content = await asyncio.to_thread(skill_md_path.read_text, encoding='utf-8')
 
-        return self._parse_skill(skill_dir, content)
+        return self._parse_skill(canonical, content)
 
     def _parse_skill(self, skill_dir: Path, content: str) -> SkillDefinition:
         """
@@ -107,6 +177,7 @@ class SkillLoader:
         name = frontmatter.get('name')
         if not name:
             raise ValueError(f"Missing required 'name' field in {skill_dir}")
+        validate_skill_name(name)
 
         description = frontmatter.get('description')
         if not description:
@@ -155,7 +226,7 @@ class SkillLoader:
 
     def get_skill_path(self, skill_name: str) -> Optional[Path]:
         """获取 skill 目录路径"""
-        skill_dir = self.skills_dir / skill_name
+        skill_dir = resolve_skill_path(self._verify_root(), skill_name)
         if skill_dir.exists() and skill_dir.is_dir():
             return skill_dir
         return None
@@ -206,52 +277,32 @@ class SkillLoader:
         if skill_name is None:
             skill_name = Path(path).name
 
-        # 验证名称
-        if not self._is_valid_skill_name(skill_name):
-            raise ValueError(f"Invalid skill name derived from URL: {skill_name}")
+        # 下载前先验证 URL/调用者给出的名称
+        try:
+            skill_name = validate_skill_name(skill_name)
+        except ValueError as exc:
+            raise ValueError(f"Invalid skill name derived from URL: {skill_name}") from exc
 
-        # 检查是否已存在
-        target = self.skills_dir / skill_name
-        if target.exists():
-            raise ValueError(f"Skill already exists: {skill_name}")
+        raw_base = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}"
+        skill_md_content = await self._download_file(f"{raw_base}/SKILL.md")
+        if not skill_md_content:
+            raise ValueError(f"Could not download SKILL.md from {raw_base}")
+        try:
+            frontmatter, _ = parse_frontmatter(skill_md_content)
+            actual_name = frontmatter.get("name")
+            if actual_name is not None:
+                skill_name = validate_skill_name(actual_name)
+        except Exception as exc:
+            raise ValueError(f"Invalid SKILL.md content: {exc}") from exc
 
-        # 创建临时目录
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # 构建 raw GitHub content URL
-            raw_base = f"https://raw.githubusercontent.com/{user}/{repo}/{branch}/{path}"
+        async def populate(staged_skill: Path) -> None:
+            staged_skill.mkdir()
+            (staged_skill / "SKILL.md").write_text(
+                skill_md_content, encoding="utf-8"
+            )
+            await self._download_github_directory(raw_base, staged_skill)
 
-            # 下载 SKILL.md
-            skill_md_content = await self._download_file(f"{raw_base}/SKILL.md")
-            if not skill_md_content:
-                raise ValueError(f"Could not download SKILL.md from {raw_base}")
-
-            # 验证 SKILL.md
-            try:
-                frontmatter, _ = parse_frontmatter(skill_md_content)
-                actual_name = frontmatter.get('name')
-                if actual_name and actual_name != skill_name:
-                    # 如果 SKILL.md 中的 name 与推断的不同，使用 SKILL.md 中的
-                    skill_name = actual_name
-                    target = self.skills_dir / skill_name
-                    if target.exists():
-                        raise ValueError(f"Skill already exists: {skill_name}")
-            except Exception as e:
-                raise ValueError(f"Invalid SKILL.md content: {e}")
-
-            # 创建 skill 目录
-            tmp_skill_dir = Path(tmpdir) / skill_name
-            tmp_skill_dir.mkdir(parents=True)
-
-            # 保存 SKILL.md
-            (tmp_skill_dir / "SKILL.md").write_text(skill_md_content, encoding='utf-8')
-
-            # 尝试下载可选子目录
-            await self._download_github_directory(raw_base, tmp_skill_dir)
-
-            # 复制到目标位置
-            await asyncio.to_thread(self._copy_tree, tmp_skill_dir, target)
-
-        return skill_name
+        return await self._stage_and_publish(skill_name, populate)
 
     def _parse_github_url(self, url: str) -> Optional[tuple]:
         """
@@ -338,9 +389,12 @@ class SkillLoader:
 
     async def _install_from_local(self, source_path: str, skill_name: Optional[str] = None) -> str:
         """从本地路径安装 skill"""
-        source = Path(source_path)
-        if not source.exists():
+        source_candidate = Path(source_path).expanduser()
+        if not source_candidate.exists():
             raise ValueError(f"Source path does not exist: {source_path}")
+        source = source_candidate.resolve(strict=True)
+        if not source.is_dir():
+            raise ValueError(f"Source is not a directory: {source_path}")
 
         # 验证源目录包含 SKILL.md
         if not (source / "SKILL.md").exists():
@@ -350,36 +404,50 @@ class SkillLoader:
         if skill_name is None:
             skill_name = source.name
 
-        # 验证名称格式
-        if not self._is_valid_skill_name(skill_name):
-            raise ValueError(f"Invalid skill name: {skill_name}")
+        name = validate_skill_name(skill_name)
 
-        # 复制目录
-        target = self.skills_dir / skill_name
-        if target.exists():
-            raise ValueError(f"Skill already exists: {skill_name}")
+        async def populate(staged_skill: Path) -> None:
+            await asyncio.to_thread(self._copy_tree, source, staged_skill)
 
-        await asyncio.to_thread(self._copy_tree, source, target)
+        return await self._stage_and_publish(name, populate)
 
-        return skill_name
+    async def _stage_and_publish(
+        self,
+        skill_name: str,
+        populate: Callable[[Path], Awaitable[None]],
+    ) -> str:
+        name = validate_skill_name(skill_name)
+        with self._open_root() as root_fd:
+            target = resolve_skill_path(self.skills_dir, name)
+            if self._entry_exists(root_fd, name) or target.is_symlink():
+                raise ValueError(f"Skill already exists: {name}")
+            with tempfile.TemporaryDirectory(prefix="skill-install-") as tmpdir:
+                staging_root = Path(tmpdir).resolve(strict=True)
+                staged_skill = resolve_skill_path(staging_root, name)
+                await populate(staged_skill)
+                self._validate_staged_skill(staging_root, name)
+                self._verify_root()
+                if self._entry_exists(root_fd, name):
+                    raise ValueError(f"Skill already exists: {name}")
+                os.rename(staged_skill, name, dst_dir_fd=root_fd)
+        return name
+
+    @staticmethod
+    def _validate_staged_skill(staging_root: Path, skill_name: str) -> None:
+        from harness.skills import SkillResolver
+
+        try:
+            SkillResolver(staging_root).resolve(skill_name)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Invalid skill source: {exc}") from exc
 
     def _is_valid_skill_name(self, name: str) -> bool:
         """验证 skill 名称格式"""
-        if not name:
-            return False
-        if len(name) > 64:
-            return False
-        if name.startswith('-') or name.endswith('-'):
-            return False
-        if '--' in name:
-            return False
-        # 只允许小写字母、数字和连字符
-        return all(c.islower() or c.isdigit() or c == '-' for c in name)
+        return is_valid_skill_name(name)
 
     def _copy_tree(self, src: Path, dst: Path) -> None:
         """递归复制目录"""
-        import shutil
-        shutil.copytree(src, dst)
+        shutil.copytree(src, dst, symlinks=True)
 
     async def uninstall_skill(self, skill_name: str) -> bool:
         """
@@ -391,14 +459,13 @@ class SkillLoader:
         Returns:
             是否成功卸载
         """
-        skill_dir = self.skills_dir / skill_name
-        if not skill_dir.exists():
-            return False
-
-        await asyncio.to_thread(self._remove_tree, skill_dir)
+        name = validate_skill_name(skill_name)
+        resolve_skill_path(self._verify_root(), name)
+        with self._open_root() as root_fd:
+            if not self._entry_exists(root_fd, name):
+                return False
+            info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError(f"Skill path is not a directory: {name}")
+            await asyncio.to_thread(shutil.rmtree, name, dir_fd=root_fd)
         return True
-
-    def _remove_tree(self, path: Path) -> None:
-        """递归删除目录"""
-        import shutil
-        shutil.rmtree(path)

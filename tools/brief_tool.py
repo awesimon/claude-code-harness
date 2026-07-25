@@ -6,7 +6,7 @@ BriefTool - 向用户发送消息
 from dataclasses import dataclass
 from typing import Optional
 
-from .base import Tool, ToolResult, ToolError
+from .base import Tool, ToolExecutionError, ToolResult
 
 
 @dataclass
@@ -95,9 +95,10 @@ class BriefTool(Tool):
         except Exception as e:
             return ToolResult(
                 success=False,
-                error=ToolError(
+                data=None,
+                error=ToolExecutionError(
                     message=f"发送消息失败: {str(e)}",
-                    tool_name=self.name
+                    details={"tool_name": self.name},
                 )
             )
 

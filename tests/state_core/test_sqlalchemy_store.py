@@ -67,6 +67,19 @@ def test_session_create_and_load_round_trip(store: SQLAlchemyStateStore) -> None
     assert store.states.load_session("missing") is None
 
 
+def test_session_catalog_lists_detached_state_in_stable_order(
+    store: SQLAlchemyStateStore,
+) -> None:
+    store.states.create_session(SessionState.new("session-b"))
+    store.states.create_session(SessionState.new("session-a"))
+
+    sessions = store.states.list_sessions()
+
+    assert [state.session_id for state in sessions] == ["session-a", "session-b"]
+    sessions[0].permission_mode = "mutated"
+    assert store.states.load_session("session-a").permission_mode == "default"  # type: ignore[union-attr]
+
+
 def test_commit_assigns_event_ids_and_resolves_same_batch_parent(
     store: SQLAlchemyStateStore,
 ) -> None:

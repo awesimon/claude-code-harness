@@ -68,6 +68,11 @@ def test_legacy_services_delegate_mutations_to_state_core(tmp_path: Path, monkey
         assert submitted["state"] == "pending_approval"
 
     runtime = SessionRuntime(conversation.id, SQLAlchemyStateStore(factory))
-    assert runtime.get_task(first.id) is not None
+    durable_first = next(
+        task
+        for task in runtime.list_tasks()
+        if task.metadata.get("apiTaskId") == first.id
+    )
+    assert durable_first.subject == "First"
     assert runtime.state.plan.state.value == "pending_approval"
     assert [event.event_type for event in runtime.events()][0] is EventType.USER_MESSAGE

@@ -2,7 +2,6 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pytest
 from utils.frontmatter_parser import parse_frontmatter, extract_frontmatter_field
 
 

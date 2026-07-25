@@ -7,13 +7,24 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import time
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Mapping, Optional
 
-from agents import AgentExecutionConfig, get_agent_manager
-from harness import CancellationToken, PermissionMode, RuntimeContext, ToolRuntime
+from agents import AgentExecutor, AgentRequest
+from harness import (
+    CompactionSummary,
+    ContextControlConfig,
+    ContextController,
+    PermissionMode,
+    SessionHarness,
+    SessionHarnessFactory,
+)
+from harness.budget import BudgetKind
+from harness.skills import acknowledge_skill_delivery, claim_skill_delivery_attempts
 from services import ChatCompletionRequest, LLMProvider, LLMService, Message
 from services.error_recovery import (
     PromptTooLongError,
@@ -22,11 +33,12 @@ from services.error_recovery import (
     RetryConfig,
     classify_for_user,
 )
-
-# 启动时加载所有已安装的 skills
-from services.skill_manager import skill_manager
 from state_core import (
+    AgentRecord,
+    AgentStatus,
+    AgentTerminationReason,
     EventType,
+    RuntimeRecordRevisionConflict,
     SessionRuntime,
     SessionRuntimeFactory,
     SQLAlchemyStateStore,
@@ -35,9 +47,7 @@ from state_core import (
     PlanState as PlanModeState,
 )
 from tools import ToolRegistry
-from tools.base import ToolResult, to_json_value, tool_flag
-
-skill_manager.load_all_skills()
+from tools.base import ToolResult, tool_flag
 
 # 系统提示词 - 定义AI助手的行为和能力
 SYSTEM_PROMPT = """You are Claude Code, a powerful AI coding assistant created by Anthropic.
@@ -84,10 +94,9 @@ You have access to a wide range of tools including:
 - pr_diff - 查看 PR 代码差异
 
 **Skill Management**
-- skill_install - 从 Git/本地安装 Skill（动态添加工具）
+- skill_install - 将声明式 Agent Skill 安装到当前会话的 skill 目录
 - skill_list - 列出已安装的 Skills
 - skill_uninstall - 卸载 Skill
-- skill_enable/skill_disable - 启用/禁用 Skill
 
 **Hooks Configuration**
 - hooks_list - 列出已配置的 hooks
@@ -171,6 +180,46 @@ Always respond in a helpful, clear, and professional manner."""
 
 logger = logging.getLogger(__name__)
 
+LEGACY_AGENT_SURFACE = "legacy_agents"
+API_AGENT_SURFACE = "api_agents"
+_AGENT_SURFACE_ALIASES = {
+    LEGACY_AGENT_SURFACE: LEGACY_AGENT_SURFACE,
+    "/agents": LEGACY_AGENT_SURFACE,
+    API_AGENT_SURFACE: API_AGENT_SURFACE,
+    "/api/agents": API_AGENT_SURFACE,
+}
+
+
+def _canonical_agent_surface(surface: str) -> str:
+    try:
+        return _AGENT_SURFACE_ALIASES[surface]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Unknown durable agent API surface: {surface!r}") from exc
+
+
+def _agent_api_compat(record: AgentRecord) -> Mapping[str, Any] | None:
+    metadata = record.definition_snapshot.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    compat = metadata.get("api_compat")
+    return compat if isinstance(compat, Mapping) else None
+
+
+def _agent_belongs_to_surface(record: AgentRecord, surface: str | None) -> bool:
+    if surface is None:
+        return True
+    canonical = _canonical_agent_surface(surface)
+    compat = _agent_api_compat(record)
+    if compat is None:
+        return False
+    recorded = compat.get("surface")
+    if recorded is None:
+        return canonical == LEGACY_AGENT_SURFACE
+    try:
+        return _canonical_agent_surface(str(recorded)) == canonical
+    except ValueError:
+        return False
+
 
 class ConversationState(Enum):
     """对话状态"""
@@ -247,7 +296,7 @@ class ConversationTurn:
     tool_calls: Optional[List[ToolCall]] = None
     tool_observations: Optional[List[ToolObservation]] = None
     thinking: Optional[str] = None  # 推理/思考内容
-    timestamp: float = field(default_factory=lambda: asyncio.get_event_loop().time())
+    timestamp: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -343,7 +392,9 @@ class QueryEngine:
         approval_callback: Optional[Callable[[Any], Any]] = None,
         tool_timeout: Optional[float] = 60.0,
         session_runtime_factory: Optional[SessionRuntimeFactory] = None,
-    ):
+        context_control_config: Optional[ContextControlConfig] = None,
+        context_summary_callback: Optional[Callable[[List[Message]], Any]] = None,
+    ) -> None:
         self.llm_service = llm_service or LLMService()
         self.max_iterations = max_iterations
         # 从环境变量读取默认 provider
@@ -356,14 +407,27 @@ class QueryEngine:
 
             init_db()
             session_runtime_factory = SessionRuntimeFactory(SQLAlchemyStateStore(SessionLocal))
-        self._runtime_factory = session_runtime_factory
-        self._session_runtimes: Dict[str, SessionRuntime] = {}
-        self._agent_manager = get_agent_manager()
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.approval_callback = approval_callback
         self.tool_timeout = tool_timeout
-        self._tool_runtime = ToolRuntime(ToolRegistry, default_timeout=tool_timeout)
-        self._cancellations: Dict[str, CancellationToken] = {}
+        self._harness_factory = SessionHarnessFactory(
+            session_runtime_factory,
+            tool_registry=ToolRegistry,
+            workspace_root=self.workspace_root,
+            approval_callback=approval_callback,
+            tool_timeout=tool_timeout,
+            agent_runner_factory=lambda record: AgentExecutor.from_record(
+                record, llm_service=self.llm_service
+            ),
+            agent_provider=self.provider.value,
+        )
+        self._agent_repository = session_runtime_factory.store.agents
+        self._session_harnesses: Dict[str, SessionHarness] = {}
+        self._pending_skill_deliveries: ContextVar[
+            tuple[str, tuple[Any, ...]] | None
+        ] = ContextVar("pending_skill_deliveries", default=None)
+        self._context_control_config = context_control_config or ContextControlConfig()
+        self._context_summary_callback = context_summary_callback
 
         # 初始化错误恢复管理器
         self._recovery_manager: Optional[RecoveryManager] = None
@@ -401,7 +465,7 @@ class QueryEngine:
     def on_state_change(
         self,
         callback: Callable[[str, ConversationState, ConversationState], None]
-    ):
+    ) -> None:
         """注册状态变更回调"""
         self._state_callbacks.append(callback)
 
@@ -433,8 +497,9 @@ class QueryEngine:
         import uuid
         cid = conversation_id or f"conv-{uuid.uuid4().hex[:8]}"
         self._conversations[cid] = ConversationContext(conversation_id=cid)
-        self._session_runtimes[cid] = self._runtime_factory.create(cid)
-        self._cancellations[cid] = CancellationToken()
+        self._session_harnesses[cid] = self._harness_factory.create(
+            cid, tool_timeout=self.tool_timeout
+        )
         logger.info(f"Created conversation: {cid}")
         return cid
 
@@ -442,19 +507,27 @@ class QueryEngine:
         """获取对话上下文"""
         return self._conversations.get(conversation_id)
 
+    def has_durable_conversation(self, conversation_id: str) -> bool:
+        """Return whether durable state exists without exposing the harness factory."""
+        store = self._harness_factory.session_runtime_factory.store
+        return store.states.load_session(conversation_id) is not None
+
     def delete_conversation(self, conversation_id: str):
         """删除对话"""
         if conversation_id in self._conversations:
             del self._conversations[conversation_id]
-            token = self._cancellations.pop(conversation_id, None)
-            if token:
-                token.cancel()
+            harness = self._session_harnesses.pop(conversation_id, None)
+            if harness is not None:
+                harness.runtime_context.cancellation.cancel()
             logger.info(f"Deleted conversation: {conversation_id}")
 
     def resume_conversation(self, conversation_id: str) -> str:
         """Restore the in-process handle from the durable transcript."""
-        runtime = self._runtime_factory.resume(conversation_id)
-        self._session_runtimes[conversation_id] = runtime
+        harness = self._harness_factory.resume(
+            conversation_id, tool_timeout=self.tool_timeout
+        )
+        self._session_harnesses[conversation_id] = harness
+        runtime = harness.session_runtime
         context = ConversationContext(conversation_id=conversation_id)
         for event in runtime.events():
             if event.event_type in {EventType.USER_MESSAGE, EventType.ASSISTANT_MESSAGE}:
@@ -500,15 +573,117 @@ class QueryEngine:
                         ConversationTurn(role="tool", tool_observations=[observation])
                     )
         self._conversations[conversation_id] = context
-        self._cancellations[conversation_id] = CancellationToken()
         return conversation_id
 
+    def _session_harness(self, conversation_id: str) -> SessionHarness:
+        harness = self._session_harnesses.get(conversation_id)
+        if harness is None:
+            harness = self._harness_factory.resume(
+                conversation_id, tool_timeout=self.tool_timeout
+            )
+            self._session_harnesses[conversation_id] = harness
+        return harness
+
     def _session_runtime(self, conversation_id: str) -> SessionRuntime:
-        runtime = self._session_runtimes.get(conversation_id)
-        if runtime is None:
-            runtime = self._runtime_factory.resume(conversation_id)
-            self._session_runtimes[conversation_id] = runtime
-        return runtime
+        return self._session_harness(conversation_id).session_runtime
+
+    async def _prepare_model_messages(
+        self,
+        conversation_id: str,
+        messages: List[Message],
+    ) -> List[Message]:
+        harness = self._session_harness(conversation_id)
+        context_window_tokens = harness.runtime_context.metadata.get(
+            "context_window_tokens", 200_000
+        )
+        harness.skills.announcement_delta(
+            context_window_tokens=(
+                context_window_tokens
+                if isinstance(context_window_tokens, int)
+                and not isinstance(context_window_tokens, bool)
+                and context_window_tokens > 0
+                else 200_000
+            )
+        )
+        skill_messages = [
+            Message(role="system", content=f"Available Agent Skills:\n{content}")
+            for content in harness.skills.announcement_history()
+        ]
+        pending = claim_skill_delivery_attempts(
+            harness,
+            harness.skills.active_snapshots(),
+            source="root_model",
+        )
+        self._pending_skill_deliveries.set((conversation_id, pending))
+        activation_messages = [
+            Message(
+                role="system",
+                content=attempt.snapshot.prompt(harness.session_id),
+            )
+            for attempt in pending
+        ]
+        system_messages = [message for message in messages if message.role == "system"]
+        transcript_messages = [
+            message for message in messages if message.role != "system"
+        ]
+        controller = ContextController(
+            harness,
+            config=self._context_control_config,
+            summarize=self._context_summary_callback or self._summarize_context,
+        )
+        return await controller.prepare_messages(
+            [
+                *system_messages,
+                *skill_messages,
+                *activation_messages,
+                *transcript_messages,
+            ]
+        )
+
+    def _ack_skill_deliveries(self, conversation_id: str) -> None:
+        harness = self._session_harness(conversation_id)
+        pending = self._pending_skill_deliveries.get()
+        if pending is None or pending[0] != conversation_id:
+            return
+        self._pending_skill_deliveries.set(None)
+        for attempt in pending[1]:
+            acknowledge_skill_delivery(
+                harness,
+                attempt,
+                source="root_model",
+            )
+
+    async def _summarize_context(self, messages) -> CompactionSummary:
+        request = ChatCompletionRequest(
+            messages=[
+                *messages,
+                Message(
+                    role="user",
+                    content=(
+                        "Summarize the conversation for continuation. Preserve decisions, "
+                        "constraints, current work, relevant files, and unresolved tasks."
+                    ),
+                ),
+            ],
+            model=self.model,
+            provider=self.provider,
+            temperature=0,
+        )
+        response = await self.llm_service.chat_completion(request)
+        return CompactionSummary(response.content, response.usage or {})
+
+    @staticmethod
+    def _classify_model_error(error: Exception) -> Dict[str, Any]:
+        category = getattr(error, "category", None)
+        if isinstance(category, str) and category:
+            retryable = bool(getattr(error, "retryable", False))
+            return {
+                "type": category,
+                "message": str(error),
+                "retryable": retryable,
+                "action": "retry" if retryable else "review_context",
+            }
+        return classify_for_user(error)
 
     def is_in_plan_mode(self, conversation_id: str) -> bool:
         """检查对话是否在计划模式中"""
@@ -531,6 +706,7 @@ class QueryEngine:
             "enter_plan_mode",
             "exit_plan_mode",
             "ask_user_question",
+            "tool_search",
         }
 
         filtered = []
@@ -543,25 +719,12 @@ class QueryEngine:
 
     def _build_tools_schema(self, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """构建工具 schema 列表"""
-        runtime = self._session_runtime(conversation_id) if conversation_id else None
-        tools = []
-        for name in ToolRegistry.list_tools():
-            tool = ToolRegistry.get(name)
-            if tool is None:
-                continue
-            enabled = getattr(tool, "is_enabled", None)
-            if runtime is not None and callable(enabled):
-                try:
-                    is_enabled = enabled({"session_runtime": runtime})
-                except TypeError:
-                    is_enabled = enabled()
-                if not is_enabled:
-                    continue
-            elif runtime is not None and enabled is False:
-                continue
-            spec = ToolRegistry.get_spec(name)
-            if spec is not None:
-                tools.append(spec.to_openai())
+        if conversation_id is not None:
+            tools = self._session_harness(
+                conversation_id
+            ).deferred_tools.visible_schemas()
+        else:
+            tools = [spec.to_openai() for spec in ToolRegistry.list_specs()]
 
         # 如果在计划模式下，过滤工具
         if conversation_id and self.is_in_plan_mode(conversation_id):
@@ -612,25 +775,26 @@ class QueryEngine:
             self._update_state(context, ConversationState.THINKING)
             yield {"type": "state_change", "state": "thinking"}
 
-            # 调用 LLM
-            llm_messages = context.to_llm_messages()
-            tools = self._build_tools_schema(conversation_id)
-
             try:
+                # Context control is part of the model-call boundary so its
+                # failures use the same classified result path.
+                llm_messages = await self._prepare_model_messages(
+                    conversation_id, context.to_llm_messages()
+                )
+                tools = self._build_tools_schema(conversation_id)
                 # 使用恢复管理器执行LLM调用
-                if self._recovery_manager:
-                    result = await self._recovery_manager.execute_with_recovery(
-                        self._call_llm_with_recovery,
-                        llm_messages,
-                        tools,
-                        temperature,
-                    )
-                    if result.success:
-                        response = result.response
-                    else:
+                async def complete_model_call():
+                    if self._recovery_manager:
+                        result = await self._recovery_manager.execute_with_recovery(
+                            self._call_llm_with_recovery,
+                            llm_messages,
+                            tools,
+                            temperature,
+                        )
+                        if result.success:
+                            return result.response
                         raise result.final_error or Exception(result.message)
-                else:
-                    response = await self.llm_service.chat_completion(
+                    return await self.llm_service.chat_completion(
                         ChatCompletionRequest(
                             messages=llm_messages,
                             model=self.model,
@@ -640,9 +804,14 @@ class QueryEngine:
                             temperature=temperature,
                         )
                     )
+
+                response = await self._budgeted_model_call(
+                    conversation_id, complete_model_call
+                )
+                self._ack_skill_deliveries(conversation_id)
             except Exception as e:
                 # 使用错误分类提供友好的错误信息
-                error_info = classify_for_user(e)
+                error_info = self._classify_model_error(e)
                 logger.error(f"LLM call failed: {e} (category: {error_info['type']})")
                 self._update_state(context, ConversationState.ERROR)
 
@@ -707,15 +876,6 @@ class QueryEngine:
                 EventType.ASSISTANT_MESSAGE,
                 {"content": response.content or "", "thinking": response.reasoning_content},
             )
-            for tool_call in tool_calls:
-                session_runtime.append_event(
-                    EventType.TOOL_CALL,
-                    {
-                        "toolCallId": tool_call.id,
-                        "name": tool_call.name,
-                        "input": tool_call.arguments,
-                    },
-                )
 
             # 发送助手消息（带工具调用意图）
             yield {
@@ -799,33 +959,23 @@ class QueryEngine:
         """
         async def execute_single(tool_call: ToolCall) -> ToolObservation:
             start_time = asyncio.get_event_loop().time()
-            token = self._cancellations.setdefault(
-                conversation_id or "default",
-                CancellationToken(),
-            )
             mode = (
                 PermissionMode.PLAN
                 if conversation_id and self.is_in_plan_mode(conversation_id)
                 else PermissionMode.DEFAULT
             )
-            runtime_context = RuntimeContext(
-                session_id=conversation_id,
-                workspace_root=self.workspace_root,
+            if conversation_id is None:
+                raise RuntimeError("conversation_id is required for tool execution")
+            harness = self._session_harness(conversation_id)
+            runtime_context = replace(
+                harness.runtime_context,
                 permission_mode=mode,
-                approval_callback=self.approval_callback,
-                cancellation=token,
-                tool_timeout=self.tool_timeout,
-                metadata={
-                    "session_runtime": (
-                        self._session_runtime(conversation_id) if conversation_id else None
-                    ),
-                    "agent_id": None,
-                },
             )
-            execution = await self._tool_runtime.execute(
+            execution = await harness.tool_runtime.execute(
                 tool_call.name,
                 tool_call.arguments,
                 runtime_context,
+                tool_call_id=tool_call.id,
             )
 
             execution_time = asyncio.get_event_loop().time() - start_time
@@ -865,41 +1015,10 @@ class QueryEngine:
         session_runtime: SessionRuntime,
         observations: List[ToolObservation],
     ) -> List[ToolObservation]:
-        """Normalize tool output before it enters transcript or transport state."""
+        """Compatibility boundary; ToolRuntime already normalized and persisted."""
 
-        normalized: List[ToolObservation] = []
-        for observation in observations:
-            result = observation.result
-            if result.success:
-                result = ToolResult.ok(
-                    to_json_value(result.data, "tool result"),
-                    message=result.message,
-                    metadata=result.metadata,
-                )
-            normalized.append(
-                ToolObservation(
-                    tool_call_id=observation.tool_call_id,
-                    name=observation.name,
-                    result=result,
-                    execution_time=observation.execution_time,
-                )
-            )
-
-        for observation in normalized:
-            session_runtime.append_event(
-                EventType.TOOL_RESULT,
-                {
-                    "toolCallId": observation.tool_call_id,
-                    "name": observation.name,
-                    "success": observation.result.success,
-                    "result": (
-                        observation.result.data
-                        if observation.result.success
-                        else str(observation.result.error)
-                    ),
-                },
-            )
-        return normalized
+        del session_runtime
+        return observations
 
     async def chat_stream(
         self,
@@ -935,11 +1054,11 @@ class QueryEngine:
             self._update_state(context, ConversationState.THINKING)
             yield {"type": "state_change", "state": "thinking"}
 
-            # 调用 LLM（流式）
-            llm_messages = context.to_llm_messages()
-            tools = self._build_tools_schema(conversation_id)
-
             try:
+                llm_messages = await self._prepare_model_messages(
+                    conversation_id, context.to_llm_messages()
+                )
+                tools = self._build_tools_schema(conversation_id)
                 # 使用流式API，带错误恢复
                 full_content = ""
                 # 使用字典来累积工具调用，key是index
@@ -972,7 +1091,9 @@ class QueryEngine:
                 # 累积思考内容
                 full_thinking = ""
 
-                async for chunk in stream_iter:
+                async for chunk in self._budgeted_model_stream(
+                    conversation_id, stream_iter
+                ):
                     # 检查是否是工具调用
                     if chunk.tool_calls:
                         # 累积工具调用片段（处理流式delta格式）
@@ -1010,9 +1131,10 @@ class QueryEngine:
                             "is_streaming": True
                         }
 
-                    # 检查是否完成
-                    if chunk.finish_reason:
-                        break
+                    # Consume the terminal usage chunk so model budgets and
+                    # traces settle with actual usage.
+
+                self._ack_skill_deliveries(conversation_id)
 
                 # 处理工具调用
                 if tool_calls_accumulator:
@@ -1031,15 +1153,6 @@ class QueryEngine:
                         EventType.ASSISTANT_MESSAGE,
                         {"content": full_content or "", "thinking": full_thinking or None},
                     )
-                    for tool_call in tool_calls:
-                        session_runtime.append_event(
-                            EventType.TOOL_CALL,
-                            {
-                                "toolCallId": tool_call.id,
-                                "name": tool_call.name,
-                                "input": tool_call.arguments,
-                            },
-                        )
 
                     # 发送工具调用事件
                     yield {
@@ -1126,9 +1239,17 @@ class QueryEngine:
                     return
 
             except Exception as e:
-                logger.error(f"LLM call failed: {e}")
+                error_info = self._classify_model_error(e)
+                logger.error(
+                    "LLM call failed: %s (category: %s)", e, error_info["type"]
+                )
                 self._update_state(context, ConversationState.ERROR)
-                yield {"type": "error", "error": f"LLM call failed: {str(e)}"}
+                yield {
+                    "type": "error",
+                    "error": error_info["message"],
+                    "error_category": error_info["type"],
+                    "action": error_info["action"],
+                }
                 return
 
         # 达到最大迭代次数
@@ -1156,6 +1277,39 @@ class QueryEngine:
             temperature=temperature,
         )
         return await self.llm_service.chat_completion(request)
+
+    async def _budgeted_model_call(self, conversation_id: str, operation):
+        harness = self._session_harness(conversation_id)
+        budget = harness.budget
+        turn = budget.reserve(BudgetKind.MODEL_TURNS, 1)
+        try:
+            async with harness.traces.span("model", self.model or "default") as span:
+                response = await operation()
+                span.set_usage(response.usage or {})
+        except BaseException:
+            turn.release()
+            raise
+        turn.consume()
+        budget.record_model_usage(response.usage or {})
+        return response
+
+    async def _budgeted_model_stream(self, conversation_id: str, stream_iter):
+        harness = self._session_harness(conversation_id)
+        budget = harness.budget
+        turn = budget.reserve(BudgetKind.MODEL_TURNS, 1)
+        usage: dict[str, Any] = {}
+        try:
+            async with harness.traces.span("model", self.model or "default") as span:
+                async for chunk in stream_iter:
+                    if chunk.usage:
+                        usage = dict(chunk.usage)
+                    yield chunk
+                span.set_usage(usage)
+        except BaseException:
+            turn.release()
+            raise
+        turn.consume()
+        budget.record_model_usage(usage)
 
     async def _call_llm_stream_with_recovery(
         self,
@@ -1220,47 +1374,177 @@ class QueryEngine:
         runtime.reject_plan()
         return {"success": True, "state": "planning", "reason": reason}
 
+    async def _spawn_agent_record(
+        self,
+        conversation_id: str,
+        agent_type: str,
+        prompt: str,
+        *,
+        background: bool,
+        description: str | None = None,
+        definition: Any = None,
+        definition_metadata: Mapping[str, Any] | None = None,
+    ) -> AgentRecord:
+        harness = self._session_harness(conversation_id)
+        return await harness.agent_scheduler.spawn(
+            AgentRequest(
+                prompt=prompt,
+                agent_type=agent_type,
+                description=description or prompt,
+                background=background,
+                cwd=self.workspace_root,
+                definition=definition,
+                definition_metadata=definition_metadata or {},
+            ),
+            harness=harness,
+        )
+
+    async def spawn_durable_agent(
+        self,
+        conversation_id: str,
+        agent_type: str,
+        prompt: str,
+        *,
+        background: bool = False,
+        api_surface: str,
+        description: str | None = None,
+        definition: Any = None,
+        api_metadata: Mapping[str, Any] | None = None,
+    ) -> AgentRecord:
+        """Spawn an agent owned by one explicit HTTP compatibility surface."""
+
+        compat = dict(api_metadata or {})
+        compat["surface"] = _canonical_agent_surface(api_surface)
+        return await self._spawn_agent_record(
+            conversation_id,
+            agent_type,
+            prompt,
+            background=background,
+            description=description,
+            definition=definition,
+            definition_metadata={"api_compat": compat},
+        )
+
+    def list_durable_agents(
+        self, *, api_surface: str | None = None
+    ) -> list[AgentRecord]:
+        """List durable agents, optionally constrained to an owning API surface."""
+
+        return [
+            record
+            for record in self._agent_repository.list_all()
+            if _agent_belongs_to_surface(record, api_surface)
+        ]
+
+    def get_durable_agent(
+        self,
+        agent_id: str,
+        *,
+        api_surface: str | None = None,
+    ) -> AgentRecord | None:
+        """Read one durable agent without requiring an in-process scheduler cache."""
+
+        record = self._agent_repository.get(agent_id)
+        if record is None or not _agent_belongs_to_surface(record, api_surface):
+            return None
+        return record
+
+    async def stop_durable_agent(
+        self,
+        agent_id: str,
+        *,
+        api_surface: str | None = None,
+    ) -> AgentRecord | None:
+        """Route a durable stop through the scheduler owning the agent's root."""
+
+        record = self.get_durable_agent(agent_id, api_surface=api_surface)
+        if record is None:
+            return None
+        if record.status not in {AgentStatus.PENDING, AgentStatus.RUNNING}:
+            return record
+        store = self._harness_factory.session_runtime_factory.store
+        if store.states.load_session(record.root_session_id) is None:
+            try:
+                return self._agent_repository.transition(
+                    record.agent_id,
+                    AgentStatus.INTERRUPTED,
+                    record.revision,
+                    termination_reason=AgentTerminationReason.INTERRUPTED,
+                )
+            except RuntimeRecordRevisionConflict:
+                current = self._agent_repository.get(record.agent_id)
+                if current is None:
+                    return None
+                if current.status in {AgentStatus.PENDING, AgentStatus.RUNNING}:
+                    raise
+                return current
+        harness = self._session_harnesses.get(record.root_session_id)
+        if harness is None:
+            harness = self._harness_factory.resume_observer(
+                record.root_session_id, tool_timeout=self.tool_timeout
+            )
+            self._session_harnesses[record.root_session_id] = harness
+        scheduler = harness.observed_agent_scheduler
+        return await scheduler.stop(agent_id)
+
     async def spawn_agent(
         self,
         conversation_id: str,
         agent_type: str,
         prompt: str,
-        is_async: bool = False
+        is_async: bool = False,
     ) -> str:
-        """
-        在对话中创建 Agent
+        """Spawn an internal conversation agent without HTTP ownership metadata."""
 
-        Args:
-            conversation_id: 对话ID
-            agent_type: Agent 类型
-            prompt: 任务描述
-            is_async: 是否异步执行
-
-        Returns:
-            Agent ID
-        """
-        agent_id = await self._agent_manager.spawn_agent(
-            agent_type=agent_type,
-            prompt=prompt,
-            parent_session_id=conversation_id,
-            config=AgentExecutionConfig(
-                is_async=is_async,
-                workspace_root=self.workspace_root,
-                approval_callback=self.approval_callback,
-                tool_timeout=self.tool_timeout,
-                session_runtime=self._session_runtime(conversation_id),
-            ),
-            is_async=is_async,
+        record = await self._spawn_agent_record(
+            conversation_id,
+            agent_type,
+            prompt,
+            background=is_async,
         )
-        return agent_id
+        return record.agent_id
+
+    def _find_agent_scheduler(self, agent_id: str):
+        record = self.get_durable_agent(agent_id)
+        if record is None:
+            return None
+        harness = self._session_harnesses.get(record.root_session_id)
+        if harness is None:
+            harness = self._harness_factory.resume_observer(
+                record.root_session_id, tool_timeout=self.tool_timeout
+            )
+            self._session_harnesses[record.root_session_id] = harness
+        return harness.observed_agent_scheduler
 
     def get_agent_status(self, agent_id: str) -> Optional[Dict]:
         """获取 Agent 状态"""
-        return self._agent_manager.get_agent_status(agent_id)
+        record = self.get_durable_agent(agent_id)
+        if record is None:
+            return None
+        output = record.output if isinstance(record.output, dict) else {}
+        return {
+            "agent_id": record.agent_id,
+            "agent_type": record.agent_type,
+            "status": record.status.value,
+            "tool_use_count": int(output.get("tool_count", 0)),
+            "started_at": record.started_at.isoformat() if record.started_at else None,
+            "completed_at": record.finished_at.isoformat() if record.finished_at else None,
+        }
 
     def abort_agent(self, agent_id: str):
         """中止 Agent"""
-        self._agent_manager.abort_agent(agent_id)
+        if self.get_durable_agent(agent_id) is None:
+            return None
+        task = asyncio.create_task(self.stop_durable_agent(agent_id))
+
+        def consume(completed: asyncio.Task[Any]) -> None:
+            try:
+                completed.result()
+            except BaseException:
+                logger.exception("Agent abort failed", exc_info=True)
+
+        task.add_done_callback(consume)
+        return task
 
     def clear_conversation(self, conversation_id: str):
         """清空对话历史"""
@@ -1268,10 +1552,12 @@ class QueryEngine:
         if context:
             context.messages.clear()
             context.state = ConversationState.IDLE
-            token = self._cancellations.get(conversation_id)
-            if token:
-                token.cancel()
-            self._cancellations[conversation_id] = CancellationToken()
+            harness = self._session_harnesses.get(conversation_id)
+            if harness is not None:
+                harness.runtime_context.cancellation.cancel()
+                self._session_harnesses[conversation_id] = self._harness_factory.resume(
+                    conversation_id, tool_timeout=self.tool_timeout
+                )
 
 
 # 全局 QueryEngine 实例

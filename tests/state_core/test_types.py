@@ -220,12 +220,24 @@ def test_session_decoder_requires_the_complete_persisted_shape():
         "interruptedAt",
     }
 
-    assert set(wire) == required_fields
+    assert set(wire) == required_fields | {"permissionScopeSnapshots"}
     for field_name in required_fields:
         truncated = dict(wire)
         del truncated[field_name]
         with pytest.raises(KeyError, match=field_name):
             SessionState.from_dict(truncated)
+
+
+def test_session_decoder_defaults_permission_scope_snapshots_for_legacy_wire():
+    wire = SessionState.new("legacy-session").to_dict()
+    del wire["permissionScopeSnapshots"]
+
+    decoded = SessionState.from_dict(wire)
+
+    assert decoded.to_dict()["permissionScopeSnapshots"] == {
+        "session": [],
+        "cliArg": [],
+    }
 
 
 def test_session_decode_is_deterministic_and_validates_cursors():

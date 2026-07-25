@@ -3,7 +3,7 @@ Team Router - API endpoints for team management
 """
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import Optional
 
 from models import get_db
 from schemas import APIResponse

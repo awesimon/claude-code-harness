@@ -11,7 +11,7 @@ This project implements a Python-based alternative to Claude Code, featuring a F
 ### Core Capabilities
 
 - **Advanced Tool System**: 37+ built-in tools including file operations (read/write/edit), code search (Glob/Grep), Bash command execution, web search, and more
-- **Agent Management**: Create and manage AI agents with specific capabilities, task assignment, and parallel execution
+- **Durable Agent Scheduling**: Spawn foreground or background subagents with persisted lifecycle, cancellation, limits, and restart reconciliation
 - **Multi-Provider LLM Support**: OpenAI, Anthropic, DeepSeek, GLM, MiniMax, and Moonshot AI (Kimi)
 - **Streaming Responses**: Server-Sent Events (SSE) for real-time streaming chat completions
 - **Plan Mode**: Structured implementation planning with approval workflow
@@ -26,6 +26,55 @@ TodoWrite compatibility data, transcript events, and agent lifecycle state.
 Task V2 and TodoWrite are mutually exclusive per session. Restart recovery loads
 the latest valid state, marks active work as interrupted, and never replays a
 mutating tool call.
+
+### Durable Harness Runtime
+
+`harness.SessionHarnessFactory` is the composition root used by `QueryEngine`,
+subagents, tools, and compatibility APIs. A root harness owns one durable
+session runtime, while child harnesses inherit the root store, permissions,
+budgets, MCP definitions, skills, hooks, and effective working directory with
+agent-scoped cancellation and activation state.
+
+- **Agents**: `Agent` supports foreground and background execution.
+  `TaskOutput` waits for or inspects durable results, and `TaskStop` requests
+  cancellation. Parent/child ownership, concurrency limits, usage, errors, and
+  terminal reasons are persisted before callers are released.
+- **Task V2 and TodoWrite**: Task V2 provides durable dependency, ownership,
+  claim, update, and completion semantics. TodoWrite remains available as a
+  compatibility mode, but the two modes cannot mutate the same session.
+- **Plan mode**: Enter, draft, submit, approve, reject, and exit transitions are
+  state-core events. Plan files are durable projections; approval state is not
+  inferred from files alone.
+- **Skills and hooks**: Skills are indexed progressively, resolved inside
+  configured roots, and snapshotted for child agents. Hooks run through the
+  controlled tool boundary with matching, timeouts, cancellation, bounded
+  output, and durable events.
+- **Budgets and tracing**: Model, tool, hook, MCP, and child-agent work reserve
+  hierarchical budgets. Durable spans record lifecycle and safe usage/error
+  summaries without storing credentials.
+- **Context control**: Streaming and non-streaming model turns share the same
+  compaction controller. Compaction writes a validated boundary and summary
+  while preserving the raw append-only transcript.
+- **MCP**: Session-scoped stdio and streamable HTTP clients perform real tool,
+  resource, and prompt discovery. Child definitions are additive, transports
+  honor timeout/cancellation, and disconnect removes live schemas.
+- **Deferred tools**: Deferred schemas are hidden until `ToolSearch` activates
+  them. `select:<tool-name>` performs exact activation; keyword discovery and
+  activation history are scoped per root or child and survive resume.
+- **Worktrees**: Harness-owned worktrees use explicit `git -C` and effective
+  cwd routing. The runtime never changes process-global cwd, validates durable
+  ownership on resume, and fails closed when cleanup would discard unapproved
+  changes.
+
+Recovery reconstructs context from snapshots, events, metadata, plan files,
+and durable runtime records. In-flight agents become interrupted when no live
+owner exists. External model calls, tool calls, hooks, MCP calls, and filesystem
+mutations are never replayed automatically after a restart.
+
+The HTTP conversation, task, plan, agent, and streaming endpoints are stateless
+adapters over this runtime. Legacy SQL rows are read only by the explicit
+migration path; new mutations do not dual-write legacy tables. Existing public
+IDs and response fields remain available through compatibility projections.
 
 ### Production-Ready Features
 
@@ -182,7 +231,18 @@ The application will be available at:
 ```
 python_api/
 ├── main.py                 # FastAPI application entry point
-├── query_engine.py         # Core conversation engine with error recovery
+├── query_engine.py         # Harness-driven model and tool loop
+├── harness/                # Session composition and controlled execution
+│   ├── session.py          # SessionHarness and factory
+│   ├── agents.py           # Durable AgentScheduler
+│   ├── runtime.py          # Ordered tool pipeline
+│   ├── context_control.py  # Compaction and recovery boundaries
+│   ├── budget.py           # Hierarchical reservations and accounting
+│   ├── tracing.py          # Durable spans
+│   ├── mcp.py              # Real MCP transport lifecycle
+│   ├── worktrees.py        # Session-owned worktree lifecycle
+│   └── deferred_tools.py   # ToolSearch activation state
+├── state_core/             # Authoritative events, snapshots, and repositories
 ├── CHANGELOG.md           # Version history and changes
 ├── config/                # Configuration management
 │   └── settings.py
@@ -195,9 +255,8 @@ python_api/
 │   ├── file_tools.py
 │   ├── search_tools.py
 │   └── ...
-├── agent/                 # Agent management system
-│   ├── __init__.py
-│   └── agent_manager.py
+├── agents/                # Agent definitions and one-child execution loop
+├── plan/                  # Durable plan tools and compatibility adapters
 ├── services/              # Core services
 │   ├── llm_service.py     # LLM provider abstraction
 │   ├── config_service.py  # Configuration service
@@ -266,24 +325,19 @@ Tokens         + Retry        Fallback
 
 ## Testing
 
-Run the test suite:
+Run the verification gates from the repository root:
 
 ```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=services --cov-report=html
-
-# Run specific test file
-pytest tests/test_context_compaction.py -v
-pytest tests/test_error_recovery.py -v
+.venv/bin/pytest -q
+.venv/bin/python -m compileall -q state_core harness agents plan services tools query_engine.py tests
+.venv/bin/ruff check --select E9,F state_core harness agents plan services tools query_engine.py tests
+git diff --check
 ```
 
-Current test coverage:
-- Context Compaction: 42 tests ✅
-- Error Recovery: 36 tests ✅
-- Total: 78 tests passing
+Focused suites cover durable recovery, foreground/background agents, Task V2
+and Todo compatibility, plan approval, hooks and skills, budget races, context
+compaction, real stdio/HTTP MCP servers, worktree cleanup, deferred activation,
+and HTTP mutation recovery through newly constructed factories.
 
 ## Environment Variables
 

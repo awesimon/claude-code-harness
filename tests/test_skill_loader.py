@@ -5,7 +5,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 import tempfile
 from pathlib import Path
-import asyncio
 
 # 直接导入模块，避免 services/__init__.py 的依赖问题
 import importlib.util
@@ -15,7 +14,6 @@ sys.modules["skill_loader"] = skill_loader_module
 spec.loader.exec_module(skill_loader_module)
 SkillLoader = skill_loader_module.SkillLoader
 
-from models.skill import SkillDefinition
 
 
 @pytest.fixture
@@ -138,3 +136,190 @@ def test_is_valid_skill_name(skill_loader):
     assert skill_loader._is_valid_skill_name("invalid--skill") is False
     assert skill_loader._is_valid_skill_name("Invalid") is False  # 大写
     assert skill_loader._is_valid_skill_name("") is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malicious_name", ["../outside", ".", "/absolute-target"])
+async def test_uninstall_rejects_paths_outside_the_skills_root(
+    tmp_path: Path,
+    malicious_name: str,
+):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    if malicious_name == ".":
+        protected_dir = skills_dir
+    elif malicious_name.startswith("/"):
+        protected_dir = tmp_path / "absolute-target"
+        malicious_name = str(protected_dir)
+    else:
+        protected_dir = tmp_path / "outside"
+    protected_dir.mkdir(exist_ok=True)
+    marker = protected_dir / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    loader = SkillLoader(str(skills_dir))
+
+    with pytest.raises(ValueError, match="Invalid skill name"):
+        await loader.uninstall_skill(malicious_name)
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.asyncio
+async def test_uninstall_rejects_canonical_path_outside_skills_root(
+    tmp_path: Path,
+):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    (skills_dir / "linked-skill").symlink_to(outside, target_is_directory=True)
+    loader = SkillLoader(str(skills_dir))
+
+    with pytest.raises(ValueError, match="escapes skills directory"):
+        await loader.uninstall_skill("linked-skill")
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.asyncio
+async def test_github_install_rejects_frontmatter_name_outside_skills_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    skills_dir = tmp_path / "skills"
+    outside = tmp_path / "outside"
+    loader = SkillLoader(str(skills_dir))
+    skill_document = """---
+name: ../outside
+description: Must stay inside the skills root
+---
+
+# Unsafe skill
+"""
+
+    async def fake_download(url: str):
+        return skill_document if url.endswith("/SKILL.md") else None
+
+    monkeypatch.setattr(loader, "_download_file", fake_download)
+
+    with pytest.raises(ValueError, match="Invalid SKILL.md content"):
+        await loader.install_skill(
+            "https://github.com/example/repository/tree/main/reviewing"
+        )
+
+    assert not outside.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["install", "uninstall", "get", "load_all"])
+async def test_operations_reject_replaced_skills_root(
+    tmp_path: Path,
+    operation: str,
+):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    loader = SkillLoader(str(skills_dir))
+    trusted_root = tmp_path / "trusted-root"
+    skills_dir.rename(trusted_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external_skill = outside / "visible-skill"
+    external_skill.mkdir()
+    marker = external_skill / "SKILL.md"
+    marker.write_text(
+        "---\nname: visible-skill\ndescription: external\n---\n\nExternal",
+        encoding="utf-8",
+    )
+    skills_dir.symlink_to(outside, target_is_directory=True)
+    source = tmp_path / "new-skill"
+    source.mkdir()
+    (source / "SKILL.md").write_text(
+        "---\nname: new-skill\ndescription: local\n---\n\nLocal",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="skills root changed"):
+        if operation == "install":
+            await loader.install_skill(str(source))
+        elif operation == "uninstall":
+            await loader.uninstall_skill("visible-skill")
+        elif operation == "get":
+            loader.get_skill_path("visible-skill")
+        else:
+            await loader.load_all_skills()
+
+    assert marker.exists()
+    assert not (outside / "new-skill").exists()
+    assert not (trusted_root / "new-skill").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_source", ["frontmatter", "name-mismatch", "resource-link"])
+async def test_local_install_validates_complete_skill_before_publishing(
+    tmp_path: Path,
+    invalid_source: str,
+):
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    target_name = "reviewing"
+    if invalid_source == "frontmatter":
+        document = "---\nname: reviewing\ndescription: [invalid\n---\n\nReview"
+    elif invalid_source == "name-mismatch":
+        document = "---\nname: other-skill\ndescription: mismatch\n---\n\nReview"
+    else:
+        document = "---\nname: reviewing\ndescription: linked\n---\n\nReview"
+    (source / "SKILL.md").write_text(document, encoding="utf-8")
+    if invalid_source == "resource-link":
+        outside = tmp_path / "secret.txt"
+        outside.write_text("secret", encoding="utf-8")
+        references = source / "references"
+        references.mkdir()
+        (references / "escape.txt").symlink_to(outside)
+    loader = SkillLoader(str(skills_dir))
+
+    with pytest.raises(ValueError):
+        await loader.install_skill(str(source), target_name)
+
+    assert not (skills_dir / target_name).exists()
+
+
+def _write_external_skill_document(path: Path, name: str) -> None:
+    path.write_text(
+        f"---\nname: {name}\ndescription: external content\n---\n\nExternal",
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_skill_rejects_skill_document_symlink_outside_root(
+    tmp_path: Path,
+):
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "linked-skill"
+    skill_dir.mkdir(parents=True)
+    outside_document = tmp_path / "outside-skill.md"
+    _write_external_skill_document(outside_document, "linked-skill")
+    (skill_dir / "SKILL.md").symlink_to(outside_document)
+    loader = SkillLoader(str(skills_dir))
+
+    with pytest.raises(ValueError, match="SKILL.md escapes skill directory"):
+        await loader.load_skill_from_dir(skill_dir)
+
+
+@pytest.mark.asyncio
+async def test_load_all_skips_skill_document_symlink_outside_root(
+    tmp_path: Path,
+):
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "linked-skill"
+    skill_dir.mkdir(parents=True)
+    outside_document = tmp_path / "outside-skill.md"
+    _write_external_skill_document(outside_document, "linked-skill")
+    (skill_dir / "SKILL.md").symlink_to(outside_document)
+    loader = SkillLoader(str(skills_dir))
+
+    assert await loader.load_all_skills() == {}

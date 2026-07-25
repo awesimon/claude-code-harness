@@ -548,3 +548,21 @@ def compact_messages(
     """
     compactor = ContextCompactor(max_tokens=max_tokens, strategy=strategy)
     return compactor.compact(messages)
+
+
+def micro_compact_messages(
+    messages: List[Any],
+    *,
+    target_tokens: int,
+    compactor: Optional[ContextCompactor] = None,
+) -> CompressionResult:
+    """Compact a model-facing copy while leaving source messages untouched."""
+
+    if (
+        isinstance(target_tokens, bool)
+        or not isinstance(target_tokens, int)
+        or target_tokens <= 0
+    ):
+        raise ValueError("target_tokens must be a positive integer")
+    projector = compactor or ContextCompactor(max_tokens=target_tokens + 1)
+    return projector.compact(list(messages), target_tokens=target_tokens)

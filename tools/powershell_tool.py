@@ -7,9 +7,9 @@ import os
 import subprocess
 import platform
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional
 
-from .base import Tool, ToolResult, ToolError
+from .base import Tool, ToolExecutionError, ToolResult
 
 
 @dataclass
@@ -69,6 +69,9 @@ class PowerShellTool(Tool):
     def __init__(self):
         self.is_windows = platform.system() == "Windows"
 
+    async def execute(self, input_data: PowerShellInput) -> ToolResult:
+        return await self.run(input_data)
+
     async def run(self, input_data: PowerShellInput) -> ToolResult:
         """
         执行PowerShell命令
@@ -83,9 +86,10 @@ class PowerShellTool(Tool):
         if not self.is_windows:
             return ToolResult(
                 success=False,
-                error=ToolError(
+                data=None,
+                error=ToolExecutionError(
                     message="PowerShellTool 仅在Windows系统上可用。请使用 BashTool 执行命令。",
-                    tool_name=self.name
+                    details={"tool_name": self.name},
                 )
             )
 
@@ -137,18 +141,20 @@ class PowerShellTool(Tool):
         except subprocess.TimeoutExpired:
             return ToolResult(
                 success=False,
-                error=ToolError(
+                data=None,
+                error=ToolExecutionError(
                     message=f"命令执行超时（超过 {input_data.timeout} 秒）",
-                    tool_name=self.name
+                    details={"tool_name": self.name},
                 ),
                 metadata={"timeout": input_data.timeout}
             )
         except Exception as e:
             return ToolResult(
                 success=False,
-                error=ToolError(
+                data=None,
+                error=ToolExecutionError(
                     message=f"执行PowerShell命令失败: {str(e)}",
-                    tool_name=self.name
+                    details={"tool_name": self.name},
                 )
             )
 

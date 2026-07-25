@@ -1,123 +1,63 @@
-"""
-Skill 管理工具
-提供 skill 安装、卸载、列表功能
-"""
+"""Compatibility exports for session-scoped Agent Skill tools."""
 
-from typing import Optional
-from pydantic import BaseModel, Field
+from __future__ import annotations
 
-from .base import Tool, ToolResult, register_tool
+from dataclasses import dataclass
 
+from .base import Tool, ToolResult
+from .skill_tool_v2 import (
+    SkillInstallInput,
+    SkillInstallToolV2,
+    SkillListInput,
+    SkillListToolV2,
+    SkillUninstallInput,
+    SkillUninstallToolV2,
+)
 
-class SkillInstallInput(BaseModel):
-    """Skill 安装输入"""
-    source: str = Field(..., description="Skill 来源（Git URL 或本地路径）")
-    name: Optional[str] = Field(None, description="Skill 名称（可选，默认从 URL/路径提取）")
-
-
-@register_tool
-class SkillInstallTool(Tool):
-    """安装 Skill"""
-
-    name = "skill_install"
-    description = """从 Git 仓库或本地路径安装 Skill，例如：
-- 从 Git: source="https://github.com/user/my-skill.git"
-- 从本地: source="/path/to/skill"
-安装后会自动注册 skill 中的工具
-使用场景：用户说"安装 skill"、"添加技能"、"从 github 安装"等"""
-    input_model = SkillInstallInput
-
-    async def execute(self, input_data: SkillInstallInput) -> ToolResult:
-        """执行安装"""
-        # 延迟导入避免循环
-        from services.skill_manager import skill_manager
-
-        source = input_data.source
-
-        # 判断是 Git URL 还是本地路径
-        if source.startswith("http://") or source.startswith("https://") or source.startswith("git@"):
-            # Git URL
-            return skill_manager.install_from_git(source, input_data.name)
-        else:
-            # 本地路径
-            return skill_manager.install_from_local(source, input_data.name)
+SkillInstallTool = SkillInstallToolV2
+SkillListTool = SkillListToolV2
+SkillUninstallTool = SkillUninstallToolV2
 
 
-class SkillUninstallInput(BaseModel):
-    """Skill 卸载输入"""
-    name: str = Field(..., description="要卸载的 Skill 名称")
+@dataclass
+class SkillEnableInput:
+    name: str
 
 
-@register_tool
-class SkillUninstallTool(Tool):
-    """卸载 Skill"""
-
-    name = "skill_uninstall"
-    description = """卸载已安装的 Skill
-使用场景：用户说"卸载 skill"、"删除技能"、"移除 skill"等"""
-    input_model = SkillUninstallInput
-
-    async def execute(self, input_data: SkillUninstallInput) -> ToolResult:
-        """执行卸载"""
-        from services.skill_manager import skill_manager
-        return skill_manager.uninstall(input_data.name)
+@dataclass
+class SkillDisableInput:
+    name: str
 
 
-class SkillListInput(BaseModel):
-    """Skill 列表输入"""
-    pass
+class _ImmutableSkillStateTool(Tool):
+    async def execute(self, input_data) -> ToolResult:
+        return ToolResult.fail(
+            "Agent Skill snapshots are immutable; install or uninstall the skill "
+            "for a new session scope"
+        )
 
 
-@register_tool
-class SkillListTool(Tool):
-    """列出所有已安装的 Skills"""
-
-    name = "skill_list"
-    description = """列出所有已安装的 Skills 及其信息
-使用场景：用户说"列出 skills"、"查看已安装的技能"、"有哪些 skill"等"""
-    input_model = SkillListInput
-
-    async def execute(self, input_data: SkillListInput) -> ToolResult:
-        """执行列表"""
-        from services.skill_manager import skill_manager
-        return skill_manager.list_skills()
-
-
-class SkillEnableInput(BaseModel):
-    """Skill 启用输入"""
-    name: str = Field(..., description="要启用的 Skill 名称")
-
-
-@register_tool
-class SkillEnableTool(Tool):
-    """启用 Skill"""
-
+class SkillEnableTool(_ImmutableSkillStateTool):
     name = "skill_enable"
-    description = """启用已禁用的 Skill
-使用场景：用户说"启用 skill"、"开启技能"等"""
-    input_model = SkillEnableInput
-
-    async def execute(self, input_data: SkillEnableInput) -> ToolResult:
-        """执行启用"""
-        from services.skill_manager import skill_manager
-        return skill_manager.enable_skill(input_data.name)
+    description = "Compatibility adapter for immutable Agent Skill snapshots"
+    input_type = SkillEnableInput
 
 
-class SkillDisableInput(BaseModel):
-    """Skill 禁用输入"""
-    name: str = Field(..., description="要禁用的 Skill 名称")
-
-
-@register_tool
-class SkillDisableTool(Tool):
-    """禁用 Skill"""
-
+class SkillDisableTool(_ImmutableSkillStateTool):
     name = "skill_disable"
-    description = """禁用已安装的 Skill（不会删除，只是暂时停用）
-使用场景：用户说"禁用 skill"、"关闭技能"等"""
-    input_model = SkillDisableInput
+    description = "Compatibility adapter for immutable Agent Skill snapshots"
+    input_type = SkillDisableInput
 
-    async def execute(self, input_data: SkillDisableInput) -> ToolResult:
-        """执行禁用"""
-        from services.skill_manager import skill_manager
-        return skill_manager.disable_skill(input_data.name)
+
+__all__ = [
+    "SkillInstallInput",
+    "SkillInstallTool",
+    "SkillListInput",
+    "SkillListTool",
+    "SkillUninstallInput",
+    "SkillUninstallTool",
+    "SkillEnableInput",
+    "SkillEnableTool",
+    "SkillDisableInput",
+    "SkillDisableTool",
+]

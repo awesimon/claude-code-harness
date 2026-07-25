@@ -2,13 +2,10 @@
 Fork Subagent 机制
 实现 Agent Fork 功能，对齐 Claude Code 的 forkSubagent.ts
 """
-import logging
+import asyncio
+import uuid
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-
-from agents.types import AgentContext
-
-logger = logging.getLogger(__name__)
 
 
 # Fork 子Agent的标记
@@ -167,14 +164,27 @@ def is_in_fork_child(messages: List[Dict[str, Any]]) -> bool:
 
 
 class ForkSubagentManager:
-    """
-    Fork Subagent 管理器
+    """Compatibility adapter over the durable AgentScheduler."""
 
-    管理 Fork 子Agent的生命周期
-    """
+    def __init__(self, scheduler=None):
+        self.scheduler = scheduler
 
-    def __init__(self):
-        self._forks: Dict[str, Dict[str, Any]] = {}
+    def _require_scheduler(self):
+        if self.scheduler is None:
+            raise RuntimeError(
+                "ForkSubagentManager requires an explicit AgentScheduler"
+            )
+        return self.scheduler
+
+    def _status_or_none(self, fork_id: str):
+        if self.scheduler is None:
+            return None
+        from harness.agents import AgentNotFound
+
+        try:
+            return self.scheduler.status(fork_id)
+        except AgentNotFound:
+            return None
 
     async def create_fork(
         self,
@@ -197,56 +207,84 @@ class ForkSubagentManager:
         Returns:
             Fork ID
         """
-        import uuid
-
-        fork_id = f"fork-{uuid.uuid4().hex[:8]}"
-
-        # 构建 Fork 消息
         forked_messages = build_forked_messages(
             directive=directive,
             assistant_message=assistant_message,
             parent_messages=parent_messages,
         )
+        from agents.types import AgentIsolationMode, AgentRequest
 
-        # 存储 Fork 信息
-        self._forks[fork_id] = {
-            "fork_id": fork_id,
-            "parent_session_id": parent_session_id,
-            "directive": directive,
-            "messages": forked_messages,
-            "isolate_worktree": isolate_worktree,
-            "status": "created",
-        }
-
-        logger.info(f"Created fork {fork_id} from parent {parent_session_id}")
-
-        return fork_id
+        record = await self._require_scheduler().spawn(
+            AgentRequest(
+                prompt=directive,
+                description=directive,
+                agent_type="general-purpose",
+                background=True,
+                initial_messages=[*parent_messages, *forked_messages],
+                isolation=(
+                    AgentIsolationMode.WORKTREE if isolate_worktree else None
+                ),
+                definition_metadata={
+                    "fork": {
+                        "parent_session_id": parent_session_id,
+                    }
+                },
+            )
+        )
+        return record.agent_id
 
     def get_fork(self, fork_id: str) -> Optional[Dict[str, Any]]:
-        """获取 Fork 信息"""
-        return self._forks.get(fork_id)
+        record = self._status_or_none(fork_id)
+        if record is None:
+            return None
+        metadata = record.definition_snapshot.get("metadata", {})
+        fork = metadata.get("fork", {}) if isinstance(metadata, dict) else {}
+        isolation = record.definition_snapshot.get("isolation")
+        return {
+            "fork_id": record.agent_id,
+            "parent_session_id": fork.get("parent_session_id"),
+            "messages": record.definition_snapshot.get(
+                "initial_messages", fork.get("messages", [])
+            ),
+            "isolate_worktree": (
+                isolation == "worktree"
+                if isolation is not None
+                else bool(fork.get("isolate_worktree"))
+            ),
+            "status": record.status.value,
+        }
 
     def update_fork_status(self, fork_id: str, status: str):
-        """更新 Fork 状态"""
-        if fork_id in self._forks:
-            self._forks[fork_id]["status"] = status
+        record = self._status_or_none(fork_id)
+        if record is None or record.status.value == status:
+            return None
+        if status in {"cancelled", "stopped", "killed"}:
+            return asyncio.create_task(self._require_scheduler().stop(fork_id))
+        raise RuntimeError("Fork status is owned by AgentScheduler lifecycle transitions")
 
     def cleanup_fork(self, fork_id: str):
-        """清理 Fork"""
-        if fork_id in self._forks:
-            del self._forks[fork_id]
+        """Retain durable history and cancel a live fork when requested."""
+        record = self._status_or_none(fork_id)
+        if record is None or record.status.value in {
+            "completed",
+            "failed",
+            "cancelled",
+            "timed_out",
+            "interrupted",
+            "orphaned",
+        }:
+            return None
+        return asyncio.create_task(self._require_scheduler().stop(fork_id))
 
 
-# 全局 Fork 管理器
-_fork_manager: Optional[ForkSubagentManager] = None
+_fork_manager: ForkSubagentManager | None = None
 
 
-def get_fork_manager() -> ForkSubagentManager:
-    """获取全局 Fork 管理器"""
+def get_fork_manager(scheduler=None) -> ForkSubagentManager:
+    """Return a durable adapter, retaining the legacy no-argument singleton."""
+    if scheduler is not None:
+        return ForkSubagentManager(scheduler)
     global _fork_manager
     if _fork_manager is None:
         _fork_manager = ForkSubagentManager()
     return _fork_manager
-
-
-import uuid

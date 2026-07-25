@@ -49,6 +49,22 @@ class EventType(str, Enum):
     AGENT_LIFECYCLE = "agent_lifecycle"
     CHECKPOINT = "checkpoint"
     EXECUTION_INTERRUPTED = "execution_interrupted"
+    COMPACTION_STARTED = "compaction_started"
+    COMPACTION_BOUNDARY = "compaction_boundary"
+    COMPACTION_FAILED = "compaction_failed"
+    MCP_CONNECTED = "mcp_connected"
+    MCP_DISCONNECTED = "mcp_disconnected"
+    MCP_CALL = "mcp_call"
+    WORKTREE_CREATED = "worktree_created"
+    WORKTREE_RESTORED = "worktree_restored"
+    WORKTREE_KEPT = "worktree_kept"
+    WORKTREE_REMOVED = "worktree_removed"
+    WORKTREE_ORPHANED = "worktree_orphaned"
+    WORKTREE_FAILED = "worktree_failed"
+    TOOL_ACTIVATED = "tool_activated"
+    SKILL_DELIVERY_ATTEMPT = "skill_delivery_attempt"
+    SKILL_DELIVERY = "skill_delivery"
+    PERMISSION_SCOPE_SNAPSHOT = "permission_scope_snapshot"
 
 
 class StateCoreError(Exception):
@@ -122,6 +138,66 @@ def _require_json_object(value: Any, path: str) -> dict[str, Any]:
     if not isinstance(copied, dict):
         raise TypeError(f"{path} must be a JSON object")
     return copied
+
+
+def _validated_permission_scope_snapshots(value: Any) -> Mapping[str, Any]:
+    wire = _require_mapping(value, "permissionScopeSnapshots")
+    required = {"session", "cliArg"}
+    if set(wire) != required:
+        raise ValueError("permissionScopeSnapshots must contain exactly session and cliArg")
+    snapshots: dict[str, list[dict[str, Any]]] = {"session": [], "cliArg": []}
+    for scope in ("session", "cliArg"):
+        raw_rules = wire[scope]
+        if not isinstance(raw_rules, (list, tuple)):
+            raise TypeError(f"permissionScopeSnapshots.{scope} must be a sequence")
+        for index, raw_rule in enumerate(raw_rules):
+            path = f"permissionScopeSnapshots.{scope}[{index}]"
+            rule = _require_json_object(raw_rule, path)
+            kind = _require_str(rule.get("kind"), f"{path}.kind")
+            expected_fields: set[str]
+            if kind == "rule":
+                expected_fields = {"kind", "behavior", "rule"}
+                behavior = _require_str(rule.get("behavior"), f"{path}.behavior")
+                if behavior not in {"allow", "deny", "ask"}:
+                    raise ValueError(f"{path}.behavior must be allow, deny, or ask")
+                if not _require_str(rule.get("rule"), f"{path}.rule"):
+                    raise ValueError(f"{path}.rule must not be empty")
+            elif kind == "directory":
+                expected_fields = {"kind", "directory"}
+                if not _require_str(rule.get("directory"), f"{path}.directory"):
+                    raise ValueError(f"{path}.directory must not be empty")
+            elif kind == "mode":
+                expected_fields = {"kind", "mode"}
+                if not _require_str(rule.get("mode"), f"{path}.mode"):
+                    raise ValueError(f"{path}.mode must not be empty")
+            else:
+                raise ValueError(f"{path}.kind must be rule, directory, or mode")
+            if set(rule) != expected_fields:
+                raise ValueError(f"{path} fields must match {kind!r} schema exactly")
+            snapshots[scope].append(rule)
+
+    # Import lazily to avoid a module cycle: runtime primitives depend on StateCoreError.
+    from .runtime_primitives import (
+        MAX_PERMISSION_SCOPE_SNAPSHOT_BYTES,
+        _restricted_json_object,
+    )
+
+    return _restricted_json_object(
+        snapshots,
+        "permissionScopeSnapshots",
+        max_bytes=MAX_PERMISSION_SCOPE_SNAPSHOT_BYTES,
+    )
+
+
+def _permission_scope_snapshots(value: Any) -> dict[str, list[dict[str, Any]]]:
+    frozen = _validated_permission_scope_snapshots(value)
+    copied = _copy_json(frozen, "permissionScopeSnapshots")
+    assert isinstance(copied, dict)
+    return cast(dict[str, list[dict[str, Any]]], copied)
+
+
+def _empty_permission_scope_snapshots() -> Mapping[str, Any]:
+    return _validated_permission_scope_snapshots({"session": [], "cliArg": []})
 
 
 def _require_str(value: Any, path: str) -> str:
@@ -449,6 +525,9 @@ class SessionState:
     revision: int = 0
     permission_mode: str = "default"
     pre_plan_permission_mode: str | None = None
+    permission_scope_snapshots: Mapping[str, Any] = field(
+        default_factory=_empty_permission_scope_snapshots
+    )
     plan: Plan = field(default_factory=Plan)
     task_list_id: str | None = None
     task_mode: TaskMode = TaskMode.TASK_V2
@@ -474,6 +553,9 @@ class SessionState:
             "prePlanPermissionMode": _require_optional_str(
                 self.pre_plan_permission_mode, "prePlanPermissionMode"
             ),
+            "permissionScopeSnapshots": _permission_scope_snapshots(
+                self.permission_scope_snapshots
+            ),
             "plan": self.plan.to_dict(),
             "taskListId": _require_optional_str(self.task_list_id, "taskListId"),
             "taskMode": self.task_mode.value,
@@ -496,6 +578,12 @@ class SessionState:
             permission_mode=_require_str(wire["permissionMode"], "permissionMode"),
             pre_plan_permission_mode=_require_optional_str(
                 wire["prePlanPermissionMode"], "prePlanPermissionMode"
+            ),
+            permission_scope_snapshots=_validated_permission_scope_snapshots(
+                wire.get(
+                    "permissionScopeSnapshots",
+                    {"session": [], "cliArg": []},
+                )
             ),
             plan=Plan.from_dict(_require_mapping(wire["plan"], "plan")),
             task_list_id=_require_optional_str(wire["taskListId"], "taskListId"),

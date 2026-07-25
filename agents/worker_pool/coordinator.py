@@ -5,14 +5,13 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Callable, Awaitable, Union
+from typing import Any, Dict, List, Optional, Callable, Awaitable
 from enum import Enum
 
-from .enums import AgentStatus, TaskStatus, TaskPriority, Result
+from .enums import TaskStatus, TaskPriority, Result
 from .agent import Agent, AgentConfig, AgentCapabilities
 from .agent_manager import WorkerPoolManager
 from .task import Task, TaskConfig, TaskResult
-from .task_queue import TaskQueue
 
 
 class CoordinatorPhase(Enum):

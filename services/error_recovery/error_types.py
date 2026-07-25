@@ -5,7 +5,7 @@
 """
 
 from enum import Enum, auto
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any
 from dataclasses import dataclass
 import re
 

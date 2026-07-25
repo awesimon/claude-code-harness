@@ -5,7 +5,6 @@
 
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Union
-import json
 
 from .base import Tool, ToolResult, ToolError, ToolExecutionError, ToolValidationError, register_tool
 

@@ -3,12 +3,14 @@
 定义所有工具的抽象基类和通用接口
 """
 
+import dataclasses
 import math
 import re
 from abc import ABC, abstractmethod
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, is_dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, Generic, Mapping, Optional, TypeVar, cast, get_args
 
 from pydantic import BaseModel
@@ -20,6 +22,18 @@ _ACTIVE_TOOL_CONTEXT: ContextVar[Dict[str, Any] | None] = ContextVar(
 
 def get_active_tool_context() -> Dict[str, Any]:
     return _ACTIVE_TOOL_CONTEXT.get() or {}
+
+
+def effective_tool_cwd() -> Path:
+    value = get_active_tool_context().get("effective_cwd")
+    return Path(value).expanduser().resolve() if value else Path.cwd().resolve()
+
+
+def resolve_tool_path(value: str | Path) -> Path:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = effective_tool_cwd() / candidate
+    return candidate.resolve()
 
 
 class ToolError(Exception):
@@ -353,39 +367,64 @@ class Tool(ABC, Generic[InputType, OutputType]):
         Returns:
             ToolResult: 执行结果
         """
-        try:
-            # 如果输入是 dict，尝试转换为 dataclass 或 Pydantic model
-            if isinstance(input_data, dict):
-                import dataclasses
-                input_type = _resolve_tool_input_type(self.__class__)
-                if input_type is None:
-                    return ToolResult.fail(
-                        ToolValidationError(
-                            "Invalid input data: cannot resolve tool input type "
-                            "(use Tool[Input, Output] or set class attribute input_model=...)"
-                        )
-                    )
-                if dataclasses.is_dataclass(input_type):
-                    input_data = cast(InputType, input_type(**input_data))
-                elif hasattr(input_type, 'model_validate'):
-                    # Pydantic BaseModel
-                    input_data = cast(InputType, input_type.model_validate(input_data))
-                elif hasattr(input_type, '__init__'):
-                    # 其他类型，尝试直接实例化
-                    input_data = cast(InputType, input_type(**input_data))
-        except Exception as e:
-            return ToolResult.fail(
-                ToolValidationError(f"Invalid input data: {str(e)}")
+        prepared, error = await self.prepare_input(input_data)
+        if error is not None:
+            return ToolResult.fail(error)
+        return await self.invoke_prepared(cast(InputType, prepared), context)
+
+    def coerce_input(
+        self, input_data: Any
+    ) -> tuple[Optional[InputType], Optional[ToolError]]:
+        """Parse raw input through the declared Pydantic-compatible type."""
+
+        input_type = _resolve_tool_input_type(self.__class__)
+        if input_type is None:
+            return None, ToolValidationError(
+                "Invalid input data: cannot resolve tool input type "
+                "(use Tool[Input, Output] or set class attribute input_model=...)"
             )
+        try:
+            from pydantic import TypeAdapter
 
-        # 验证输入
-        validation_error = await self.validate(input_data)
-        if validation_error:
-            return ToolResult.fail(validation_error)
+            if isinstance(input_type, type) and isinstance(input_data, input_type):
+                parsed = input_data
+            elif dataclasses.is_dataclass(input_type) and isinstance(input_data, Mapping):
+                parsed = input_type(**dict(input_data))
+            elif hasattr(input_type, "model_validate"):
+                parsed = input_type.model_validate(input_data, strict=True)
+            else:
+                parsed = TypeAdapter(input_type).validate_python(input_data, strict=True)
+            return cast(InputType, parsed), None
+        except Exception as exc:
+            return None, ToolValidationError(f"Invalid input data: {str(exc)}")
 
-        # Keep the runtime context available to legacy execute(input) methods.
-        # The context is restored after execution because registry tools are
-        # shared instances and may run concurrently.
+    async def prepare_input(
+        self, input_data: Any
+    ) -> tuple[Optional[InputType], Optional[ToolError]]:
+        """Coerce and run the tool's semantic validation without executing it."""
+
+        prepared, error = self.coerce_input(input_data)
+        if error is not None:
+            return None, error
+        try:
+            validation_error = await self.validate(cast(InputType, prepared))
+        except ToolError as exc:
+            return None, exc
+        except Exception as exc:
+            return None, ToolValidationError(f"Invalid input data: {str(exc)}")
+        return (
+            (None, validation_error)
+            if validation_error is not None
+            else (prepared, None)
+        )
+
+    async def invoke_prepared(
+        self,
+        input_data: InputType,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> ToolResult:
+        """Execute already-validated input under the legacy active context."""
+
         context_token = _ACTIVE_TOOL_CONTEXT.set(context or {})
         try:
             return await self.execute(input_data)
@@ -441,6 +480,9 @@ class ToolRegistry:
         cls._aliases[canonical] = canonical
         cls._aliases[tool.name] = canonical
         cls._aliases[tool.name.lower()] = canonical
+        for alias in getattr(tool, "aliases", ()):
+            cls._aliases[alias] = canonical
+            cls._aliases[alias.lower()] = canonical
         for alias, target in _EXPLICIT_TOOL_ALIASES.items():
             if target == canonical:
                 cls._aliases[alias] = canonical

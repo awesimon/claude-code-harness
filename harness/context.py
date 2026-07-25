@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 
 class PermissionMode(str, Enum):
@@ -20,9 +22,17 @@ class CancellationToken:
     def __init__(self, parent: Optional["CancellationToken"] = None):
         self._event = asyncio.Event()
         self._tasks: set[asyncio.Task[Any]] = set()
-        self._callbacks: set[Callable[[], None]] = set()
+        self._callbacks: dict[int, Callable[[], None]] = {}
+        self._next_callback_id = 0
+        self._parent = parent
+        self._remove_parent_callback: Callable[[], None] | None = None
         if parent is not None:
-            parent.add_callback(self.cancel)
+            self._remove_parent_callback = parent.add_callback(self.cancel, weak=True)
+
+    @property
+    def parent(self) -> Optional["CancellationToken"]:
+        """The token whose cancellation propagates to this token."""
+        return self._parent
 
     @property
     def cancelled(self) -> bool:
@@ -32,18 +42,66 @@ class CancellationToken:
         if self._event.is_set():
             return
         self._event.set()
-        for callback in tuple(self._callbacks):
-            callback()
+        self.dispose()
+        for callback in tuple(self._callbacks.values()):
+            try:
+                callback()
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                continue
         self._callbacks.clear()
         for task in tuple(self._tasks):
             if not task.done():
                 task.cancel()
 
-    def add_callback(self, callback: Callable[[], None]) -> None:
+    def dispose(self) -> None:
+        """Detach this token from its parent without cancelling either token."""
+        if self._remove_parent_callback is not None:
+            self._remove_parent_callback()
+            self._remove_parent_callback = None
+
+    def add_callback(
+        self, callback: Callable[[], None], *, weak: bool = False
+    ) -> Callable[[], None]:
         if self.cancelled:
-            callback()
-            return
-        self._callbacks.add(callback)
+            try:
+                callback()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            return lambda: None
+
+        self._next_callback_id += 1
+        callback_id = self._next_callback_id
+        stored_callback = callback
+        if weak:
+            try:
+                parent_reference = weakref.ref(self)
+
+                def remove_dead_callback(_reference: weakref.ReferenceType[object]) -> None:
+                    parent = parent_reference()
+                    if parent is not None:
+                        parent._callbacks.pop(callback_id, None)
+
+                reference = weakref.WeakMethod(  # type: ignore[arg-type]
+                    callback, remove_dead_callback
+                )
+            except TypeError:
+                reference = None
+            if reference is not None:
+                def stored_callback() -> None:
+                    target = reference()
+                    if target is not None:
+                        target()
+
+        self._callbacks[callback_id] = stored_callback
+
+        def remove() -> None:
+            self._callbacks.pop(callback_id, None)
+
+        return remove
 
     def track(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
         if self.cancelled:
@@ -60,7 +118,7 @@ class CancellationToken:
 ApprovalCallback = Callable[[Any], Awaitable[bool] | bool]
 
 
-@dataclass
+@dataclass(frozen=True)
 class RuntimeContext:
     session_id: Optional[str] = None
     workspace_root: Optional[Path] = None
@@ -68,16 +126,28 @@ class RuntimeContext:
     approval_callback: Optional[ApprovalCallback] = None
     cancellation: CancellationToken = field(default_factory=CancellationToken)
     tool_timeout: Optional[float] = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    tool_timeout_disabled: bool = False
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("RuntimeContext metadata must be a mapping")
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
     def child(self, **overrides: Any) -> "RuntimeContext":
+        metadata_overrides = overrides.pop("metadata", {})
+        if not isinstance(metadata_overrides, Mapping):
+            raise TypeError("RuntimeContext.child metadata must be a mapping")
+        if "cancellation" in overrides:
+            raise TypeError("RuntimeContext.child always derives its cancellation token")
         values = {
             "session_id": self.session_id,
             "workspace_root": self.workspace_root,
             "permission_mode": self.permission_mode,
             "approval_callback": self.approval_callback,
             "tool_timeout": self.tool_timeout,
-            "metadata": dict(self.metadata),
+            "tool_timeout_disabled": self.tool_timeout_disabled,
+            "metadata": {**self.metadata, **dict(metadata_overrides)},
         }
         values.update(overrides)
         values["cancellation"] = CancellationToken(parent=self.cancellation)

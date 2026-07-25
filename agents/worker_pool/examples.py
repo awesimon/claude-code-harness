@@ -6,8 +6,6 @@ similar to Claude Code's coordinator mode.
 """
 
 import asyncio
-import random
-from typing import Any
 
 from agents.worker_pool import (
     Coordinator,
@@ -15,7 +13,6 @@ from agents.worker_pool import (
     AgentConfig,
     AgentCapabilities,
     Task,
-    TaskConfig,
     TaskPriority,
     ExecutionPlan,
 )
@@ -32,7 +29,7 @@ async def example_basic_task() -> None:
             return "Research findings: Found the bug in auth module"
 
         # Spawn the task
-        task = await coordinator.spawn_task(
+        await coordinator.spawn_task(
             description="Investigate auth bug",
             executor=research_task,
             priority=TaskPriority.HIGH,
@@ -127,7 +124,7 @@ async def example_execution_plan() -> None:
         # Execute plan
         results = await coordinator.execute_plan(plan)
 
-        print(f"Plan execution results:")
+        print("Plan execution results:")
         for task_id, result in results.items():
             status = "SUCCESS" if result.success else "FAILED"
             print(f"  {task_id}: {status}")
@@ -280,7 +277,7 @@ async def example_research_implementation_verification() -> None:
             await asyncio.sleep(0.4)
             return "Fixed null pointer, added null check at line 42"
 
-        implementation = await coordinator.spawn_task(
+        await coordinator.spawn_task(
             description="Fix null pointer in auth/validate.ts:42",
             executor=implement_fix,
             priority=TaskPriority.HIGH,

@@ -10,8 +10,8 @@ A specialized agent for codebase exploration.
 对齐 Claude Code 的 exploreAgent.ts
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Set
+from dataclasses import dataclass
+from typing import Optional
 
 from .agent_runner import AgentConfig, AgentResult, run_agent
 

@@ -10,8 +10,8 @@ A specialized agent that only explores the codebase and creates implementation p
 对齐 Claude Code 的 planAgent.ts
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
 
 from .agent_runner import AgentConfig, AgentResult, run_agent
 

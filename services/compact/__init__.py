@@ -13,6 +13,7 @@ from .context_compactor import (
     CompressionStrategy,
     CompressionResult,
     compact_messages,
+    micro_compact_messages,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "CompressionStrategy",
     "CompressionResult",
     "compact_messages",
+    "micro_compact_messages",
 ]

@@ -7,10 +7,9 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Callable, Awaitable
-from enum import Enum
 
-from .enums import AgentStatus, TaskStatus
-from .task import Task, TaskResult
+from .enums import AgentStatus
+from .task import Task
 from .task_queue import TaskQueue
 
 

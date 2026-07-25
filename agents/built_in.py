@@ -2,7 +2,7 @@
 内置Agent定义
 对齐 Claude Code 的 built-in agents
 """
-from .types import BuiltInAgentDefinition, AgentPermissionMode
+from .types import AgentPermissionMode, AgentSource, BuiltInAgentDefinition
 
 
 def get_explore_system_prompt() -> str:
@@ -131,7 +131,7 @@ EXPLORE_AGENT = BuiltInAgentDefinition(
     ),
     tools=["glob", "grep", "read_file", "bash"],
     disallowed_tools=["agent", "exit_plan_mode", "edit_file", "write_file"],
-    source="built-in",
+    source=AgentSource.BUILT_IN,
     base_dir="built-in",
     model="inherit",
     permission_mode=AgentPermissionMode.BYPASS,
@@ -148,7 +148,7 @@ PLAN_AGENT = BuiltInAgentDefinition(
     ),
     tools=["glob", "grep", "read_file", "bash"],
     disallowed_tools=["agent", "exit_plan_mode", "edit_file", "write_file"],
-    source="built-in",
+    source=AgentSource.BUILT_IN,
     base_dir="built-in",
     model="inherit",
     permission_mode=AgentPermissionMode.BYPASS,
@@ -165,7 +165,7 @@ GENERAL_PURPOSE_AGENT = BuiltInAgentDefinition(
         "to perform the search for you."
     ),
     tools=["*"],  # 所有工具
-    source="built-in",
+    source=AgentSource.BUILT_IN,
     base_dir="built-in",
     model="inherit",
     get_system_prompt=get_general_purpose_system_prompt,
@@ -179,7 +179,7 @@ CODE_AGENT = BuiltInAgentDefinition(
         "has access to file editing tools and can make changes to the codebase."
     ),
     tools=["*"],
-    source="built-in",
+    source=AgentSource.BUILT_IN,
     base_dir="built-in",
     model="inherit",
     get_system_prompt=get_general_purpose_system_prompt,
@@ -192,7 +192,7 @@ TEST_AGENT = BuiltInAgentDefinition(
         "create unit tests, integration tests, or test fixtures."
     ),
     tools=["read_file", "write_file", "edit_file", "bash", "glob", "grep"],
-    source="built-in",
+    source=AgentSource.BUILT_IN,
     base_dir="built-in",
     model="inherit",
     get_system_prompt=get_general_purpose_system_prompt,
@@ -206,7 +206,7 @@ VERIFICATION_AGENT = BuiltInAgentDefinition(
     ),
     tools=["read_file", "bash", "glob", "grep"],
     disallowed_tools=["write_file", "edit_file"],
-    source="built-in",
+    source=AgentSource.BUILT_IN,
     base_dir="built-in",
     model="inherit",
     get_system_prompt=get_general_purpose_system_prompt,

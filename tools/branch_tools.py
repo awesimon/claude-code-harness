@@ -4,7 +4,6 @@
 """
 
 import subprocess
-from typing import Optional
 from pydantic import BaseModel, Field
 
 from .base import Tool, ToolResult, register_tool
@@ -166,7 +165,7 @@ class BranchSwitchTool(Tool):
             if result.returncode != 0:
                 return ToolResult(
                     success=False,
-                    message=f"切换分支失败",
+                    message="切换分支失败",
                     error=result.stderr
                 )
 

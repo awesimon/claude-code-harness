@@ -6,11 +6,9 @@ import uuid
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional, Callable, Awaitable, Dict, List
-from enum import Enum
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
-from .enums import TaskStatus, TaskType, TaskPriority, Result
+from .enums import TaskStatus, TaskType, TaskPriority
 
 
 @dataclass

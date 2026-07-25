@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from agents import AgentExecutionResult
+from harness import AgentScheduler, ToolRuntime
 from models import Base
-from query_engine import QueryEngine, ToolObservation
-from services.llm_service import ChatCompletionResponse
+from query_engine import QueryEngine, ToolCall, ToolObservation
+from services.llm_service import ChatCompletionResponse, LLMProvider
 from state_core import EventType, SessionRuntimeFactory, SQLAlchemyStateStore, TaskMode
-from tools.base import ToolResult
+from tools.base import Tool, ToolResult
 from tools.web_search_tool import WebSearchOutput
 
 
@@ -23,6 +27,25 @@ class StaticLLM:
             content="done",
             finish_reason="stop",
         )
+
+
+class RecordingChildLLM:
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def chat_completion(self, request):
+        self.requests.append(request)
+        return ChatCompletionResponse(
+            id="child-response",
+            model=request.model or "child-model",
+            content="child done",
+            finish_reason="stop",
+        )
+
+
+def test_query_engine_side_effect_apis_are_annotated_as_returning_none() -> None:
+    assert get_type_hints(QueryEngine.__init__)["return"] is type(None)
+    assert get_type_hints(QueryEngine.on_state_change)["return"] is type(None)
 
 
 def tool_call_response() -> ChatCompletionResponse:
@@ -87,17 +110,45 @@ class MalformedStreamingToolCallingLLM:
 
 class WebSearchResultEngine(QueryEngine):
     async def _execute_tools(self, tool_calls, conversation_id=None):
-        return [
-            ToolObservation(
-                tool_call_id=tool_calls[0].id,
-                name="web_search",
-                result=ToolResult.ok(
+        class OutputTool(Tool[dict, dict]):
+            name = "web_search"
+            input_type = dict
+
+            async def execute(self, input_data):
+                return ToolResult.ok(
                     WebSearchOutput(
                         query="python",
                         results=[{"title": "Python", "url": "https://python.org"}],
                         duration_seconds=0.25,
                     )
-                ),
+                )
+
+            def is_read_only(self):
+                return True
+
+        class Registry:
+            tool = OutputTool()
+
+            @classmethod
+            def resolve_name(cls, name):
+                return "web_search" if name == "web_search" else None
+
+            @classmethod
+            def get(cls, name):
+                return cls.tool if name == "web_search" else None
+
+        harness = self._session_harness(conversation_id)
+        execution = await ToolRuntime(Registry).execute(
+            "web_search",
+            tool_calls[0].arguments,
+            harness.runtime_context,
+            tool_call_id=tool_calls[0].id,
+        )
+        return [
+            ToolObservation(
+                tool_call_id=tool_calls[0].id,
+                name="web_search",
+                result=execution.result,
                 execution_time=0.25,
             )
         ]
@@ -109,6 +160,33 @@ def runtime_factory(tmp_path: Path) -> SessionRuntimeFactory:
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     return SessionRuntimeFactory(SQLAlchemyStateStore(factory))
+
+
+@pytest.mark.asyncio
+async def test_child_agent_inherits_query_provider_and_injected_llm_service(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    llm = RecordingChildLLM()
+    engine = QueryEngine(
+        llm_service=llm,
+        provider=LLMProvider.ANTHROPIC,
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("provider-inheritance")
+
+    completed = await engine.spawn_durable_agent(
+        "provider-inheritance",
+        "general-purpose",
+        "inspect provider inheritance",
+        background=False,
+        api_surface="/agents",
+    )
+
+    assert completed.definition_snapshot["provider"] == "anthropic"
+    assert len(llm.requests) == 1
+    assert llm.requests[0].provider is LLMProvider.ANTHROPIC
 
 
 @pytest.mark.asyncio
@@ -154,16 +232,165 @@ def test_query_engine_exposes_exactly_one_task_mode(
         session_runtime_factory=runtime_factory,
     )
     engine.create_conversation("tool-mode")
+    harness = engine._session_harness("tool-mode")
+    for name in ("task_create", "agent", "task_output", "task_stop"):
+        harness.deferred_tools.activate(name)
     task_names = {item["function"]["name"] for item in engine._build_tools_schema("tool-mode")}
     assert "task_create" in task_names
     assert "todo_write" not in task_names
 
     runtime = engine._session_runtime("tool-mode")
     runtime.enable_todo_v1()
+    harness.deferred_tools.activate("todo_write")
     assert runtime.task_mode is TaskMode.TODO_V1
     todo_names = {item["function"]["name"] for item in engine._build_tools_schema("tool-mode")}
     assert "todo_write" in todo_names
     assert "task_create" not in todo_names
+
+    assert {"agent", "task_output", "task_stop"}.issubset(todo_names)
+
+
+def test_query_engine_uses_session_harness_as_only_runtime_lookup(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("harness-runtime")
+
+    harness = engine._session_harness("harness-runtime")
+
+    assert engine._session_runtime("harness-runtime") is harness.session_runtime
+    assert not hasattr(engine, "_agent_manager")
+    assert not hasattr(engine, "_session_runtimes")
+    assert not hasattr(engine, "_tool_runtime")
+
+
+def test_clear_conversation_rotates_the_session_harness(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("clear-harness")
+    previous = engine._session_harness("clear-harness")
+
+    engine.clear_conversation("clear-harness")
+    current = engine._session_harness("clear-harness")
+
+    assert previous.runtime_context.cancellation.cancelled
+    assert current is not previous
+    assert not current.runtime_context.cancellation.cancelled
+
+
+@pytest.mark.asyncio
+async def test_query_engine_finds_agent_across_owned_session_roots(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    class CompletingRunner:
+        async def run(self, record, child_harness):
+            return AgentExecutionResult(content="done", output="done")
+
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("first-root")
+    engine.create_conversation("second-root")
+    first = AgentScheduler(engine._session_harness("first-root"), runner=CompletingRunner())
+    second = AgentScheduler(engine._session_harness("second-root"), runner=CompletingRunner())
+
+    agent_id = await engine.spawn_agent(
+        "second-root", "Explore", "inspect", is_async=False
+    )
+
+    assert engine.get_agent_status(agent_id)["status"] == "completed"
+    await first.shutdown()
+    await second.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_query_engine_abort_delegates_to_session_scheduler(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    class BlockingLLM:
+        def __init__(self) -> None:
+            self.release = asyncio.Event()
+
+        async def chat_completion(self, request):
+            await self.release.wait()
+            return ChatCompletionResponse(
+                id="blocked", model="test", content="done", finish_reason="stop"
+            )
+
+    llm = BlockingLLM()
+    engine = QueryEngine(
+        llm_service=llm,
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("abort-root")
+    scheduler = engine._session_harness("abort-root").agent_scheduler
+    agent_id = await engine.spawn_agent(
+        "abort-root", "Explore", "inspect", is_async=True
+    )
+
+    abort = engine.abort_agent(agent_id)
+    assert abort is not None
+    await abort
+
+    assert engine.get_agent_status(agent_id)["status"] == "cancelled"
+    llm.release.set()
+    await scheduler.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_query_engine_agent_tool_executes_with_active_harness(
+    runtime_factory: SessionRuntimeFactory, tmp_path: Path
+) -> None:
+    class CompletingRunner:
+        async def run(self, record, child_harness):
+            return AgentExecutionResult(content="done", output="done")
+
+    engine = QueryEngine(
+        llm_service=StaticLLM(),
+        enable_error_recovery=False,
+        workspace_root=tmp_path,
+        session_runtime_factory=runtime_factory,
+    )
+    engine.create_conversation("agent-tool-root")
+    scheduler = AgentScheduler(
+        engine._session_harness("agent-tool-root"), runner=CompletingRunner()
+    )
+    engine._session_harness("agent-tool-root").deferred_tools.activate("agent")
+
+    observations = await engine._execute_tools(
+        [
+            ToolCall(
+                id="agent-call",
+                name="agent",
+                arguments={
+                    "prompt": "inspect",
+                    "description": "Inspect",
+                    "subagent_type": "Explore",
+                },
+            )
+        ],
+        "agent-tool-root",
+    )
+
+    assert observations[0].result.success
+    assert observations[0].result.data["status"] == "completed"
+    await scheduler.shutdown()
 
 
 def test_resume_rebuilds_assistant_tool_call_and_result_order(

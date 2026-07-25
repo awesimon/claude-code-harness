@@ -1,621 +1,612 @@
+"""One child-agent LLM/tool execution loop.
+
+Durable lifecycle ownership belongs to :mod:`harness.agents`; this module only
+executes one already-created agent record against its child harness.
 """
-Agent 执行引擎
-实现 Agent 的完整生命周期管理
-对齐 Claude Code 的 runAgent.ts
-"""
+
+from __future__ import annotations
+
 import asyncio
+import inspect
 import json
-import logging
-import uuid
-from datetime import datetime
-from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
-from agents.built_in import get_agent_by_type
 from agents.types import (
-    AgentContext,
     AgentDefinition,
-    AgentError,
     AgentExecutionConfig,
-    AgentExecutionError,
+    AgentExecutionResult,
     AgentToolResult,
+    normalize_agent_messages,
+    parse_agent_definition,
 )
-from harness import CancellationToken, PermissionMode, RuntimeContext, ToolRuntime
-from services import ChatCompletionRequest, LLMService, Message
+from harness.budget import BudgetKind
+from harness.skills import acknowledge_skill_delivery, claim_skill_delivery_attempts
+from services import ChatCompletionRequest, LLMProvider, LLMService, Message
+from state_core import AgentRecord
 from tools import ToolRegistry
-from tools.base import Tool, canonical_tool_name
+from tools.base import Tool, canonical_tool_name, to_json_value
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from harness.session import SessionHarness
+
+
+def _message_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        if all(
+            isinstance(block, Mapping) and block.get("type") == "text"
+            for block in content
+        ):
+            return "\n".join(str(block.get("text", "")) for block in content)
+        return json.dumps(content, ensure_ascii=False)
+    return json.dumps(content, ensure_ascii=False)
+
+
+def _connected_mcp_servers(harness: "SessionHarness") -> tuple[str, ...]:
+    connected: list[str] = []
+    for record in harness.mcp.list_servers():
+        status = getattr(record, "status", None)
+        if getattr(status, "value", status) == "connected":
+            name = getattr(record, "name", None)
+            if isinstance(name, str):
+                connected.append(name)
+    return tuple(connected)
+
+
+def _assistant_message(message: Mapping[str, Any]) -> Message:
+    content = message["content"]
+    if not isinstance(content, list):
+        return Message(
+            role="assistant",
+            content=content,
+            name=message.get("name"),
+            tool_calls=message.get("tool_calls"),
+        )
+    text_blocks = [
+        str(block.get("text", ""))
+        for block in content
+        if isinstance(block, Mapping) and block.get("type") == "text"
+    ]
+    tool_calls = list(message.get("tool_calls") or ())
+    tool_calls.extend(
+        {
+            "id": str(block.get("id", "")),
+            "type": "function",
+            "function": {
+                "name": str(block.get("name", "")),
+                "arguments": json.dumps(
+                    block.get("input", {}), ensure_ascii=False, separators=(",", ":")
+                ),
+            },
+        }
+        for block in content
+        if isinstance(block, Mapping) and block.get("type") == "tool_use"
+    )
+    return Message(
+        role="assistant",
+        content="\n".join(text_blocks),
+        name=message.get("name"),
+        tool_calls=tool_calls,
+    )
+
+
+def _restored_initial_messages(message: Mapping[str, Any]) -> list[Message]:
+    role = message["role"]
+    content = message["content"]
+    if role == "assistant":
+        return [_assistant_message(message)]
+    if role != "user" or not isinstance(content, list) or not any(
+        isinstance(block, Mapping) and block.get("type") == "tool_result"
+        for block in content
+    ):
+        return [
+            Message(
+                role=role,
+                content=content,
+                name=message.get("name"),
+                tool_calls=message.get("tool_calls"),
+                tool_call_id=message.get("tool_call_id"),
+            )
+        ]
+
+    restored: list[Message] = []
+    pending_text: list[str] = []
+
+    def flush_text() -> None:
+        if pending_text:
+            restored.append(Message(role="user", content="\n".join(pending_text)))
+            pending_text.clear()
+
+    for block in content:
+        if isinstance(block, Mapping) and block.get("type") == "tool_result":
+            flush_text()
+            restored.append(
+                Message(
+                    role="tool",
+                    content=_message_content_text(block.get("content")),
+                    tool_call_id=str(block.get("tool_use_id", "")),
+                )
+            )
+        elif isinstance(block, Mapping) and block.get("type") == "text":
+            pending_text.append(str(block.get("text", "")))
+        else:
+            pending_text.append(_message_content_text(block))
+    flush_text()
+    return restored
 
 
 class AgentExecutor:
-    """
-    Agent 执行器
-
-    负责执行 Agent 的完整生命周期：
-    1. 初始化 Agent 上下文
-    2. 准备工具列表
-    3. 运行对话循环
-    4. 收集结果
-    5. 清理资源
-    """
+    """Run a single child conversation without storing lifecycle state."""
 
     def __init__(
         self,
         agent_definition: AgentDefinition,
-        prompt: str,
-        parent_session_id: Optional[str] = None,
-        config: Optional[AgentExecutionConfig] = None,
-        llm_service: Optional[LLMService] = None,
-        tool_runtime: Optional[ToolRuntime] = None,
-    ):
+        *,
+        config: AgentExecutionConfig | None = None,
+        llm_service: LLMService | None = None,
+        initial_messages: Sequence[Mapping[str, Any]] = (),
+        provider: LLMProvider = LLMProvider.OPENAI,
+    ) -> None:
         self.agent_definition = agent_definition
-        self.prompt = prompt
-        self.parent_session_id = parent_session_id
         self.config = config or AgentExecutionConfig()
         self.llm_service = llm_service or LLMService()
-        self.tool_runtime = tool_runtime or ToolRuntime(
-            ToolRegistry,
-            default_timeout=self.config.tool_timeout,
+        self.initial_messages = normalize_agent_messages(initial_messages)
+        self.provider = provider
+
+    @classmethod
+    def from_record(
+        cls,
+        record: AgentRecord,
+        *,
+        config: AgentExecutionConfig | None = None,
+        llm_service: LLMService | None = None,
+    ) -> "AgentExecutor":
+        return cls(
+            parse_agent_definition(
+                record.definition_snapshot,
+                expected_agent_type=record.agent_type,
+            ),
+            config=config,
+            llm_service=llm_service,
+            initial_messages=record.definition_snapshot.get("initial_messages", ()),
+            provider=LLMProvider(record.definition_snapshot.get("provider", "openai")),
         )
-        self.agent_id = self._generate_agent_id()
-        self.context = AgentContext(
-            agent_id=self.agent_id,
-            agent_type=agent_definition.agent_type,
-            session_id=self.agent_id,
-            parent_session_id=parent_session_id,
-            started_at=datetime.now(),
-            is_async=self.config.is_async,
-        )
-        self.cancellation = CancellationToken(parent=self.config.parent_cancellation)
-        self._termination_reason = "max_turns"
-        self._usage: Dict[str, int] = {}
-        if self.config.session_runtime is not None:
-            self.config.session_runtime.update_agent_lifecycle(
-                self.agent_id,
-                "running",
-                agentType=self.agent_definition.agent_type,
-            )
 
-    def _generate_agent_id(self) -> str:
-        """生成 Agent ID"""
-        return f"agent-{self.agent_definition.agent_type.lower()}-{uuid.uuid4().hex[:8]}"
-
-    def _resolve_tools(self) -> List[Tool]:
-        """
-        解析 Agent 可用工具
-
-        根据 agent_definition.tools 和 disallowed_tools 过滤
-        """
-        all_tools: List[Tool] = []
-        for name in ToolRegistry.list_tools():
-            tool = ToolRegistry.get(name)
-            if tool:
-                all_tools.append(tool)
-
-        # 如果 tools 为 None 或 ['*']，允许所有工具
+    def _resolve_tools(self, child_harness: SessionHarness) -> list[Tool]:
+        registry = child_harness.tool_runtime.registry
+        all_tools = [
+            tool
+            for name in registry.list_tools()
+            if (tool := registry.get(name)) is not None
+        ]
         allowed_tools = self.agent_definition.tools
-        if allowed_tools is None or (len(allowed_tools) == 1 and allowed_tools[0] == "*"):
+        if allowed_tools is None or allowed_tools == ["*"]:
             resolved = all_tools
         else:
-            allowed = {canonical_tool_name(name) for name in allowed_tools}
-            resolved = [t for t in all_tools if self.tool_name(t) in allowed]
-
-        # 应用禁止工具列表
+            allowed = {
+                registry.resolve_name(name) or canonical_tool_name(name)
+                for name in allowed_tools
+            }
+            resolved = [
+                tool for tool in all_tools if self.tool_name(tool, registry) in allowed
+            ]
         if self.agent_definition.disallowed_tools:
             denied = {
-                canonical_tool_name(name) for name in self.agent_definition.disallowed_tools
+                registry.resolve_name(name) or canonical_tool_name(name)
+                for name in self.agent_definition.disallowed_tools
             }
-            resolved = [t for t in resolved if self.tool_name(t) not in denied]
-
-        return resolved
+            resolved = [
+                tool for tool in resolved if self.tool_name(tool, registry) not in denied
+            ]
+        context = child_harness.tool_runtime.tool_context(
+            child_harness.runtime_context
+        )
+        return [tool for tool in resolved if _tool_is_enabled(tool, context)]
 
     @staticmethod
-    def tool_name(tool: Tool) -> str:
-        return ToolRegistry.resolve_name(tool.name) or canonical_tool_name(tool.name)
+    def tool_name(tool: Tool, registry: Any = ToolRegistry) -> str:
+        return registry.resolve_name(tool.name) or canonical_tool_name(tool.name)
 
     def _build_system_prompt(self) -> str:
-        """构建系统提示词"""
-        base_prompt = f"""You are an agent for Claude Code, Anthropic's official CLI for Claude.
-Agent Type: {self.agent_definition.agent_type}
-
-{self.agent_definition.when_to_use}
-
-CRITICAL RULES:
-1. Use tools silently - DO NOT output text between tool calls
-2. Complete the task fully—don't gold-plate, but don't leave it half-done
-3. When you complete the task, respond with ONLY a concise report covering what was done and key findings
-4. Your response MUST begin with "Scope:" followed by your findings
-5. Be factual and concise, under 500 words unless specified otherwise
-
-Output format:
-  Scope: <one sentence summary of what you did>
-  Result: <key findings and actions taken>
-  Key files: <relevant file paths if applicable>"""
-
-        # 如果是内置Agent且有自定义prompt，使用自定义的
         if self.agent_definition.get_system_prompt:
             return self.agent_definition.get_system_prompt()
+        return (
+            "You are an agent for Claude Code.\n"
+            f"Agent Type: {self.agent_definition.agent_type}\n\n"
+            f"{self.agent_definition.when_to_use}\n\n"
+            "Complete the task and return a concise factual report."
+        )
 
-        return base_prompt
+    def _available_tools(
+        self, child_harness: SessionHarness
+    ) -> tuple[dict[str, Tool], list[dict[str, Any]]]:
+        registry = child_harness.tool_runtime.registry
+        deferred = child_harness.deferred_tools
+        available: dict[str, Tool] = {}
+        schemas: list[dict[str, Any]] = []
+        visible = set(deferred.visible_names())
+        for tool in self._resolve_tools(child_harness):
+            name = self.tool_name(tool, registry)
+            spec = deferred.get_spec(name)
+            if spec is None or name not in visible:
+                continue
+            available[name] = tool
+            schemas.append(spec.to_openai())
+        allowed_tools = self.agent_definition.tools
+        allow_dynamic = allowed_tools is None or allowed_tools == ["*"]
+        if allow_dynamic:
+            for name in deferred.visible_names():
+                if name in available or registry.get(name) is not None:
+                    continue
+                tool = deferred.resolve_tool(name)
+                spec = deferred.get_spec(name)
+                if tool is not None and spec is not None:
+                    available[name] = tool
+                    schemas.append(spec.to_openai())
+        return available, schemas
 
-    async def _run_conversation_loop(
+    async def run(
         self,
-        tools: List[Tool],
-        on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        运行对话循环
+        record: AgentRecord,
+        child_harness: SessionHarness,
+        on_message: Callable[[dict[str, Any]], None] | None = None,
+    ) -> AgentExecutionResult:
+        if record.agent_id != child_harness.agent_id:
+            raise ValueError("Agent record and child harness IDs must match")
+        cancellation = child_harness.runtime_context.cancellation
+        if cancellation.cancelled:
+            raise asyncio.CancelledError
 
-        实现 LLM → Tool → Observation → LLM 的闭环
-        """
-        messages: List[Dict[str, Any]] = []
-
-        # 构建初始消息
-        system_prompt = self._build_system_prompt()
-        llm_messages = [
-            Message(role="system", content=system_prompt),
-            Message(role="user", content=self.prompt),
-        ]
-
-        # 如果有 initial_prompt，添加到用户消息前
+        registry = child_harness.tool_runtime.registry
+        resolver = child_harness.skills
+        available, _ = self._available_tools(child_harness)
+        skill_activations = tuple(
+            resolver.activate(
+                name,
+                available_mcp_servers=_connected_mcp_servers(child_harness),
+                available_tools=available,
+            )
+            for name in (self.agent_definition.skills or ())
+        )
+        system_prompt = self._build_system_prompt().replace(
+            "${CLAUDE_SESSION_ID}", child_harness.session_id
+        )
+        llm_messages = [Message(role="system", content=system_prompt)]
+        resolver.announcement_delta(context_window_tokens=200_000)
+        llm_messages.extend(
+            Message(role="system", content=f"Available Agent Skills:\n{content}")
+            for content in resolver.announcement_history()
+        )
+        pending_skill_deliveries = claim_skill_delivery_attempts(
+            child_harness,
+            (activation.snapshot for activation in skill_activations),
+            source="static_agent",
+        )
+        llm_messages.extend(
+            Message(
+                role="system",
+                content=attempt.snapshot.prompt(child_harness.session_id),
+            )
+            for attempt in pending_skill_deliveries
+        )
+        announced_history_count = len(resolver.announcement_history())
         if self.agent_definition.initial_prompt:
-            llm_messages.insert(1, Message(role="user", content=self.agent_definition.initial_prompt))
-
+            llm_messages.append(
+                Message(role="user", content=self.agent_definition.initial_prompt)
+            )
+        if self.initial_messages:
+            for message in self.initial_messages:
+                llm_messages.extend(_restored_initial_messages(message))
+        else:
+            llm_messages.append(Message(role="user", content=record.prompt))
+        messages: list[dict[str, Any]] = []
+        usage: dict[str, int] = {}
+        tool_count = 0
+        termination_reason = "max_turns"
         max_turns = self.agent_definition.max_turns or self.config.max_turns
 
-        for turn in range(max_turns):
-            if self.cancellation.cancelled:
-                logger.info(f"Agent {self.agent_id} aborted")
-                self._termination_reason = "cancelled"
-                break
-
-            # 构建工具 schema
-            tools_schema = [
-                ToolRegistry.get_spec(self.tool_name(tool)).to_openai()
-                for tool in tools
-            ]
-
+        for _turn in range(max_turns):
+            if cancellation.cancelled:
+                raise asyncio.CancelledError
+            resolver.announcement_delta(context_window_tokens=200_000)
+            announcement_history = resolver.announcement_history()
+            llm_messages.extend(
+                Message(role="system", content=f"Available Agent Skills:\n{content}")
+                for content in announcement_history[announced_history_count:]
+            )
+            announced_history_count = len(announcement_history)
+            _, schemas = self._available_tools(child_harness)
+            model = record.definition_snapshot.get("model") or self.config.model
+            if model == "inherit":
+                model = self.config.model
+            budget = child_harness.budget
+            turn = budget.reserve(
+                BudgetKind.MODEL_TURNS,
+                1,
+                agent_id=child_harness.agent_id,
+            )
             try:
-                # 调用 LLM
-                llm_task = asyncio.create_task(
-                    self.llm_service.chat_completion(
-                        ChatCompletionRequest(
-                            messages=llm_messages,
-                            model=self.config.model,
-                            temperature=self.config.temperature,
-                            tools=tools_schema if tools_schema else None,
-                            tool_choice="auto" if tools_schema else None,
+                async with child_harness.traces.span("model", model or "default") as span:
+                    llm_task = asyncio.create_task(
+                        self.llm_service.chat_completion(
+                            ChatCompletionRequest(
+                                messages=llm_messages,
+                                model=model,
+                                temperature=self.config.temperature,
+                                tools=schemas or None,
+                                tool_choice="auto" if schemas else None,
+                                provider=self.provider,
+                            )
                         )
                     )
+                    cancellation.track(llm_task)
+                    response = await llm_task
+                    span.set_usage(response.usage or {})
+            except BaseException:
+                turn.release()
+                raise
+            turn.consume()
+            for attempt in pending_skill_deliveries:
+                acknowledge_skill_delivery(
+                    child_harness,
+                    attempt,
+                    source="static_agent",
                 )
-                self.cancellation.track(llm_task)
-                response = await llm_task
-                for key, value in (response.usage or {}).items():
-                    if isinstance(value, int):
-                        self._usage[key] = self._usage.get(key, 0) + value
-            except Exception as e:
-                logger.error(f"LLM call failed in agent {self.agent_id}: {e}")
-                raise AgentExecutionError(f"LLM call failed: {e}")
+            pending_skill_deliveries = ()
+            budget.record_model_usage(
+                response.usage or {}, agent_id=child_harness.agent_id
+            )
+            for key, value in (response.usage or {}).items():
+                if isinstance(value, int):
+                    usage[key] = usage.get(key, 0) + value
 
-            # 处理助手消息
-            assistant_message = {
+            assistant: dict[str, Any] = {
                 "role": "assistant",
                 "content": response.content,
             }
             if response.tool_calls:
-                assistant_message["tool_calls"] = response.tool_calls
-
-            messages.append(assistant_message)
-            llm_messages.append(Message(
-                role="assistant",
-                content=response.content,
-                tool_calls=response.tool_calls,
-            ))
-
-            if on_message:
-                on_message({
-                    "type": "assistant",
-                    "agent_id": self.agent_id,
-                    "content": response.content,
-                })
-
-            # 检查是否有工具调用
+                assistant["tool_calls"] = response.tool_calls
+            messages.append(assistant)
+            llm_messages.append(
+                Message(
+                    role="assistant",
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                )
+            )
+            if on_message is not None:
+                on_message(
+                    {
+                        "type": "assistant",
+                        "agent_id": record.agent_id,
+                        "content": response.content,
+                    }
+                )
             if not response.tool_calls:
-                # 没有工具调用，任务完成
-                logger.info(f"Agent {self.agent_id} completed after {turn + 1} turns")
-                self._termination_reason = "completed"
+                termination_reason = "completed"
                 break
 
-            # 执行工具
-            self.context.tool_use_count += len(response.tool_calls)
-
+            tool_count += len(response.tool_calls)
             for tool_call in response.tool_calls:
-                tool_name = tool_call.get("function", {}).get("name", "")
-                tool_args_str = tool_call.get("function", {}).get("arguments", "{}")
-
+                if cancellation.cancelled:
+                    raise asyncio.CancelledError
+                tool_call_id = ""
+                tool_name = ""
+                execution_name = "invalid_tool_call"
+                result_success = False
                 try:
-                    tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
-                except json.JSONDecodeError:
-                    tool_args = {}
+                    if not isinstance(tool_call, Mapping):
+                        raise ValueError("Tool call must be an object")
+                    raw_id = tool_call.get("id", "")
+                    if isinstance(raw_id, str):
+                        tool_call_id = raw_id
+                    function = tool_call.get("function")
+                    if not isinstance(function, Mapping):
+                        raise ValueError("Tool call function must be an object")
+                    tool_name = function.get("name")
+                    if not isinstance(tool_name, str) or not tool_name:
+                        raise ValueError("Tool call name must be a non-empty string")
+                    execution_name = (
+                        registry.resolve_name(tool_name)
+                        or child_harness.deferred_tools.resolve_name(tool_name)
+                        or canonical_tool_name(tool_name)
+                    )
+                    raw_arguments = function.get("arguments", "{}")
+                    if isinstance(raw_arguments, str):
+                        try:
+                            arguments = json.loads(raw_arguments)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                "Tool call arguments must be valid JSON"
+                            ) from exc
+                    elif isinstance(raw_arguments, Mapping):
+                        arguments = dict(raw_arguments)
+                    else:
+                        raise ValueError(
+                            "Tool call arguments must be a JSON object"
+                        )
+                    if not isinstance(arguments, dict):
+                        raise ValueError(
+                            "Tool call arguments must decode to a JSON object"
+                        )
 
-                permission_mode = PermissionMode.DEFAULT
-                configured_mode = self.agent_definition.permission_mode
-                if configured_mode and configured_mode.value == "bypass":
-                    permission_mode = PermissionMode.BYPASS
-                elif configured_mode and configured_mode.value == "plan":
-                    permission_mode = PermissionMode.PLAN
-                runtime_context = RuntimeContext(
-                    session_id=self.parent_session_id or self.agent_id,
-                    workspace_root=(self.config.workspace_root or Path.cwd()).resolve(),
-                    permission_mode=permission_mode,
-                    approval_callback=self.config.approval_callback,
-                    cancellation=self.cancellation,
-                    tool_timeout=self.config.tool_timeout,
-                    metadata={
-                        "agent_context": self.context,
-                        "session_runtime": self.config.session_runtime,
-                        "agent_id": self.agent_id,
-                    },
-                )
-                execution = await self.tool_runtime.execute(
-                    tool_name,
-                    tool_args,
-                    runtime_context,
-                )
-                tool_name = execution.tool_name
-                tool_result = execution.result
-                result_data = (
-                    tool_result.data
-                    if tool_result.success
-                    else {"error": str(tool_result.error)}
-                )
-                result_success = tool_result.success
-
-                # 添加工具结果到消息
-                tool_result_message = {
+                    available, _ = self._available_tools(child_harness)
+                    if execution_name not in available:
+                        result_data: Any = {
+                            "error": f"Tool {tool_name!r} is not available"
+                        }
+                    else:
+                        execution = await child_harness.tool_runtime.execute(
+                            tool_name,
+                            arguments,
+                            child_harness.runtime_context,
+                            tool_call_id=tool_call_id or None,
+                        )
+                        if execution.termination_reason.value == "cancelled":
+                            raise asyncio.CancelledError
+                        execution_name = execution.tool_name
+                        result = execution.result
+                        result_success = result.success
+                        result_data = (
+                            result.data
+                            if result.success
+                            else {"error": str(result.error)}
+                        )
+                except (TypeError, ValueError) as exc:
+                    result_data = {"error": str(exc)}
+                try:
+                    json_result = to_json_value(result_data)
+                except (TypeError, ValueError):
+                    result_success = False
+                    json_result = {"error": "Tool result is not valid JSON data"}
+                content = json.dumps(json_result, ensure_ascii=False)
+                tool_message = {
                     "role": "tool",
-                    "tool_call_id": tool_call.get("id", ""),
-                    "name": tool_name,
-                    "content": json.dumps(result_data, ensure_ascii=False) if isinstance(result_data, dict) else str(result_data),
+                    "tool_call_id": tool_call_id,
+                    "name": execution_name,
+                    "content": content,
                 }
-                messages.append(tool_result_message)
-                llm_messages.append(Message(
-                    role="tool",
-                    content=tool_result_message["content"],
-                    tool_call_id=tool_result_message["tool_call_id"],
-                    name=tool_name,
-                ))
-
-                if on_message:
-                    on_message({
-                        "type": "tool_result",
-                        "agent_id": self.agent_id,
-                        "tool_name": tool_name,
-                        "success": result_success,
-                    })
-
-        return messages
-
-    async def execute(
-        self,
-        on_message: Optional[Callable[[Dict[str, Any]], None]] = None,
-    ) -> AgentToolResult:
-        """
-        执行 Agent
-
-        Args:
-            on_message: 消息回调函数
-
-        Returns:
-            AgentToolResult: 执行结果
-        """
-        start_time = datetime.now()
-        logger.info(f"Starting agent {self.agent_id} (type: {self.agent_definition.agent_type})")
-
-        try:
-            # 解析工具
-            tools = self._resolve_tools()
-            logger.debug(f"Agent {self.agent_id} resolved {len(tools)} tools")
-
-            # 运行对话循环
-            messages = await self._run_conversation_loop(tools, on_message)
-
-            # 构建结果
-            end_time = datetime.now()
-            duration_ms = int((end_time - start_time).total_seconds() * 1000)
-
-            # 提取最后的助手消息内容
-            content = []
-            for msg in reversed(messages):
-                if msg.get("role") == "assistant" and msg.get("content"):
-                    content.append({"type": "text", "text": msg["content"]})
-                    break
-
-            if not content:
-                content = [{"type": "text", "text": "Agent completed without output"}]
-
-            self.context.status = (
-                "killed" if self._termination_reason == "cancelled" else "completed"
-            )
-            self.context.completed_at = end_time
-            self.context.messages = messages
-
-            result = AgentToolResult(
-                agent_id=self.agent_id,
-                agent_type=self.agent_definition.agent_type,
-                content=content,
-                total_tool_use_count=self.context.tool_use_count,
-                total_duration_ms=duration_ms,
-                total_tokens=self._usage.get(
-                    "total_tokens",
-                    self._usage.get("input_tokens", 0) + self._usage.get("output_tokens", 0),
-                ),
-                usage=dict(self._usage),
-                termination_reason=self._termination_reason,
-            )
-
-            logger.info(f"Agent {self.agent_id} completed in {duration_ms}ms")
-            if self.config.session_runtime is not None:
-                self.config.session_runtime.update_agent_lifecycle(
-                    self.agent_id,
-                    self.context.status,
-                    terminationReason=self._termination_reason,
+                messages.append(tool_message)
+                llm_messages.append(
+                    Message(
+                        role="tool",
+                        content=content,
+                        tool_call_id=tool_message["tool_call_id"],
+                        name=execution_name,
+                    )
                 )
-            return result
+                if on_message is not None:
+                    on_message(
+                        {
+                            "type": "tool_result",
+                            "agent_id": record.agent_id,
+                            "tool_name": execution_name,
+                            "success": result_success,
+                        }
+                    )
 
-        except asyncio.CancelledError:
-            self.context.status = "killed"
-            self.context.completed_at = datetime.now()
-            if self.config.session_runtime is not None:
-                self.config.session_runtime.update_agent_lifecycle(self.agent_id, "interrupted")
-            raise
-        except Exception as e:
-            self.context.status = "failed"
-            if self.config.session_runtime is not None:
-                self.config.session_runtime.update_agent_lifecycle(
-                    self.agent_id, "failed", error=str(e)
-                )
-            logger.error(f"Agent {self.agent_id} failed: {e}")
-            raise AgentExecutionError(f"Agent execution failed: {e}")
+        content_blocks: list[dict[str, str]] = []
+        for message in reversed(messages):
+            if message.get("role") == "assistant" and message.get("content"):
+                content_blocks = [{"type": "text", "text": message["content"]}]
+                break
+        return AgentExecutionResult(
+            content=content_blocks,
+            usage=usage,
+            tool_count=tool_count,
+            termination_reason=termination_reason,
+        )
 
-    async def execute_stream(
-        self,
-    ) -> AsyncIterator[Dict[str, Any]]:
-        """
-        流式执行 Agent
 
-        Yields:
-            事件字典
-        """
-        start_time = datetime.now()
-
-        # 发送开始事件
-        yield {
-            "type": "agent_start",
-            "agent_id": self.agent_id,
-            "agent_type": self.agent_definition.agent_type,
-            "timestamp": start_time.isoformat(),
-        }
-
-        try:
-            # 运行对话循环，带回调
-            messages = []
-
-            def on_message(msg: Dict[str, Any]):
-                messages.append(msg)
-
-            result = await self.execute(on_message=on_message)
-
-            # 发送完成事件
-            yield {
-                "type": "agent_complete",
-                "agent_id": self.agent_id,
-                "result": {
-                    "content": result.content,
-                    "total_tool_use_count": result.total_tool_use_count,
-                    "total_duration_ms": result.total_duration_ms,
-                },
-                "timestamp": datetime.now().isoformat(),
-            }
-
-        except Exception as e:
-            yield {
-                "type": "agent_error",
-                "agent_id": self.agent_id,
-                "error": str(e),
-                "timestamp": datetime.now().isoformat(),
-            }
-
-    def abort(self):
-        """中止 Agent 执行"""
-        self.cancellation.cancel()
-        self._termination_reason = "cancelled"
-        self.context.status = "killed"
-        logger.info(f"Agent {self.agent_id} abort requested")
+def _tool_is_enabled(tool: Tool, context: dict[str, Any]) -> bool:
+    predicate = getattr(tool, "is_enabled", None)
+    if predicate is None:
+        return True
+    if not callable(predicate):
+        return bool(predicate)
+    parameters = inspect.signature(predicate).parameters
+    return bool(predicate() if not parameters else predicate(context))
 
 
 class SpawnAgentManager:
-    """
-    Claude Code 对齐的「子 Agent / spawn」运行时注册表。
+    """Temporary compatibility adapter around an explicitly supplied scheduler."""
 
-    管理由 `AgentExecutor` 承载的、通过 `spawn_agent` 创建的任务会话。
-    """
+    def __init__(self, scheduler=None) -> None:
+        self.scheduler = scheduler
 
-    def __init__(self, executor_factory: Callable[..., AgentExecutor] = AgentExecutor):
-        self._executor_factory = executor_factory
-        self._agents: Dict[str, AgentExecutor] = {}
-        self._results: Dict[str, AgentToolResult] = {}
-        self._tasks: Dict[str, asyncio.Task[AgentToolResult]] = {}
+    def _require_scheduler(self):
+        if self.scheduler is None:
+            raise RuntimeError("SpawnAgentManager requires an explicit AgentScheduler")
+        return self.scheduler
 
     async def spawn_agent(
         self,
         agent_type: str,
         prompt: str,
-        parent_session_id: Optional[str] = None,
-        config: Optional[AgentExecutionConfig] = None,
+        parent_session_id: str | None = None,
+        config: AgentExecutionConfig | None = None,
         is_async: bool = False,
     ) -> str:
-        """
-        创建并启动 Agent
+        from agents.types import AgentRequest
 
-        Args:
-            agent_type: Agent 类型
-            prompt: 任务描述
-            parent_session_id: 父会话ID
-            config: 执行配置
-            is_async: 是否异步执行
-
-        Returns:
-            Agent ID
-        """
-        # 获取 Agent 定义
-        agent_def = get_agent_by_type(agent_type)
-        if not agent_def:
-            raise AgentError(f"Unknown agent type: {agent_type}")
-
-        # 创建执行器
-        executor = self._executor_factory(
-            agent_definition=agent_def,
-            prompt=prompt,
-            parent_session_id=parent_session_id,
-            config=config or AgentExecutionConfig(is_async=is_async),
-        )
-
-        self._agents[executor.agent_id] = executor
-
-        if is_async:
-            # 异步执行，立即返回 Agent ID
-            self._tasks[executor.agent_id] = asyncio.create_task(
-                self._run_async(executor)
+        scheduler = self._require_scheduler()
+        record = await scheduler.spawn(
+            AgentRequest(
+                prompt=prompt,
+                agent_type=agent_type,
+                description=(config.description if config else None) or prompt,
+                background=is_async,
+                parent_agent_id=parent_session_id,
+                model=config.model if config else None,
+                cwd=config.workspace_root if config else None,
             )
-            return executor.agent_id
-        else:
-            # 同步执行
-            await self._run_async(executor)
-            return executor.agent_id
+        )
+        return record.agent_id
 
-    async def _run_async(self, executor: AgentExecutor) -> AgentToolResult:
-        """异步运行 Agent"""
-        try:
-            result = await executor.execute()
-            self._results[executor.agent_id] = result
-            return result
-        except asyncio.CancelledError:
-            executor.context.status = "killed"
-            result = self._cancelled_result(executor)
-            self._results[executor.agent_id] = result
-            return result
-        except Exception as e:
-            logger.error(f"Async agent {executor.agent_id} failed: {e}")
-            executor.context.status = "failed"
-            result = self._failed_result(executor, e)
-            self._results[executor.agent_id] = result
-            return result
-
-    @staticmethod
-    def _cancelled_result(executor: AgentExecutor) -> AgentToolResult:
+    async def wait_for_agent(
+        self, agent_id: str, timeout: float | None = None
+    ) -> AgentToolResult:
+        record = await self._require_scheduler().wait(agent_id, timeout)
+        output = record.output if isinstance(record.output, dict) else {}
+        content = output.get("content", [])
+        usage = dict(record.usage)
         return AgentToolResult(
-            agent_id=executor.agent_id,
-            agent_type=executor.context.agent_type,
-            content=[{"type": "text", "text": "Agent execution cancelled"}],
-            total_tool_use_count=executor.context.tool_use_count,
+            agent_id=record.agent_id,
+            agent_type=record.agent_type,
+            content=content,
+            total_tool_use_count=int(output.get("tool_count", 0)),
             total_duration_ms=0,
-            total_tokens=0,
-            usage={},
-            termination_reason="cancelled",
-            error="Agent execution cancelled",
+            total_tokens=int(usage.get("total_tokens", 0)),
+            usage=usage,
+            termination_reason=(
+                record.termination_reason.value
+                if record.termination_reason is not None
+                else record.status.value
+            ),
+            error=(record.error or {}).get("message") if record.error else None,
         )
 
-    @staticmethod
-    def _failed_result(executor: AgentExecutor, error: Exception) -> AgentToolResult:
-        return AgentToolResult(
-            agent_id=executor.agent_id,
-            agent_type=executor.context.agent_type,
-            content=[{"type": "text", "text": f"Agent execution failed: {error}"}],
-            total_tool_use_count=executor.context.tool_use_count,
-            total_duration_ms=0,
-            total_tokens=0,
-            usage={},
-            termination_reason="failed",
-            error=str(error),
-        )
-
-    async def wait_for_agent(self, agent_id: str, timeout: Optional[float] = None) -> AgentToolResult:
-        """等待 Agent 完成"""
-        executor = self._agents.get(agent_id)
-        if not executor:
-            raise AgentError(f"Agent {agent_id} not found")
-
-        if agent_id in self._results:
-            return self._results[agent_id]
-
-        task = self._tasks.get(agent_id)
-        if task is None:
-            raise AgentError(f"Agent {agent_id} has not been started")
-
+    def get_agent_status(self, agent_id: str) -> dict[str, Any] | None:
         try:
-            if timeout is None:
-                return await asyncio.shield(task)
-            return await asyncio.wait_for(asyncio.shield(task), timeout)
-        except asyncio.TimeoutError as exc:
-            raise AgentError(f"Timed out waiting for agent {agent_id}") from exc
-        except asyncio.CancelledError:
-            result = self._cancelled_result(executor)
-            self._results[agent_id] = result
-            return result
-
-    def get_agent_status(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        """获取 Agent 状态"""
-        executor = self._agents.get(agent_id)
-        if not executor:
+            record = self._require_scheduler().status(agent_id)
+        except Exception:
             return None
-
         return {
-            "agent_id": agent_id,
-            "agent_type": executor.context.agent_type,
-            "status": executor.context.status,
-            "tool_use_count": executor.context.tool_use_count,
-            "started_at": executor.context.started_at.isoformat() if executor.context.started_at else None,
-            "completed_at": executor.context.completed_at.isoformat() if executor.context.completed_at else None,
+            "agent_id": record.agent_id,
+            "agent_type": record.agent_type,
+            "status": record.status.value,
+            "tool_use_count": int(
+                record.output.get("tool_count", 0)
+                if isinstance(record.output, dict)
+                else 0
+            ),
+            "started_at": record.started_at.isoformat() if record.started_at else None,
+            "completed_at": record.finished_at.isoformat() if record.finished_at else None,
         }
 
-    def abort_agent(self, agent_id: str):
-        """中止 Agent"""
-        executor = self._agents.get(agent_id)
-        if executor:
-            executor.abort()
-        task = self._tasks.get(agent_id)
-        if task and not task.done():
-            task.cancel()
-
-    def cleanup_agent(self, agent_id: str):
-        """清理 Agent 资源"""
-        task = self._tasks.pop(agent_id, None)
-        if task and not task.done():
-            task.cancel()
-        if agent_id in self._agents:
-            del self._agents[agent_id]
-        if agent_id in self._results:
-            del self._results[agent_id]
+    def abort_agent(self, agent_id: str) -> asyncio.Task[Any]:
+        return asyncio.create_task(self._require_scheduler().stop(agent_id))
 
 
-# 全局 spawn 运行时（与 agents.worker_pool.WorkerPoolManager 不同）
-_spawn_agent_manager: Optional[SpawnAgentManager] = None
+def get_spawn_agent_manager(scheduler=None) -> SpawnAgentManager:
+    return SpawnAgentManager(scheduler)
 
 
-def get_spawn_agent_manager() -> SpawnAgentManager:
-    """获取全局 SpawnAgentManager（子 Agent 执行）。"""
-    global _spawn_agent_manager
-    if _spawn_agent_manager is None:
-        _spawn_agent_manager = SpawnAgentManager()
-    return _spawn_agent_manager
+def get_agent_manager(scheduler=None) -> SpawnAgentManager:
+    return get_spawn_agent_manager(scheduler)
 
 
-def get_agent_manager() -> SpawnAgentManager:
-    """兼容旧名：等同于 get_spawn_agent_manager。"""
-    return get_spawn_agent_manager()
-
-
-# 兼容旧代码中的类型名
 AgentManager = SpawnAgentManager
+
+
+__all__ = [
+    "AgentExecutor",
+    "AgentManager",
+    "SpawnAgentManager",
+    "get_agent_manager",
+    "get_spawn_agent_manager",
+]

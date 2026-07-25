@@ -1,7 +1,9 @@
-from typing import Any, Dict, Optional, List
-from dataclasses import dataclass, field
+from __future__ import annotations
 
-from .base import Tool, ToolResult, ToolError, register_tool
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from .base import Tool, ToolExecutionError, ToolResult, ToolValidationError, register_tool
 from .mcp_tool import get_mcp_manager
 
 
@@ -18,12 +20,30 @@ class ReadMcpResourceInput:
 
 @register_tool
 class ListMcpResourcesTool(Tool[ListMcpResourcesInput, List[Dict[str, Any]]]):
-    """List MCP server resources."""
-
     name = "mcp_list_resources"
     description = "List available resources from MCP servers"
     version = "1.0"
 
+    async def execute(self, input_data: ListMcpResourcesInput) -> ToolResult:
+        try:
+            resources = await get_mcp_manager().list_resources(input_data.server)
+            data = [
+                {
+                    "name": item.name,
+                    "uri": item.uri,
+                    "mimeType": item.mime_type,
+                    "description": item.description,
+                    "server": item.server,
+                }
+                for item in resources
+            ]
+            return ToolResult.ok(data=data, message=f"Found {len(data)} resources")
+        except Exception as exc:
+            return ToolResult.fail(ToolExecutionError(f"List MCP resources failed: {exc}"))
+
+    def is_read_only(self) -> bool:
+        return True
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -34,46 +54,44 @@ class ListMcpResourcesTool(Tool[ListMcpResourcesInput, List[Dict[str, Any]]]):
                 "properties": {
                     "server": {
                         "type": "string",
-                        "description": "Server name to list resources from (omit for all servers)"
+                        "description": "Server name to list resources from (omit for all servers)",
                     }
-                }
-            }
+                },
+            },
         }
-
-    async def validate(self, input_data: ListMcpResourcesInput) -> Optional[ToolError]:
-        if input_data.server:
-            manager = get_mcp_manager()
-            if not manager.get_server(input_data.server):
-                return ToolError(f"MCP server not found: {input_data.server}", tool_name=self.name)
-        return None
-
-    async def execute(self, input_data: ListMcpResourcesInput) -> ToolResult:
-        # Mock implementation
-        resources = [
-            {
-                "name": "example_resource",
-                "uri": f"mcp://{input_data.server or 'default'}/example",
-                "mimeType": "application/json",
-                "description": "Example MCP resource"
-            }
-        ]
-        return ToolResult(
-            success=True,
-            data=resources,
-            message=f"Found {len(resources)} resources"
-        )
-
-    def is_read_only(self) -> bool:
-        return True
 
 
 @register_tool
 class ReadMcpResourceTool(Tool[ReadMcpResourceInput, Dict[str, Any]]):
-    """Read an MCP server resource."""
-
     name = "mcp_read_resource"
     description = "Read a resource from an MCP server"
     version = "1.0"
+
+    async def validate(self, input_data: ReadMcpResourceInput):
+        if not input_data.server.strip():
+            return ToolValidationError("Server name is required")
+        if not input_data.uri.strip():
+            return ToolValidationError("Resource URI is required")
+        return None
+
+    async def execute(self, input_data: ReadMcpResourceInput) -> ToolResult:
+        try:
+            content = await get_mcp_manager().read_resource(
+                input_data.server.strip(), input_data.uri.strip()
+            )
+            return ToolResult.ok(
+                data={
+                    "uri": content.uri,
+                    "content": content.text if content.text is not None else content.blob,
+                    "mimeType": content.mime_type,
+                },
+                message=f"Read resource {input_data.uri}",
+            )
+        except Exception as exc:
+            return ToolResult.fail(ToolExecutionError(f"Read MCP resource failed: {exc}"))
+
+    def is_read_only(self) -> bool:
+        return True
 
     def get_schema(self) -> Dict[str, Any]:
         return {
@@ -83,38 +101,9 @@ class ReadMcpResourceTool(Tool[ReadMcpResourceInput, Dict[str, Any]]):
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "server": {
-                        "type": "string",
-                        "description": "MCP server name"
-                    },
-                    "uri": {
-                        "type": "string",
-                        "description": "Resource URI"
-                    }
+                    "server": {"type": "string", "description": "MCP server name"},
+                    "uri": {"type": "string", "description": "Resource URI"},
                 },
-                "required": ["server", "uri"]
-            }
-        }
-
-    async def validate(self, input_data: ReadMcpResourceInput) -> Optional[ToolError]:
-        if not input_data.server:
-            return ToolError("Server name is required", tool_name=self.name)
-        if not input_data.uri:
-            return ToolError("Resource URI is required", tool_name=self.name)
-        return None
-
-    async def execute(self, input_data: ReadMcpResourceInput) -> ToolResult:
-        # Mock implementation
-        content = f"Mock content for resource {input_data.uri} from server {input_data.server}"
-        return ToolResult(
-            success=True,
-            data={
-                "uri": input_data.uri,
-                "content": content,
-                "mimeType": "text/plain"
+                "required": ["server", "uri"],
             },
-            message=f"Read resource {input_data.uri}"
-        )
-
-    def is_read_only(self) -> bool:
-        return True
+        }

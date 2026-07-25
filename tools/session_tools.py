@@ -10,10 +10,11 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from .base import Tool, ToolResult, register_tool
+from core.config_paths import ConfigPaths
 
 
 # 会话存储目录
-SESSIONS_DIR = os.path.expanduser("~/.claude_code/sessions")
+SESSIONS_DIR = str(ConfigPaths.sessions_dir())
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 

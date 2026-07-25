@@ -1,0 +1,940 @@
+"""Durable, session-scoped scheduling for child agents.
+
+Scheduler ownership is enforced within this process. Cross-process concurrent
+scheduling over the same durable root is unsupported; deployments must ensure
+one scheduling process and fail closed by treating an unverifiable owner as
+unavailable.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import dataclasses
+import enum
+import logging
+import math
+import threading
+import uuid
+import weakref
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
+
+from agents.built_in import get_agent_by_type
+from agents.types import (
+    AgentDefinition,
+    AgentDefinitionError,
+    AgentExecutionResult,
+    AgentIsolationMode,
+    AgentRequest,
+    AgentRunner,
+    CustomAgentDefinition,
+    PluginAgentDefinition,
+    normalize_agent_messages,
+    parse_agent_definition,
+)
+from state_core import (
+    AgentRecord,
+    AgentRepository,
+    AgentStatus,
+    AgentTerminationReason,
+    InvalidAgentParent,
+    RuntimeRecordRevisionConflict,
+    sanitize_runtime_error,
+)
+from state_core.runtime_records import AGENT_TERMINAL_STATUSES
+
+from .context import PermissionMode
+from .session import SessionHarness
+from .worktrees import WorktreeNotClean
+
+
+logger = logging.getLogger(__name__)
+
+
+class AgentSchedulerError(RuntimeError):
+    """Base error for scheduler operations."""
+
+
+class AgentSchedulerAlreadyActive(AgentSchedulerError):
+    """Raised when another scheduler already owns the durable root."""
+
+
+class AgentSchedulerDegraded(AgentSchedulerError):
+    """Raised while unresolved runner work retains scheduler capacity."""
+
+
+class AgentNotFound(AgentSchedulerError):
+    """Raised when no durable agent record exists."""
+
+
+class AgentOwnershipError(AgentSchedulerError):
+    """Raised when an agent belongs to another root session."""
+
+
+class AgentWaitTimeout(TimeoutError, AgentSchedulerError):
+    """Raised when a waiter reaches its deadline without stopping the agent."""
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentShutdownReport:
+    """Bounded shutdown outcome for work Python could not terminate."""
+
+    unresolved_quarantines: int
+
+
+_SCHEDULER_OWNERS: dict[
+    tuple[str, str], weakref.ReferenceType[AgentScheduler]
+] = {}
+_REVOKED_BINDINGS: dict[tuple[str, str], weakref.WeakSet[Any]] = {}
+_SCHEDULER_OWNER_LOCK = threading.RLock()
+
+
+class _DirectSchedulerBindingToken:
+    """Weak-referenceable identity for schedulers not created by a factory."""
+
+
+def _repository_identity(
+    repository: AgentRepository, harness_store: Any
+) -> str:
+    session_factory = getattr(repository, "_session_factory", None)
+    bind = getattr(session_factory, "kw", {}).get("bind")
+    url = getattr(bind, "url", None)
+    if url is not None:
+        drivername = getattr(url, "drivername", "")
+        if drivername.startswith("sqlite"):
+            database = getattr(url, "database", None)
+            if database and database != ":memory:":
+                canonical_database = Path(database).expanduser().resolve()
+                return f"sqlalchemy:sqlite:{canonical_database}"
+            return f"sqlalchemy:sqlite-memory:{id(bind)}"
+        rendered = url.render_as_string(hide_password=False)
+        return f"sqlalchemy:{rendered}"
+    if session_factory is not None:
+        return f"session-factory:{id(session_factory)}"
+    # Generic repository protocols expose no durable identity. Keying their
+    # adapters to the harness store may reject independent adapters, which is
+    # the required fail-closed behavior when ownership cannot be verified.
+    return f"harness-store:{id(harness_store)}"
+
+
+def _owner_key(
+    harness: SessionHarness, repository: AgentRepository
+) -> tuple[str, str]:
+    return (
+        _repository_identity(repository, harness.store),
+        harness.root_session_id,
+    )
+
+
+def _registered_owner(key: tuple[str, str]) -> AgentScheduler | None:
+    reference = _SCHEDULER_OWNERS.get(key)
+    owner = reference() if reference is not None else None
+    if reference is not None and owner is None:
+        _SCHEDULER_OWNERS.pop(key, None)
+    return owner
+
+
+def _revoked_bindings(key: tuple[str, str]) -> weakref.WeakSet[Any]:
+    revoked = _REVOKED_BINDINGS.get(key)
+    if revoked is None:
+        revoked = weakref.WeakSet()
+        _REVOKED_BINDINGS[key] = revoked
+    return revoked
+
+
+class _ConcurrencyLease:
+    """One idempotent ownership handle for root and parent scheduler capacity."""
+
+    def __init__(
+        self,
+        agent_id: str,
+        key: str,
+        root_semaphore: asyncio.Semaphore,
+        parent_semaphore: asyncio.Semaphore,
+    ) -> None:
+        self.agent_id = agent_id
+        self.key = key
+        self.root_semaphore = root_semaphore
+        self.parent_semaphore = parent_semaphore
+        self.root_acquired = False
+        self.parent_acquired = False
+        self.released = False
+
+
+def _json_value(value: Any) -> Any:
+    if value is None or type(value) in (bool, int, float, str):
+        return value
+    if isinstance(value, enum.Enum):
+        return _json_value(value.value)
+    if isinstance(value, Path):
+        return str(value)
+    if dataclasses.is_dataclass(value):
+        return {
+            field.name: _json_value(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+            if field.name != "get_system_prompt"
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_value(item) for item in value]
+    raise TypeError(f"unsupported definition value: {type(value).__name__}")
+
+
+def _definition_snapshot(
+    definition: AgentDefinition,
+    request: AgentRequest,
+    isolation: AgentIsolationMode | None,
+    provider: str,
+) -> dict[str, Any]:
+    snapshot = _json_value(definition)
+    assert isinstance(snapshot, dict)
+    if definition.get_system_prompt is None:
+        system_prompt = (
+            "You are an agent for Claude Code.\n"
+            f"Agent Type: {definition.agent_type}\n\n"
+            f"{definition.when_to_use}\n\n"
+            "Complete the task and return a concise factual report."
+        )
+    else:
+        system_prompt = definition.get_system_prompt()
+    if not isinstance(system_prompt, str) or not system_prompt:
+        raise AgentDefinitionError("Agent system prompt must be a non-empty string")
+    snapshot["system_prompt"] = system_prompt
+    snapshot["metadata"] = _json_value(copy.deepcopy(request.definition_metadata))
+    snapshot["initial_messages"] = normalize_agent_messages(request.initial_messages)
+    snapshot["isolation"] = isolation.value if isolation is not None else None
+    snapshot["provider"] = provider
+    if request.model is not None:
+        snapshot["model"] = request.model
+    snapshot["execution_timeout"] = _execution_timeout(request)
+    return snapshot
+
+
+def _execution_timeout(request: AgentRequest) -> float | None:
+    value = request.timeout
+    if value is None:
+        value = request.definition_metadata.get("timeout")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Agent timeout must be a positive finite number")
+    timeout = float(value)
+    if timeout <= 0 or not math.isfinite(timeout):
+        raise ValueError("Agent timeout must be a positive finite number")
+    return timeout
+
+
+def _permission_mode(definition: AgentDefinition) -> PermissionMode | None:
+    configured = definition.permission_mode
+    if configured is None:
+        return None
+    return PermissionMode(configured.value)
+
+
+def _normalized_content(content: Any) -> list[dict[str, Any]]:
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if content is None:
+        return []
+    if isinstance(content, (list, tuple)):
+        return [
+            {"type": "text", "text": item}
+            if isinstance(item, str)
+            else _json_value(item)
+            for item in content
+        ]
+    return [{"type": "text", "text": str(content)}]
+
+
+def _error_payload(error: BaseException | Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if error is None:
+        return None
+    if isinstance(error, BaseException):
+        name = type(error).__name__
+        message = str(error)
+    else:
+        copied = _json_value(error)
+        assert isinstance(copied, dict)
+        name = str(copied.get("type", "AgentExecutionError"))
+        message = str(copied.get("message", "Agent execution failed"))
+    sanitized = sanitize_runtime_error({"type": name, "message": message})
+    assert sanitized is not None
+    return sanitized
+
+
+class AgentScheduler:
+    """Own live asyncio handles while keeping lifecycle state in the repository."""
+
+    def __init__(
+        self,
+        harness: SessionHarness,
+        repository: AgentRepository | None = None,
+        *,
+        runner: AgentRunner | Callable[[AgentRecord, SessionHarness], Any] | None = None,
+        runner_factory: Callable[[AgentRecord], AgentRunner] | None = None,
+        agent_provider: str = "openai",
+        root_concurrency: int = 4,
+        per_parent_concurrency: int = 2,
+        stop_grace: float = 0.25,
+        force_grace: float = 0.25,
+        _binding_token: object | None = None,
+        _binding_explicit: bool = False,
+    ) -> None:
+        if root_concurrency < 1 or per_parent_concurrency < 1:
+            raise ValueError("agent concurrency limits must be positive")
+        if (
+            stop_grace < 0
+            or force_grace < 0
+            or not math.isfinite(stop_grace)
+            or not math.isfinite(force_grace)
+        ):
+            raise ValueError("stop grace periods must be non-negative finite numbers")
+        if runner is not None and runner_factory is not None:
+            raise ValueError("provide runner or runner_factory, not both")
+        if agent_provider not in {"openai", "anthropic"}:
+            raise ValueError("agent_provider must be one of: anthropic, openai")
+        resolved_repository = repository or harness.store.agents
+        owner_key = _owner_key(harness, resolved_repository)
+        with _SCHEDULER_OWNER_LOCK:
+            owner = _registered_owner(owner_key)
+            if owner is not None:
+                raise AgentSchedulerAlreadyActive(
+                    "An AgentScheduler already owns this durable root"
+                )
+            self.harness = harness
+            self.repository = resolved_repository
+            self._owner_key = owner_key
+            self._runner = runner
+            self._runner_factory = runner_factory
+            self._agent_provider = agent_provider
+            self._binding_token = (
+                _DirectSchedulerBindingToken()
+                if _binding_token is None
+                else _binding_token
+            )
+            try:
+                weakref.ref(self._binding_token)
+            except TypeError as exc:
+                raise ValueError("scheduler binding token must support weak references") from exc
+            self._binding_explicit = bool(
+                _binding_explicit or runner is not None or runner_factory is not None
+            )
+            self._binding_valid = True
+            self._root_semaphore = asyncio.BoundedSemaphore(root_concurrency)
+            self._per_parent_concurrency = per_parent_concurrency
+            self._parent_semaphores: dict[str, asyncio.Semaphore] = {}
+            self._parent_refcounts: dict[str, int] = {}
+            self._concurrency_leases: dict[str, _ConcurrencyLease] = {}
+            self._concurrency_lock = asyncio.Lock()
+            self._tasks: dict[str, asyncio.Task[AgentRecord]] = {}
+            self._children: dict[str, SessionHarness] = {}
+            self._ready_events: dict[str, asyncio.Event] = {}
+            self._quarantined_tasks: set[asyncio.Task[AgentRecord]] = set()
+            self._stop_grace = stop_grace
+            self._force_grace = force_grace
+            self._closed = False
+            _SCHEDULER_OWNERS[owner_key] = weakref.ref(self)
+
+    @classmethod
+    def for_harness(
+        cls,
+        harness: SessionHarness,
+        repository: AgentRepository | None = None,
+        **options: Any,
+    ) -> AgentScheduler:
+        """Resolve one runtime binding without silently changing its configuration."""
+
+        resolved_repository = repository or harness.store.agents
+        key = _owner_key(harness, resolved_repository)
+        with _SCHEDULER_OWNER_LOCK:
+            requested_token = options.get("_binding_token")
+            revoked = _revoked_bindings(key)
+            if requested_token is not None and requested_token in revoked:
+                raise AgentSchedulerAlreadyActive(
+                    "This scheduler runtime binding has been superseded"
+                )
+            owner = _registered_owner(key)
+            if owner is None:
+                return cls(harness, resolved_repository, **options)
+            if not options:
+                return owner
+            if requested_token is None:
+                raise AgentSchedulerAlreadyActive(
+                    "A configured AgentScheduler already owns this durable root"
+                )
+            if requested_token is owner._binding_token:
+                if (
+                    options.get("runner_factory") is not owner._runner_factory
+                    or options.get("agent_provider", "openai")
+                    != owner._agent_provider
+                ):
+                    raise AgentSchedulerAlreadyActive(
+                        "The scheduler binding configuration changed after ownership"
+                    )
+                return owner
+            if owner._tasks or owner._quarantined_tasks or owner._concurrency_leases:
+                raise AgentSchedulerAlreadyActive(
+                    "Cannot replace a scheduler runtime binding with live work"
+                )
+
+            owner._binding_valid = False
+            revoked.add(owner._binding_token)
+            _SCHEDULER_OWNERS.pop(key, None)
+            try:
+                return cls(harness, resolved_repository, **options)
+            except BaseException:
+                revoked.discard(owner._binding_token)
+                owner._binding_valid = True
+                _SCHEDULER_OWNERS[key] = weakref.ref(owner)
+                raise
+
+    @property
+    def live_agent_ids(self) -> frozenset[str]:
+        return frozenset(self._tasks)
+
+    @property
+    def quarantined_task_count(self) -> int:
+        return len(self._quarantined_tasks)
+
+    @property
+    def unresolved_quarantine_count(self) -> int:
+        return len(self._quarantined_tasks)
+
+    @property
+    def is_degraded(self) -> bool:
+        return bool(self._quarantined_tasks)
+
+    @property
+    def parent_limiter_count(self) -> int:
+        return len(self._parent_semaphores)
+
+    @property
+    def parent_limiter_refcounts(self) -> dict[str, int]:
+        return dict(self._parent_refcounts)
+
+    @property
+    def root_available_capacity(self) -> int:
+        return self._root_semaphore._value
+
+    @property
+    def managed_concurrency_count(self) -> int:
+        return len(self._concurrency_leases)
+
+    def _owned(self, agent_id: str) -> AgentRecord:
+        record = self.repository.get(agent_id)
+        if record is None:
+            raise AgentNotFound(f"Agent {agent_id} not found")
+        if record.root_session_id != self.harness.root_session_id:
+            raise AgentOwnershipError(
+                f"Agent {agent_id} belongs to root session {record.root_session_id!r}"
+            )
+        return record
+
+    def _validate_request(
+        self,
+        request: AgentRequest,
+    ) -> tuple[
+        AgentDefinition,
+        dict[str, Any],
+        AgentIsolationMode | None,
+    ]:
+        if not isinstance(request.prompt, str) or not request.prompt:
+            raise ValueError("Agent prompt must be non-empty")
+        if not isinstance(request.description, str) or not request.description:
+            raise ValueError("Agent description must be non-empty")
+        built_in_definition = get_agent_by_type(request.agent_type)
+        if request.definition is None:
+            if built_in_definition is None:
+                raise ValueError(f"Unknown agent type: {request.agent_type}")
+            definition: AgentDefinition = built_in_definition
+        else:
+            definition = parse_agent_definition(
+                request.definition, expected_agent_type=request.agent_type
+            )
+        definition = parse_agent_definition(
+            definition, expected_agent_type=request.agent_type
+        )
+        if built_in_definition is None and not isinstance(
+            definition, (CustomAgentDefinition, PluginAgentDefinition)
+        ):
+            raise AgentDefinitionError(f"Unknown agent type: {request.agent_type}")
+        if request.model is not None and not isinstance(request.model, str):
+            raise AgentDefinitionError("Agent model must be a string")
+        if request.isolation is not None and not isinstance(
+            request.isolation, AgentIsolationMode
+        ):
+            raise AgentDefinitionError(
+                "Agent isolation must be an AgentIsolationMode value or None"
+            )
+        isolation = (
+            request.isolation
+            if request.isolation is not None
+            else definition.isolation
+        )
+        if isolation is AgentIsolationMode.REMOTE:
+            raise AgentSchedulerError("Remote agent isolation is not supported")
+        _execution_timeout(request)
+        return (
+            definition,
+            _definition_snapshot(
+                definition, request, isolation, self._agent_provider
+            ),
+            isolation,
+        )
+
+    @staticmethod
+    def _cleanup_worktree(child: SessionHarness, worktree_id: str | None) -> None:
+        """Remove an unchanged child worktree or detach and keep changed work."""
+
+        if worktree_id is None:
+            return
+        try:
+            current = child.store.worktrees.get(worktree_id)
+            if (
+                current is None
+                or current.agent_id != child.agent_id
+                or current.details.get("attached") is not True
+            ):
+                return
+            isolated_cwd = Path(current.canonical_path)
+            try:
+                child.worktrees.remove(worktree_id)
+            except WorktreeNotClean:
+                try:
+                    child.worktrees.keep(worktree_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to keep changed agent worktree %s", worktree_id
+                    )
+            except Exception:
+                logger.exception("Failed to clean up agent worktree %s", worktree_id)
+            try:
+                # A force-cancelled coroutine may still be unwinding. Never let its
+                # child scope fall back to the parent repository after isolation ends.
+                child._set_effective_cwd(isolated_cwd)
+            except Exception:
+                logger.exception(
+                    "Failed to retain isolated cwd for agent worktree %s", worktree_id
+                )
+        except Exception:
+            logger.exception("Failed to inspect agent worktree %s", worktree_id)
+
+    async def spawn(
+        self,
+        request: AgentRequest,
+        *,
+        harness: SessionHarness | None = None,
+    ) -> AgentRecord:
+        if not self._binding_valid:
+            raise AgentSchedulerAlreadyActive(
+                "This scheduler runtime binding has been superseded"
+            )
+        if self.is_degraded:
+            raise AgentSchedulerDegraded(
+                "Agent scheduler has unresolved quarantined runner work"
+            )
+        if self._closed:
+            raise RuntimeError("Agent scheduler is shut down")
+        scope = self.harness if harness is None else harness
+        if _owner_key(scope, self.repository) != self._owner_key:
+            raise AgentOwnershipError(
+                "Agent spawn harness must belong to the scheduler's durable root"
+            )
+        parent_agent_id = (
+            request.parent_agent_id
+            if request.parent_agent_id is not None
+            else scope.agent_id
+        )
+        definition, definition_snapshot, isolation = self._validate_request(request)
+        agent_id = f"agent-{request.agent_type.lower()}-{uuid.uuid4().hex[:12]}"
+        parent_cwd = scope.effective_cwd
+        child_options: dict[str, Any] = {
+            "parent_agent_id": parent_agent_id,
+            "cwd": request.cwd,
+            "metadata": {"agent_type": request.agent_type},
+        }
+        permission_mode = _permission_mode(definition)
+        if permission_mode is not None:
+            child_options["permission_mode"] = permission_mode
+        child = scope.child(agent_id, **child_options)
+        worktree_id = request.worktree_id
+        if isolation is AgentIsolationMode.WORKTREE:
+            worktree = child.worktrees.create(agent_id)
+            worktree_id = worktree.worktree_id
+            metadata = definition_snapshot.get("metadata", {})
+            fork = metadata.get("fork") if isinstance(metadata, Mapping) else None
+            if isinstance(fork, Mapping) and fork.get("parent_session_id") is not None:
+                from agents.fork import build_worktree_notice
+
+                definition_snapshot["initial_messages"].append(
+                    {
+                        "role": "user",
+                        "content": build_worktree_notice(
+                            str(parent_cwd), str(child.effective_cwd)
+                        ),
+                    }
+                )
+        try:
+            pending_record = AgentRecord(
+                agent_id=agent_id,
+                root_session_id=self.harness.root_session_id,
+                parent_agent_id=parent_agent_id,
+                agent_type=request.agent_type,
+                prompt=request.prompt,
+                description=request.description,
+                is_background=request.background,
+                effective_cwd=str(child.effective_cwd),
+                definition_snapshot=definition_snapshot,
+                worktree_id=worktree_id,
+            )
+            if parent_agent_id is None:
+                record = self.repository.create(pending_record)
+            else:
+                create_guarded = getattr(
+                    self.repository, "create_with_parent_guard", None
+                )
+                if not callable(create_guarded):
+                    raise InvalidAgentParent(parent_agent_id)
+                record = create_guarded(pending_record)
+        except Exception as exc:
+            if isolation is AgentIsolationMode.WORKTREE:
+                self._cleanup_worktree(child, worktree_id)
+            if isinstance(exc, InvalidAgentParent):
+                raise AgentOwnershipError(
+                    "Agent parent must be running in the same durable root"
+                ) from exc
+            raise
+        self._children[agent_id] = child
+        ready = asyncio.Event()
+        self._ready_events[agent_id] = ready
+        task = asyncio.create_task(self._execute(record, child), name=f"agent:{agent_id}")
+        self._tasks[agent_id] = task
+        task.add_done_callback(lambda completed, key=agent_id: self._forget(key, completed))
+        if request.background:
+            await ready.wait()
+            return self._owned(agent_id)
+        return await self.wait(agent_id)
+
+    def _forget(self, agent_id: str, completed: asyncio.Task[AgentRecord]) -> None:
+        if self._tasks.get(agent_id) is completed:
+            self._tasks.pop(agent_id, None)
+            child = self._children.pop(agent_id, None)
+            ready = self._ready_events.pop(agent_id, None)
+            if ready is not None and not ready.is_set():
+                try:
+                    current = self._owned(agent_id)
+                    if current.status is AgentStatus.PENDING:
+                        self._finish(agent_id, AgentStatus.CANCELLED)
+                finally:
+                    ready.set()
+            if child is not None:
+                child.runtime_context.cancellation.dispose()
+
+    def _signal_ready(self, agent_id: str) -> None:
+        ready = self._ready_events.get(agent_id)
+        if ready is not None:
+            ready.set()
+
+    async def _acquire_concurrency_lease(
+        self, record: AgentRecord
+    ) -> "_ConcurrencyLease":
+        key = record.parent_agent_id or "<root>"
+        async with self._concurrency_lock:
+            parent_semaphore = self._parent_semaphores.setdefault(
+                key, asyncio.BoundedSemaphore(self._per_parent_concurrency)
+            )
+            self._parent_refcounts[key] = self._parent_refcounts.get(key, 0) + 1
+            lease = _ConcurrencyLease(
+                record.agent_id,
+                key,
+                self._root_semaphore,
+                parent_semaphore,
+            )
+            self._concurrency_leases[record.agent_id] = lease
+        try:
+            await parent_semaphore.acquire()
+            lease.parent_acquired = True
+            await self._root_semaphore.acquire()
+            lease.root_acquired = True
+            return lease
+        except BaseException:
+            await self._release_concurrency_lease(record.agent_id, lease)
+            raise
+
+    async def _release_concurrency_lease(
+        self, agent_id: str, lease: "_ConcurrencyLease" | None = None
+    ) -> None:
+        lease = lease or self._concurrency_leases.get(agent_id)
+        if lease is None:
+            return
+        async with self._concurrency_lock:
+            if lease.released:
+                return
+            lease.released = True
+            if lease.root_acquired:
+                lease.root_semaphore.release()
+            if lease.parent_acquired:
+                lease.parent_semaphore.release()
+            current = self._parent_refcounts.get(lease.key, 0)
+            if current <= 1:
+                self._parent_refcounts.pop(lease.key, None)
+                if self._parent_semaphores.get(lease.key) is lease.parent_semaphore:
+                    self._parent_semaphores.pop(lease.key, None)
+            else:
+                self._parent_refcounts[lease.key] = current - 1
+            if self._concurrency_leases.get(agent_id) is lease:
+                self._concurrency_leases.pop(agent_id, None)
+
+    def _runner_for(self, record: AgentRecord):
+        if self._runner_factory is not None:
+            return self._runner_factory(record)
+        if self._runner is not None:
+            return self._runner
+        from agents.engine import AgentExecutor
+
+        return AgentExecutor.from_record(record)
+
+    async def _execute(self, record: AgentRecord, child: SessionHarness) -> AgentRecord:
+        lease: _ConcurrencyLease | None = None
+        try:
+            lease = await self._acquire_concurrency_lease(record)
+            if child.runtime_context.cancellation.cancelled:
+                raise asyncio.CancelledError
+            current = self._owned(record.agent_id)
+            current = self.repository.transition(
+                current.agent_id, AgentStatus.RUNNING, current.revision
+            )
+            self._signal_ready(record.agent_id)
+            runner = self._runner_for(current)
+            invocation = (
+                runner.run(current, child)
+                if hasattr(runner, "run")
+                else runner(current, child)
+            )
+            timeout = current.definition_snapshot.get("execution_timeout")
+            if timeout is None:
+                result = await invocation
+            else:
+                result = await asyncio.wait_for(invocation, float(timeout))
+            return self._persist_result(current.agent_id, result)
+        except asyncio.TimeoutError:
+            return self._finish(record.agent_id, AgentStatus.TIMED_OUT)
+        except asyncio.CancelledError:
+            return self._finish(record.agent_id, AgentStatus.CANCELLED)
+        except Exception as exc:
+            from .budget import BudgetExhausted
+
+            if isinstance(exc, BudgetExhausted):
+                return self._finish(
+                    record.agent_id,
+                    AgentStatus.BUDGET_EXHAUSTED,
+                    error=_error_payload(exc),
+                )
+            return self._finish(
+                record.agent_id, AgentStatus.FAILED, error=_error_payload(exc)
+            )
+        except BaseException as exc:
+            return self._finish(
+                record.agent_id, AgentStatus.FAILED, error=_error_payload(exc)
+            )
+        finally:
+            self._signal_ready(record.agent_id)
+            if lease is not None:
+                await self._release_concurrency_lease(record.agent_id, lease)
+            if record.definition_snapshot.get("isolation") == "worktree":
+                self._cleanup_worktree(child, record.worktree_id)
+
+    def _persist_result(
+        self, agent_id: str, result: AgentExecutionResult
+    ) -> AgentRecord:
+        reason = (
+            result.termination_reason.value
+            if isinstance(result.termination_reason, enum.Enum)
+            else str(result.termination_reason)
+        )
+        aliases = {"timeout": "timed_out", "killed": "cancelled"}
+        reason = aliases.get(reason, reason)
+        try:
+            status = AgentStatus(reason)
+        except ValueError:
+            status = AgentStatus.FAILED
+        if status not in AGENT_TERMINAL_STATUSES:
+            status = AgentStatus.FAILED
+        output = {
+            "content": _normalized_content(result.content),
+            "tool_count": int(result.tool_count),
+            "output": _json_value(result.output),
+        }
+        return self._finish(
+            agent_id,
+            status,
+            output=output,
+            usage=_json_value(result.usage),
+            error=_error_payload(result.error),
+        )
+
+    def _finish(
+        self,
+        agent_id: str,
+        status: AgentStatus,
+        *,
+        output: Any = None,
+        usage: Mapping[str, Any] | None = None,
+        error: Mapping[str, Any] | None = None,
+    ) -> AgentRecord:
+        current = self._owned(agent_id)
+        if current.status in AGENT_TERMINAL_STATUSES:
+            return current
+        try:
+            return self.repository.transition(
+                agent_id,
+                status,
+                current.revision,
+                termination_reason=AgentTerminationReason(status.value),
+                output=output,
+                usage=usage,
+                error=error,
+            )
+        except RuntimeRecordRevisionConflict:
+            current = self._owned(agent_id)
+            if current.status in AGENT_TERMINAL_STATUSES:
+                return current
+            return self.repository.transition(
+                agent_id,
+                status,
+                current.revision,
+                termination_reason=AgentTerminationReason(status.value),
+                output=output,
+                usage=usage,
+                error=error,
+            )
+
+    async def wait(self, agent_id: str, timeout: float | None = None) -> AgentRecord:
+        record = self._owned(agent_id)
+        if record.status in AGENT_TERMINAL_STATUSES:
+            return record
+        task = self._tasks.get(agent_id)
+        if task is None:
+            async def poll_durable() -> AgentRecord:
+                while True:
+                    current = self._owned(agent_id)
+                    if current.status in AGENT_TERMINAL_STATUSES:
+                        return current
+                    await asyncio.sleep(0.01)
+
+            try:
+                if timeout is None:
+                    return await poll_durable()
+                return await asyncio.wait_for(poll_durable(), timeout)
+            except asyncio.TimeoutError as exc:
+                raise AgentWaitTimeout(f"Timed out waiting for agent {agent_id}") from exc
+        try:
+            if timeout is None:
+                await asyncio.shield(task)
+            else:
+                await asyncio.wait_for(asyncio.shield(task), timeout)
+        except asyncio.TimeoutError as exc:
+            raise AgentWaitTimeout(f"Timed out waiting for agent {agent_id}") from exc
+        return self._owned(agent_id)
+
+    def status(self, agent_id: str) -> AgentRecord:
+        return self._owned(agent_id)
+
+    def list(
+        self,
+        *,
+        parent_agent_id: str | None = None,
+        status: AgentStatus | None = None,
+        background: bool | None = None,
+    ) -> list[AgentRecord]:
+        return self.repository.list(
+            self.harness.root_session_id,
+            parent_agent_id=parent_agent_id,
+            status=status,
+            is_background=background,
+        )
+
+    async def stop(self, agent_id: str) -> AgentRecord:
+        record = self._owned(agent_id)
+        if record.status in AGENT_TERMINAL_STATUSES:
+            return record
+        child = self._children.get(agent_id)
+        if child is not None:
+            child.runtime_context.cancellation.cancel()
+        task = self._tasks.get(agent_id)
+        if task is None:
+            return self._finish(agent_id, AgentStatus.CANCELLED)
+        try:
+            await asyncio.wait_for(asyncio.shield(task), self._stop_grace)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), self._force_grace)
+            except asyncio.TimeoutError:
+                current = self._owned(agent_id)
+                if child is not None and current.worktree_id is not None:
+                    self._cleanup_worktree(child, current.worktree_id)
+                cancelled = self._finish(agent_id, AgentStatus.CANCELLED)
+                await self._quarantine(agent_id, task)
+                return cancelled
+        return self._owned(agent_id)
+
+    async def _quarantine(
+        self, agent_id: str, task: asyncio.Task[AgentRecord]
+    ) -> None:
+        if self._tasks.get(agent_id) is task:
+            self._tasks.pop(agent_id, None)
+        child = self._children.pop(agent_id, None)
+        if child is not None:
+            child.runtime_context.cancellation.dispose()
+        # Python cannot kill a coroutine that suppresses cancellation. Keep its
+        # quota lease until _execute actually leaves its finally block.
+        self._quarantined_tasks.add(task)
+        task.add_done_callback(self._reap_quarantined)
+
+    def _reap_quarantined(self, task: asyncio.Task[AgentRecord]) -> None:
+        self._quarantined_tasks.discard(task)
+        try:
+            task.result()
+        except BaseException:
+            pass
+        if self._closed and not self._quarantined_tasks:
+            self._unregister_owner()
+
+    def reconcile(self) -> list[AgentRecord]:
+        return self.repository.reconcile(
+            self.harness.root_session_id, set(self.live_agent_ids)
+        )
+
+    def _unregister_owner(self) -> None:
+        with _SCHEDULER_OWNER_LOCK:
+            if _registered_owner(self._owner_key) is self:
+                _SCHEDULER_OWNERS.pop(self._owner_key, None)
+
+    async def shutdown(self) -> AgentShutdownReport:
+        self._closed = True
+        agent_ids = list(self._tasks)
+        if agent_ids:
+            await asyncio.gather(
+                *(self.stop(agent_id) for agent_id in agent_ids),
+                return_exceptions=True,
+            )
+        await asyncio.sleep(0)
+        if not self._quarantined_tasks:
+            self._unregister_owner()
+        return AgentShutdownReport(len(self._quarantined_tasks))
+
+
+__all__ = [
+    "AgentNotFound",
+    "AgentOwnershipError",
+    "AgentScheduler",
+    "AgentSchedulerAlreadyActive",
+    "AgentSchedulerDegraded",
+    "AgentSchedulerError",
+    "AgentShutdownReport",
+    "AgentWaitTimeout",
+]
