@@ -291,6 +291,21 @@ class SessionHarness:
         return manager
 
     @property
+    def deferred_tools(self):
+        from .deferred_tools import DeferredToolRegistry
+
+        registry = self._services.get("deferred_tools")
+        if registry is None:
+            parent = (
+                self._parent_harness.deferred_tools
+                if self._parent_harness is not None
+                else None
+            )
+            registry = DeferredToolRegistry(self, parent=parent)
+            self._services["deferred_tools"] = registry
+        return registry
+
+    @property
     def effective_cwd(self) -> Path:
         configured = self._services.get("effective_cwd")
         if configured is not None:

@@ -156,6 +156,7 @@ async def test_task_stop_runs_through_harness_pipeline_without_approval(harness)
         },
         {"session_harness": harness},
     )
+    harness.deferred_tools.activate("task_stop")
 
     execution = await harness.tool_runtime.execute(
         "TaskStop",

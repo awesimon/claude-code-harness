@@ -61,6 +61,7 @@ class EventType(str, Enum):
     WORKTREE_REMOVED = "worktree_removed"
     WORKTREE_ORPHANED = "worktree_orphaned"
     WORKTREE_FAILED = "worktree_failed"
+    TOOL_ACTIVATED = "tool_activated"
 
 
 class StateCoreError(Exception):

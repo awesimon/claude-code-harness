@@ -133,15 +133,28 @@ class AgentExecutor:
         skill_snapshots: tuple[Any, ...] = (),
     ) -> tuple[dict[str, Tool], list[dict[str, Any]]]:
         registry = child_harness.tool_runtime.registry
+        deferred = child_harness.deferred_tools
         available: dict[str, Tool] = {}
         schemas: list[dict[str, Any]] = []
+        visible = set(deferred.visible_names())
         for tool in self._resolve_tools(child_harness, skill_snapshots):
             name = self.tool_name(tool, registry)
-            spec = registry.get_spec(name)
-            if spec is None:
+            spec = deferred.get_spec(name)
+            if spec is None or name not in visible:
                 continue
             available[name] = tool
             schemas.append(spec.to_openai())
+        allowed_tools = self.agent_definition.tools
+        allow_dynamic = allowed_tools is None or allowed_tools == ["*"]
+        if allow_dynamic:
+            for name in deferred.visible_names():
+                if name in available or registry.get(name) is not None:
+                    continue
+                tool = deferred.resolve_tool(name)
+                spec = deferred.get_spec(name)
+                if tool is not None and spec is not None:
+                    available[name] = tool
+                    schemas.append(spec.to_openai())
         return available, schemas
 
     async def run(
@@ -264,6 +277,7 @@ class AgentExecutor:
                         raise ValueError("Tool call name must be a non-empty string")
                     execution_name = (
                         registry.resolve_name(tool_name)
+                        or child_harness.deferred_tools.resolve_name(tool_name)
                         or canonical_tool_name(tool_name)
                     )
                     raw_arguments = function.get("arguments", "{}")

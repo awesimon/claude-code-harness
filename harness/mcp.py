@@ -298,6 +298,14 @@ class MCPConnectionManager:
                 raise
             raise MCPError(f'MCP server "{config.name}" failed to connect') from exc
         record = self._set_record(config, MCPServerStatus.CONNECTED)
+        try:
+            definitions = await self.list_tools(config.name)
+            self.harness.deferred_tools.register_mcp_tools(
+                config.name, definitions
+            )
+        except BaseException:
+            await self.disconnect(config.name)
+            raise
         self.harness.session_runtime.append_event(
             EventType.MCP_CONNECTED,
             {"server": config.name, "transport": config.transport.value},
@@ -311,6 +319,7 @@ class MCPConnectionManager:
             raise MCPServerNotFound(f'MCP server "{server_name}" is not configured')
         if connection is not None:
             await connection.close()
+        self.harness.deferred_tools.set_mcp_server_available(server_name, False)
         record = self._set_record(config, MCPServerStatus.DISCONNECTED)
         self.harness.session_runtime.append_event(
             EventType.MCP_DISCONNECTED,

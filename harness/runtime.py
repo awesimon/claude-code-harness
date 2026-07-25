@@ -166,10 +166,46 @@ class ToolRuntime:
         tool_call_id: str | None = None,
     ) -> ToolExecution:
         call_id = tool_call_id or f"tool_{uuid.uuid4().hex}"
-        canonical = self.registry.resolve_name(tool_name) or tool_name
+        deferred = self._service(context, "deferred_tools", self.deferred_registry)
+        deferred_name = None
+        if deferred is not None:
+            resolver = getattr(deferred, "resolve_name", None)
+            if callable(resolver):
+                deferred_name = resolver(tool_name)
+        canonical = self.registry.resolve_name(tool_name) or deferred_name or tool_name
         prepared_input = self._prepare_input(canonical, input_data, context)
         tool = self.registry.get(canonical)
+        if tool is None and deferred is not None:
+            resolver = getattr(deferred, "resolve_tool", None)
+            if callable(resolver):
+                tool = resolver(canonical)
         if tool is None:
+            known_deferred = deferred_name is not None or canonical.startswith("mcp__")
+            activations = getattr(deferred, "activations", None)
+            if callable(activations) and canonical in activations():
+                known_deferred = True
+            if deferred is not None and known_deferred:
+                try:
+                    await _maybe_await(
+                        deferred.require_active(
+                            canonical, agent_id=context.metadata.get("agent_id")
+                        )
+                    )
+                except Exception as exc:
+                    category = getattr(exc, "category", "failed")
+                    reason = (
+                        TerminationReason.MCP_UNAVAILABLE
+                        if category == "mcp_unavailable"
+                        else TerminationReason.FAILED
+                    )
+                    return await self._finish(
+                        canonical,
+                        call_id,
+                        prepared_input,
+                        context,
+                        ToolResult.fail(ToolExecutionError(str(exc))),
+                        reason,
+                    )
             return await self._finish(
                 canonical,
                 call_id,
@@ -179,7 +215,6 @@ class ToolRuntime:
                 TerminationReason.FAILED,
             )
 
-        deferred = self._service(context, "deferred_tools", self.deferred_registry)
         if deferred is not None:
             try:
                 await _maybe_await(

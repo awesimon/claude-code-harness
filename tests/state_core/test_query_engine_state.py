@@ -185,12 +185,16 @@ def test_query_engine_exposes_exactly_one_task_mode(
         session_runtime_factory=runtime_factory,
     )
     engine.create_conversation("tool-mode")
+    harness = engine._session_harness("tool-mode")
+    for name in ("task_create", "agent", "task_output", "task_stop"):
+        harness.deferred_tools.activate(name)
     task_names = {item["function"]["name"] for item in engine._build_tools_schema("tool-mode")}
     assert "task_create" in task_names
     assert "todo_write" not in task_names
 
     runtime = engine._session_runtime("tool-mode")
     runtime.enable_todo_v1()
+    harness.deferred_tools.activate("todo_write")
     assert runtime.task_mode is TaskMode.TODO_V1
     todo_names = {item["function"]["name"] for item in engine._build_tools_schema("tool-mode")}
     assert "todo_write" in todo_names
@@ -318,6 +322,7 @@ async def test_query_engine_agent_tool_executes_with_active_harness(
     scheduler = AgentScheduler(
         engine._session_harness("agent-tool-root"), runner=CompletingRunner()
     )
+    engine._session_harness("agent-tool-root").deferred_tools.activate("agent")
 
     observations = await engine._execute_tools(
         [

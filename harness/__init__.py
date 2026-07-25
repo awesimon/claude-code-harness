@@ -53,6 +53,15 @@ from .worktrees import (
     WorktreePathError,
     WorktreeStateError,
 )
+from .deferred_tools import (
+    DEFERRED_TOOLS_NAMESPACE,
+    DeferredSearchResult,
+    DeferredToolError,
+    DeferredToolNotActive,
+    DeferredToolNotFound,
+    DeferredToolRegistry,
+    DeferredToolUnavailable,
+)
 from state_core import WorktreeRecord, WorktreeStatus
 
 __all__ = [
@@ -91,6 +100,13 @@ __all__ = [
     "WorktreeRecord",
     "WorktreeStateError",
     "WorktreeStatus",
+    "DEFERRED_TOOLS_NAMESPACE",
+    "DeferredSearchResult",
+    "DeferredToolError",
+    "DeferredToolNotActive",
+    "DeferredToolNotFound",
+    "DeferredToolRegistry",
+    "DeferredToolUnavailable",
     "PermissionDecision",
     "PermissionMode",
     "PermissionPolicy",

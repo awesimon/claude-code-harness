@@ -599,6 +599,7 @@ class QueryEngine:
             "enter_plan_mode",
             "exit_plan_mode",
             "ask_user_question",
+            "tool_search",
         }
 
         filtered = []
@@ -611,25 +612,12 @@ class QueryEngine:
 
     def _build_tools_schema(self, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """构建工具 schema 列表"""
-        runtime = self._session_runtime(conversation_id) if conversation_id else None
-        tools = []
-        for name in ToolRegistry.list_tools():
-            tool = ToolRegistry.get(name)
-            if tool is None:
-                continue
-            enabled = getattr(tool, "is_enabled", None)
-            if runtime is not None and callable(enabled):
-                try:
-                    is_enabled = enabled({"session_runtime": runtime})
-                except TypeError:
-                    is_enabled = enabled()
-                if not is_enabled:
-                    continue
-            elif runtime is not None and enabled is False:
-                continue
-            spec = ToolRegistry.get_spec(name)
-            if spec is not None:
-                tools.append(spec.to_openai())
+        if conversation_id is not None:
+            tools = self._session_harness(
+                conversation_id
+            ).deferred_tools.visible_schemas()
+        else:
+            tools = [spec.to_openai() for spec in ToolRegistry.list_specs()]
 
         # 如果在计划模式下，过滤工具
         if conversation_id and self.is_in_plan_mode(conversation_id):
